@@ -14,13 +14,13 @@ RESOLUTION="1280x720"
 INPUT_FILE="./input/johnny30.yuv"
 SOURCE_FILE="./input/johnny60.y4m"
 CONFIG_FOLDER="./configs"
-HOST_SCRIPT_FILE="script.txt"
+HOST_SCRIPT_FILE="./script.txt"
 
 # Container paths
 CONTAINER_HOST_SCRIPT_FILE="/uvgcomm/build/script.txt"
 CONTAINER_CONFIG_FILE="/uvgcomm/build/uvgComm.ini"
 CONTAINER_STATS_FOLDER="/uvgcomm/build/stats_csv"
-CONTAINER_INPUT_FILE="/uvgcomm/input/input.yuv"
+CONTAINER_INPUT_FILE="/uvgcomm/input/johnny30.yuv"
 
 # Timestamped root folder for logs and stats
 RUN_ID=$(date +"%Y%m%d_%H%M%S")
@@ -89,12 +89,27 @@ create_host() {
 }
 
 countdown_timer() {
-    echo "Experiment running for $DURATION seconds..."
-    REMAINING=$DURATION_S
-    while [ $REMAINING -gt 0 ]; do
-        echo "Time remaining: $REMAINING s"
-        sleep 5
-        REMAINING=$((REMAINING - 5))
+    echo "Experiment running for $DURATION_S seconds..."
+    CPU_LOG="${OUTPUT_FOLDER}/cpu_usage.csv"
+    echo "time_sec;cpu_percent" > $CPU_LOG
+    START_TIME=$(date +%s)
+
+    while true; do
+        NOW=$(date +%s)
+        ELAPSED=$((NOW - START_TIME))
+        if [ $ELAPSED -ge $DURATION_S ]; then
+            break
+        fi
+
+        # CPU measurement using mpstat with non-blocking mode
+        CPU=$(mpstat 1 1 | awk '/Average/ {print 100-$12}' | tr ',' '.')
+        echo "$ELAPSED;$CPU" >> $CPU_LOG
+        echo "Time elapsed: $ELAPSED s, CPU usage: $CPU%"
+
+        # Sleep until the next second boundary
+        NEXT=$((START_TIME + ELAPSED + 1))
+        SLEEP_TIME=$((NEXT - $(date +%s)))
+        [ $SLEEP_TIME -gt 0 ] && sleep $SLEEP_TIME
     done
 }
 

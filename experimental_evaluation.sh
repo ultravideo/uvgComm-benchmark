@@ -14,7 +14,6 @@ RESOLUTION="1280x720"
 INPUT_FILE="./input/johnny30.yuv"
 SOURCE_FILE="./input/johnny60.y4m"
 CONFIG_FOLDER="./configs"
-HOST_SCRIPT_FILE="./script.txt"
 
 # Container paths
 CONTAINER_HOST_SCRIPT_FILE="/uvgcomm/build/script.txt"
@@ -25,6 +24,8 @@ CONTAINER_INPUT_FILE="/uvgcomm/input/johnny30.yuv"
 # Timestamped root folder for logs and stats
 RUN_ID=$(date +"%Y%m%d_%H%M%S")
 OUTPUT_FOLDER="./results/$RUN_ID"
+
+USERS_FILE="./usernames.conf"
 
 # ----------------------- functions ------------------------
 
@@ -80,7 +81,55 @@ create_clients() {
     done
 }
 
+create_host_script() {
+    local output_file="$1"  # path to save generated host script
+    local wait_between_calls=5
+    local wait_after_calls=10
+
+    if [[ ! -f "$USERS_FILE" ]]; then
+        echo "Error: USERS_FILE not found: $USERS_FILE"
+        return 1
+    fi
+
+    echo "# Auto-generated host script" > "$output_file"
+
+    # Read host IP (not used in calls, but could be logged)
+    local host_line
+    host_line=$(grep "^host=" "$USERS_FILE")
+    if [[ -n "$host_line" ]]; then
+        host_user="${host_line#*=}"
+        host_user="${host_user%%:*}"  # username only
+    fi
+
+    # Read clients
+    client_count=0
+    while IFS= read -r line; do
+        [[ "$line" =~ ^#.*$ ]] && continue        # skip comments
+        [[ "$line" =~ ^host=.*$ ]] && continue    # skip host line
+        client_count=$((client_count + 1))
+        [[ $client_count -gt $CLIENTS ]] && break
+
+        client_user="${line#*=}"
+        client_name="${client_user%%:*}"
+        client_ip="${client_user##*:}"
+
+        echo "wait $wait_between_calls" >> "$output_file"
+        echo "call $client_name $client_ip" >> "$output_file"
+    done < "$USERS_FILE"
+
+    # Hangup and quit
+    echo "wait $wait_after_calls" >> "$output_file"
+    echo "hangup" >> "$output_file"
+    echo "wait 5" >> "$output_file"
+    echo "quit" >> "$output_file"
+
+    echo "Host script generated at: $output_file"
+}
+
 create_host() {
+    HOST_SCRIPT_FILE="${OUTPUT_FOLDER}/script.txt"
+    create_host_script "$HOST_SCRIPT_FILE"
+
     echo "Starting host"
     docker run -d --name $HOST_NAME --network $NETWORK_NAME --ip 172.28.0.2 \
         -v ${CONFIG_FOLDER}/uvgComm.ini:$CONTAINER_CONFIG_FILE \
@@ -141,7 +190,7 @@ docker network inspect $NETWORK_NAME >/dev/null 2>&1 || \
 
 prepare_tests
 
-# P2P Mesh, 720p, no latencies
+# P2P Mesh, 720p, no latencies, gallery view
 create_clients
 create_host
 countdown_timer

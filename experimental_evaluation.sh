@@ -50,7 +50,7 @@ prepare_tests() {
         wget -O "$SOURCE_FILE" "https://media.xiph.org/video/derf/y4m/Johnny_1280x720_60.y4m"
     fi
 
-    local frame_rate = 30
+    local frame_rate=30
 
     if [ ! -f "$INPUT_FILE" ]; then
         echo "Converting source file $SOURCE_FILE to $INPUT_FILE"
@@ -64,6 +64,45 @@ prepare_tests() {
 
     mkdir -p "$RUN_FOLDER"
     echo "Preparation complete. Input file ready: $INPUT_FILE"
+}
+
+write_metadata() {
+    local scenario="$1"
+    local architecture="$2"
+    local clients="$3"
+    local resolution="$4"
+    local download_bw="$5"
+    local upload_bw="$6"
+    local latency="$7"
+    local view_mode="$8"
+    local duration_s="$9"
+    local output_folder="${10}"
+    local cpu_log="${output_folder}/cpu_usage.csv"
+
+    local metadata_file="${output_folder}/metadata.txt"
+
+    # Create output folder if it doesn't exist
+    mkdir -p "$output_folder"
+
+    # If START_TIME exists, use it; otherwise, use current time
+    local start_time="${START_TIME:-$(date +%s)}"
+
+    echo "Writing metadata to $metadata_file..."
+
+    {
+        echo "Scenario: $scenario"
+        echo "Architecture: $architecture"
+        echo "Clients: $clients"
+        echo "Resolution: $resolution"
+        echo "Download_BW: ${download_bw}Mbps"
+        echo "Upload_BW: ${upload_bw}Mbps"
+        echo "Latency: $latency ms"
+        echo "View_Mode: $view_mode"
+        echo "Start_Time: $start_time"
+        echo "Duration_s: $duration_s"
+    } > "$metadata_file"
+
+    echo "Metadata written successfully."
 }
 
 
@@ -91,6 +130,7 @@ create_clients() {
 
 create_host_script() {
     local output_file="$1"  # path to save generated host script
+    local architecture="$2" # P2P Mesh, SFU, Hybrid
     local wait_between_calls=5
     local wait_after_calls=10
 
@@ -100,6 +140,10 @@ create_host_script() {
     fi
 
     echo "# Auto-generated host script" > "$output_file"
+
+    # Always set the architecture at the beginning
+    echo "setting sip/Topology $architecture" >> "$output_file"
+    echo "setCall" >> "$output_file"
 
     # Read host IP (not used in calls, but could be logged)
     local host_line
@@ -136,7 +180,8 @@ create_host_script() {
 
 create_host() {
     local script_file="$1/script.txt"
-    create_host_script "${script_file}"
+    local architecture="$2"
+    create_host_script "${script_file}" $architecture
 
     echo "Starting host"
     docker run -d --name $HOST_NAME --network $NETWORK_NAME --ip 172.28.0.2 \
@@ -149,26 +194,29 @@ countdown_timer() {
     local duration_s=$1
     local output_location=$2
     echo "Experiment running for $duration_s seconds..."
+
     CPU_LOG="${output_location}/cpu_usage.csv"
-    echo "time_sec;cpu_percent" > $CPU_LOG
-    START_TIME=$(date +%s)
+    echo "timestamp_ms;cpu_percent" > "$CPU_LOG"
+
+    local START_TIME_MS=$(($(date +%s%N)/1000000))
 
     while true; do
-        NOW=$(date +%s)
-        ELAPSED=$((NOW - START_TIME))
-        if [ $ELAPSED -ge $duration_s ]; then
+        local NOW_MS=$(($(date +%s%N)/1000000))
+        local ELAPSED_MS=$((NOW_MS - START_TIME_MS))
+        if [ $((ELAPSED_MS/1000)) -ge $duration_s ]; then
             break
         fi
 
-        # CPU measurement using mpstat with non-blocking mode
-        CPU=$(mpstat 1 1 | awk '/Average/ {print 100-$12}' | tr ',' '.')
-        echo "$ELAPSED;$CPU" >> $CPU_LOG
-        echo "Time elapsed: $ELAPSED s, CPU usage: $CPU%"
+        # CPU measurement using mpstat
+        local CPU=$(mpstat 1 1 | awk '/Average/ {print 100-$12}' | tr ',' '.')
 
-        # Sleep until the next second boundary
-        NEXT=$((START_TIME + ELAPSED + 1))
-        SLEEP_TIME=$((NEXT - $(date +%s)))
-        [ $SLEEP_TIME -gt 0 ] && sleep $SLEEP_TIME
+        echo "$NOW_MS;$CPU" >> "$CPU_LOG"
+        echo "Timestamp: $NOW_MS ms, CPU usage: $CPU%"
+
+        # Sleep until the next millisecond boundary (approx 1s intervals)
+        local NEXT_MS=$((START_TIME_MS + ((ELAPSED_MS/1000)+1)*1000))
+        local SLEEP_MS=$((NEXT_MS - $(($(date +%s%N)/1000000))))
+        [ $SLEEP_MS -gt 0 ] && sleep $(awk "BEGIN {print $SLEEP_MS/1000}")
     done
 }
 
@@ -190,7 +238,7 @@ run_scenario() {
     local UPLOAD_BW="$6"
     local LATENCY="$7"
     local VIEW_MODE="$8"
-    local duration_s=30
+    local duration_s=60
 
     local scenario_output_folder="${RUN_FOLDER}/${SCENARIO}/${ARCHITECTURE}-${CLIENTS}"
 
@@ -201,8 +249,12 @@ run_scenario() {
     echo "Latency: $LATENCY, View: $VIEW_MODE"
     echo "---------------------------------------------------------"
 
+    write_metadata "$SCENARIO" "$ARCHITECTURE" "$CLIENTS" "$RESOLUTION" \
+               "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY" "$VIEW_MODE" \
+               "$duration_s" "$scenario_output_folder"
+
     create_clients "$CLIENTS" "$INPUT_FILE" $scenario_output_folder
-    create_host $scenario_output_folder
+    create_host $scenario_output_folder $ARCHITECTURE
     countdown_timer $duration_s $scenario_output_folder
     record_container_logs $scenario_output_folder
     cleanup
@@ -225,8 +277,11 @@ trap cleanup EXIT # remove containers if this script crashes
 
 prepare_tests
 
-# P2P Mesh, 720p, no latencies, gallery view
-run_scenario "720p" "P2P" 2 "1280x720" 1.0 1.0 false "gallery"
+for clients in {2..6}; do
+    run_scenario "720p" "P2P_Mesh" "$clients" "1280x720" 1.0 1.0 false "gallery"
+    run_scenario "720p" "SFU" "$clients" "1280x720" 1.0 1.0 false "gallery"
+    run_scenario "720p" "Hybrid" "$clients" "1280x720" 1.0 1.0 false "gallery"
+done
 
 # Cleanup will be triggered automatically by trap
 echo "Experiment finished"

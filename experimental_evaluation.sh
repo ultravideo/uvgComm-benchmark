@@ -135,20 +135,21 @@ create_host_script() {
 }
 
 create_host() {
-    HOST_SCRIPT_FILE="${RUN_FOLDER}/script.txt"
-    create_host_script "$HOST_SCRIPT_FILE"
+    local script_file="$1/script.txt"
+    create_host_script "${script_file}"
 
     echo "Starting host"
     docker run -d --name $HOST_NAME --network $NETWORK_NAME --ip 172.28.0.2 \
         -v ${CONFIG_FOLDER}/uvgComm.ini:$CONTAINER_CONFIG_FILE \
-        -v ${HOST_SCRIPT_FILE}:${CONTAINER_HOST_SCRIPT_FILE} \
+        -v ${script_file}:${CONTAINER_HOST_SCRIPT_FILE} \
         ${DOCKER_IMAGE}:latest --script $CONTAINER_HOST_SCRIPT_FILE
 }
 
 countdown_timer() {
-    local duration_s="$1"
+    local duration_s=$1
+    local output_location=$2
     echo "Experiment running for $duration_s seconds..."
-    CPU_LOG="${RUN_FOLDER}/cpu_usage.csv"
+    CPU_LOG="${output_location}/cpu_usage.csv"
     echo "time_sec;cpu_percent" > $CPU_LOG
     START_TIME=$(date +%s)
 
@@ -172,11 +173,12 @@ countdown_timer() {
 }
 
 record_container_logs() {
+    local output_location=$1
     echo "Recording logs"
     for i in $(seq 1 $CLIENTS); do
-        docker logs ${CLIENT_PREFIX}${i} &> ${RUN_FOLDER}/${CLIENT_PREFIX}${i}/docker.log
+        docker logs ${CLIENT_PREFIX}${i} &> ${output_location}/${CLIENT_PREFIX}${i}/docker.log
     done
-    docker logs $HOST_NAME &> ${RUN_FOLDER}/${HOST_NAME}.log
+    docker logs $HOST_NAME &> ${output_location}/${HOST_NAME}.log
 }
 
 run_scenario() {
@@ -188,6 +190,9 @@ run_scenario() {
     local UPLOAD_BW="$6"
     local LATENCY="$7"
     local VIEW_MODE="$8"
+    local duration_s=30
+
+    local scenario_output_folder="${RUN_FOLDER}/${SCENARIO}/${ARCHITECTURE}-${CLIENTS}"
 
     echo "---------------------------------------------------------"
     echo "Running scenario: $SCENARIO"
@@ -196,10 +201,10 @@ run_scenario() {
     echo "Latency: $LATENCY, View: $VIEW_MODE"
     echo "---------------------------------------------------------"
 
-    create_clients "$CLIENTS" "$INPUT_FILE" "$RUN_FOLDER"
-    create_host
-    countdown_timer 30
-    record_container_logs
+    create_clients "$CLIENTS" "$INPUT_FILE" $scenario_output_folder
+    create_host $scenario_output_folder
+    countdown_timer $duration_s $scenario_output_folder
+    record_container_logs $scenario_output_folder
     cleanup
 }
 

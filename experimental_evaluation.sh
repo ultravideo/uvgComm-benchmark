@@ -75,17 +75,15 @@ write_metadata() {
     local upload_bw="$6"
     local latency="$7"
     local view_mode="$8"
-    local duration_s="$9"
-    local output_folder="${10}"
+    local output_folder="$9"
+    local start="${10}"
+    local end="${10}"
     local cpu_log="${output_folder}/cpu_usage.csv"
 
     local metadata_file="${output_folder}/metadata.txt"
 
     # Create output folder if it doesn't exist
     mkdir -p "$output_folder"
-
-    # If START_TIME exists, use it; otherwise, use current time
-    local start_time="${START_TIME:-$(date +%s)}"
 
     echo "Writing metadata to $metadata_file..."
 
@@ -98,8 +96,8 @@ write_metadata() {
         echo "Upload_BW: ${upload_bw}Mbps"
         echo "Latency: $latency ms"
         echo "View_Mode: $view_mode"
-        echo "Start_Time: $start_time"
-        echo "Duration_s: $duration_s"
+        echo "Start_Timestamp: $start"
+        echo "End_timestamp: $end"
     } > "$metadata_file"
 
     echo "Metadata written successfully."
@@ -128,51 +126,52 @@ create_clients() {
     done
 }
 
-create_host_script() {
-    local output_file="$1"  # path to save generated host script
-    local architecture="$2" # P2P Mesh, SFU, Hybrid
-    local wait_between_calls=5
-    local wait_after_calls=10
 
-    if [[ ! -f "$USERS_FILE" ]]; then
-        echo "Error: USERS_FILE not found: $USERS_FILE"
-        return 1
-    fi
+create_host_script() {
+    local output_file="$1"
+    local architecture="$2"
+    local clients="$3"
+    local setup_duration="$4"       # in milliseconds
+    local warmup_duration="$5"      # in milliseconds
+    local experiment_duration="$6"  # in milliseconds
+
+    local wait_between_calls=6      # seconds between calling each client
+    local wait_after_calls=10       # seconds after last client before hangup
 
     echo "# Auto-generated host script" > "$output_file"
-
-    # Always set the architecture at the beginning
     echo "setting sip/Topology $architecture" >> "$output_file"
     echo "setCall" >> "$output_file"
 
-    # Read host IP (not used in calls, but could be logged)
-    local host_line
-    host_line=$(grep "^host=" "$USERS_FILE")
-    if [[ -n "$host_line" ]]; then
-        host_user="${host_line#*=}"
-        host_user="${host_user%%:*}"  # username only
-    fi
-
-    # Read clients
-    client_count=0
+    # Read clients from USERS_FILE
+    local client_count=0
     while IFS= read -r line; do
         [[ "$line" =~ ^#.*$ ]] && continue        # skip comments
         [[ "$line" =~ ^host=.*$ ]] && continue    # skip host line
         client_count=$((client_count + 1))
-        [[ $client_count -gt $CLIENTS ]] && break
+        [[ $client_count -gt $clients ]] && break # only do set amount of clients
 
         client_user="${line#*=}"
         client_name="${client_user%%:*}"
         client_ip="${client_user##*:}"
 
+        # Wait before calling next client
         echo "wait $wait_between_calls" >> "$output_file"
         echo "call $client_name $client_ip" >> "$output_file"
     done < "$USERS_FILE"
 
+    # Wait remaining warmup period
+    # Convert milliseconds to seconds (round down)
+    local warmup_s=$((warmup_duration / 1000))
+    echo "wait $warmup_s" >> "$output_file"
+
+    # Experiment period
+    local experiment_s=$((experiment_duration / 1000))
+    echo "# Experiment running for $experiment_s seconds" >> "$output_file"
+    echo "wait $experiment_s" >> "$output_file"
+
     # Hangup and quit
-    echo "wait $wait_after_calls" >> "$output_file"
     echo "hangup" >> "$output_file"
-    echo "wait 5" >> "$output_file"
+    echo "wait $wait_after_calls" >> "$output_file"
     echo "quit" >> "$output_file"
 
     echo "Host script generated at: $output_file"
@@ -181,7 +180,12 @@ create_host_script() {
 create_host() {
     local script_file="$1/script.txt"
     local architecture="$2"
-    create_host_script "${script_file}" $architecture
+    local clients="$3"
+    local setup_time="$4"
+    local warmup_time="$5"
+    local experiment_time="$6"
+
+    create_host_script "${script_file}" $architecture $clients $setup_time $warmup_time $experiment_time
 
     echo "Starting host"
     docker run -d --name $HOST_NAME --network $NETWORK_NAME --ip 172.28.0.2 \
@@ -191,7 +195,7 @@ create_host() {
 }
 
 countdown_timer() {
-    local duration_s=$1
+    local duration_ms=$1
     local output_location=$2
     echo "Experiment running for $duration_s seconds..."
 
@@ -203,7 +207,7 @@ countdown_timer() {
     while true; do
         local NOW_MS=$(($(date +%s%N)/1000000))
         local ELAPSED_MS=$((NOW_MS - START_TIME_MS))
-        if [ $((ELAPSED_MS/1000)) -ge $duration_s ]; then
+        if [ $((ELAPSED_MS)) -ge $duration_ms ]; then
             break
         fi
 
@@ -238,9 +242,22 @@ run_scenario() {
     local UPLOAD_BW="$6"
     local LATENCY="$7"
     local VIEW_MODE="$8"
-    local duration_s=60
 
     local scenario_output_folder="${RUN_FOLDER}/${SCENARIO}/${ARCHITECTURE}-${CLIENTS}"
+
+    # Current time
+    local current_time_ms=$(date +%s%3N)
+
+    # Setup + warmup + experiment
+    local setup_time=120000        # 2 minutes
+    local warmup_time=30000        # 30 seconds
+    local experiment_time=120000   # 2 minutes
+    local cooldown_time=10000      # 10 seconds
+
+    local duration_ms=$((setup_time+warmup_time+experiment_time+cooldown_time))
+
+    local experiment_start=$((current_time_ms + setup_time + warmup_time))
+    local experiment_end=$((experiment_start + experiment_time))
 
     echo "---------------------------------------------------------"
     echo "Running scenario: $SCENARIO"
@@ -251,11 +268,11 @@ run_scenario() {
 
     write_metadata "$SCENARIO" "$ARCHITECTURE" "$CLIENTS" "$RESOLUTION" \
                "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY" "$VIEW_MODE" \
-               "$duration_s" "$scenario_output_folder"
+               "$scenario_output_folder" "$experiment_start" "$experiment_end"
 
     create_clients "$CLIENTS" "$INPUT_FILE" $scenario_output_folder
-    create_host $scenario_output_folder $ARCHITECTURE
-    countdown_timer $duration_s $scenario_output_folder
+    create_host $scenario_output_folder $ARCHITECTURE $CLIENTS $setup_time $warmup_time $experiment_time
+    countdown_timer $duration_ms $scenario_output_folder
     record_container_logs $scenario_output_folder
     cleanup
 }

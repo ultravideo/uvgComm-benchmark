@@ -195,8 +195,8 @@ create_host() {
 }
 
 countdown_timer() {
-    local duration_ms=$1
-    local output_location=$2
+    local output_location=$1
+    local duration_ms=$2
     echo "Experiment running for $duration_s seconds..."
 
     CPU_LOG="${output_location}/cpu_usage.csv"
@@ -242,39 +242,46 @@ run_scenario() {
     local UPLOAD_BW="$6"
     local LATENCY="$7"
     local VIEW_MODE="$8"
+    local RUN_COUNT="$9"
 
-    local scenario_output_folder="${RUN_FOLDER}/${SCENARIO}/${ARCHITECTURE}-${CLIENTS}"
+    local base_output_folder="${RUN_FOLDER}/${SCENARIO}/${ARCHITECTURE}-${CLIENTS}"
 
-    # Current time
-    local current_time_ms=$(date +%s%3N)
+    for run_index in $(seq 1 $RUN_COUNT); do
 
-    # Setup + warmup + experiment
-    local setup_time=120000        # 2 minutes
-    local warmup_time=30000        # 30 seconds
-    local experiment_time=120000   # 2 minutes
-    local cooldown_time=10000      # 10 seconds
+        local run_output_folder="${base_output_folder}/run_${run_index}"
 
-    local duration_ms=$((setup_time+warmup_time+experiment_time+cooldown_time))
+        # Current time
+        local current_time_ms=$(date +%s%3N)
 
-    local experiment_start=$((current_time_ms + setup_time + warmup_time))
-    local experiment_end=$((experiment_start + experiment_time))
+        # Setup + warmup + experiment
+        local setup_time=120000        # 2 minutes
+        local warmup_time=30000        # 30 seconds
+        local experiment_time=120000   # 2 minutes
+        local cooldown_time=10000      # 10 seconds
 
-    echo "---------------------------------------------------------"
-    echo "Running scenario: $SCENARIO"
-    echo "Architecture: $ARCHITECTURE, Clients: $CLIENTS"
-    echo "Resolution: $RESOLUTION, DL: ${DOWNLOAD_BW}Mbps, UL: ${UPLOAD_BW}Mbps"
-    echo "Latency: $LATENCY, View: $VIEW_MODE"
-    echo "---------------------------------------------------------"
+        local duration_ms=$((setup_time+warmup_time+experiment_time+cooldown_time))
 
-    write_metadata "$SCENARIO" "$ARCHITECTURE" "$CLIENTS" "$RESOLUTION" \
-               "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY" "$VIEW_MODE" \
-               "$scenario_output_folder" "$experiment_start" "$experiment_end"
+        local experiment_start=$((current_time_ms + setup_time + warmup_time))
+        local experiment_end=$((experiment_start + experiment_time))
 
-    create_clients "$CLIENTS" "$INPUT_FILE" $scenario_output_folder
-    create_host $scenario_output_folder $ARCHITECTURE $CLIENTS $setup_time $warmup_time $experiment_time
-    countdown_timer $duration_ms $scenario_output_folder
-    record_container_logs $scenario_output_folder
-    cleanup
+        echo "---------------------------------------------------------"
+        echo "Running scenario: $SCENARIO"
+        echo "Run ${run_index}/${RUN_COUNT}"
+        echo "Architecture: $ARCHITECTURE, Clients: $CLIENTS"
+        echo "Resolution: $RESOLUTION, DL: ${DOWNLOAD_BW}Mbps, UL: ${UPLOAD_BW}Mbps"
+        echo "Latency: $LATENCY, View: $VIEW_MODE"
+        echo "---------------------------------------------------------"
+
+        write_metadata "$SCENARIO" "$ARCHITECTURE" "$CLIENTS" "$RESOLUTION" \
+                   "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY" "$VIEW_MODE" \
+                   "$run_output_folder" "$experiment_start" "$experiment_end"
+
+        create_clients "$CLIENTS" "$INPUT_FILE" $run_output_folder
+        create_host $run_output_folder $ARCHITECTURE $CLIENTS $setup_time $warmup_time $experiment_time
+        countdown_timer $run_output_folder $duration_ms
+        record_container_logs $run_output_folder
+        cleanup
+    done
 }
 
 
@@ -292,12 +299,14 @@ cleanup() {
 cleanup # make sure the containers don't exist
 trap cleanup EXIT # remove containers if this script crashes
 
-prepare_tests
+prepare_tests # prepares test files and creates network
+
+run_count=3
 
 for clients in {2..6}; do
-    run_scenario "720p" "P2P_Mesh" "$clients" "1280x720" 1.0 1.0 false "gallery"
-    run_scenario "720p" "SFU" "$clients" "1280x720" 1.0 1.0 false "gallery"
-    run_scenario "720p" "Hybrid" "$clients" "1280x720" 1.0 1.0 false "gallery"
+    run_scenario "720p" "P2P_Mesh" "$clients" "1280x720" 1.0 1.0 false "gallery" "$run_count"
+    run_scenario "720p" "SFU" "$clients" "1280x720" 1.0 1.0 false "gallery" "$run_count"
+    run_scenario "720p" "Hybrid" "$clients" "1280x720" 1.0 1.0 false "gallery" "$run_count"
 done
 
 # Cleanup will be triggered automatically by trap

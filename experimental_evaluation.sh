@@ -92,8 +92,8 @@ write_metadata() {
         echo "Architecture: $architecture"
         echo "Clients: $clients"
         echo "Resolution: $resolution"
-        echo "Download_BW: ${download_bw}Mbps"
-        echo "Upload_BW: ${upload_bw}Mbps"
+        echo "Download_BW: ${download_bw} Mbps"
+        echo "Upload_BW: ${upload_bw} Mbps"
         echo "Latency: $latency ms"
         echo "View_Mode: $view_mode"
         echo "Start_Timestamp: $start"
@@ -128,19 +128,22 @@ create_clients() {
 
 
 create_host_script() {
-    local output_file="$1"
-    local architecture="$2"
-    local clients="$3"
-    local setup_duration="$4"       # in milliseconds
-    local warmup_duration="$5"      # in milliseconds
-    local experiment_duration="$6"  # in milliseconds
+    local output_file=$1
+    local architecture=$2
+    local clients=$3
+    local setup_duration_ms=$4
+    local warmup_duration_ms=$5
+    local experiment_duration_ms=$6
+    local cooldown_duration_ms=$7
 
-    local wait_between_calls=6      # seconds between calling each client
-    local wait_after_calls=10       # seconds after last client before hangup
+    local wait_after_invite=6      # seconds between calling each client
+    local wait_after_settings=3
+
 
     echo "# Auto-generated host script" > "$output_file"
     echo "setting sip/Topology $architecture" >> "$output_file"
     echo "setCall" >> "$output_file"
+    echo "wait $wait_after_settings" >> "$output_file"
 
     # Read clients from USERS_FILE
     local client_count=0
@@ -155,23 +158,24 @@ create_host_script() {
         client_ip="${client_user##*:}"
 
         # Wait before calling next client
-        echo "wait $wait_between_calls" >> "$output_file"
         echo "call $client_name $client_ip" >> "$output_file"
+        echo "wait $wait_after_invite" >> "$output_file"
     done < "$USERS_FILE"
 
     # Wait remaining warmup period
     # Convert milliseconds to seconds (round down)
-    local warmup_s=$((warmup_duration / 1000))
+    local warmup_s=$((warmup_duration_ms / 1000))
     echo "wait $warmup_s" >> "$output_file"
 
     # Experiment period
-    local experiment_s=$((experiment_duration / 1000))
+    local experiment_s=$((experiment_duration_ms / 1000))
     echo "# Experiment running for $experiment_s seconds" >> "$output_file"
     echo "wait $experiment_s" >> "$output_file"
 
     # Hangup and quit
     echo "hangup" >> "$output_file"
-    echo "wait $wait_after_calls" >> "$output_file"
+    local cooldown_s=$((cooldown_duration_ms / 1000))
+    echo "wait $cooldown_s" >> "$output_file"
     echo "quit" >> "$output_file"
 
     echo "Host script generated at: $output_file"
@@ -184,8 +188,9 @@ create_host() {
     local setup_time="$4"
     local warmup_time="$5"
     local experiment_time="$6"
+    local cooldown_time="$7"
 
-    create_host_script "${script_file}" $architecture $clients $setup_time $warmup_time $experiment_time
+    create_host_script "${script_file}" $architecture $clients $setup_time $warmup_time $experiment_time $cooldown_time
 
     echo "Starting host"
     docker run -d --name $HOST_NAME --network $NETWORK_NAME --ip 172.28.0.2 \
@@ -196,32 +201,66 @@ create_host() {
 
 countdown_timer() {
     local output_location=$1
-    local duration_ms=$2
-    echo "Experiment running for $duration_s seconds..."
+    local start_time_ms=$2
+    local setup_time_ms=$3
+    local warmup_time_ms=$4
+    local experiment_time_ms=$5
+    local cooldown_time_ms=$6
+
+    # Total duration in ms
+    local total_duration_ms=$((setup_time_ms + warmup_time_ms + experiment_time_ms + cooldown_time_ms))
 
     CPU_LOG="${output_location}/cpu_usage.csv"
     echo "timestamp_ms;cpu_percent" > "$CPU_LOG"
 
-    local START_TIME_MS=$(($(date +%s%N)/1000000))
+    echo "Starting countdown timer..."
+
+    local last_phase=""
 
     while true; do
-        local NOW_MS=$(($(date +%s%N)/1000000))
-        local ELAPSED_MS=$((NOW_MS - START_TIME_MS))
-        if [ $((ELAPSED_MS)) -ge $duration_ms ]; then
+        local now_ms=$(($(date +%s%N)/1000000))
+        local elapsed_ms=$((now_ms - start_time_ms))
+
+        # Stop when total duration exceeded
+        if [ $elapsed_ms -ge $total_duration_ms ]; then
             break
         fi
 
-        # CPU measurement using mpstat
+        # Determine phase
+        local phase=""
+        if [ $elapsed_ms -lt $setup_time_ms ]; then
+            phase="Setup ${setup_time_ms} ms"
+        elif [ $elapsed_ms -lt $((setup_time_ms + warmup_time_ms)) ]; then
+            phase="Warmup ${warmup_time_ms} ms"
+        elif [ $elapsed_ms -lt $((setup_time_ms + warmup_time_ms + experiment_time_ms)) ]; then
+            phase="Experiment ${experiment_time_ms} ms"
+        else
+            phase="Cooldown ${cooldown_time_ms} ms"
+        fi
+
+        # Print phase only when it changes
+        if [ "$phase" != "$last_phase" ]; then
+            echo "[$(date '+%H:%M:%S')] Phase: $phase"
+            last_phase="$phase"
+        fi
+
+        # CPU measurement
         local CPU=$(mpstat 1 1 | awk '/Average/ {print 100-$12}' | tr ',' '.')
 
-        echo "$NOW_MS;$CPU" >> "$CPU_LOG"
-        echo "Timestamp: $NOW_MS ms, CPU usage: $CPU%"
+        # Log to file
+        echo "$now_ms;$CPU" >> "$CPU_LOG"
+
+        # Simple inline print (no formatting headaches)
+        echo "${now_ms}: $CPU%"
+
 
         # Sleep until the next millisecond boundary (approx 1s intervals)
-        local NEXT_MS=$((START_TIME_MS + ((ELAPSED_MS/1000)+1)*1000))
-        local SLEEP_MS=$((NEXT_MS - $(($(date +%s%N)/1000000))))
-        [ $SLEEP_MS -gt 0 ] && sleep $(awk "BEGIN {print $SLEEP_MS/1000}")
+        local next_ms=$((start_time_ms + ((elapsed_ms/1000)+1)*1000))
+        local sleep_ms=$((next_ms - $(($(date +%s%N)/1000000))))
+        [ $sleep_ms -gt 0 ] && sleep $(awk "BEGIN {print $sleep_ms/1000}")
+
     done
+    echo "Countdown finished"
 }
 
 record_container_logs() {
@@ -249,36 +288,36 @@ run_scenario() {
     for run_index in $(seq 1 $RUN_COUNT); do
 
         local run_output_folder="${base_output_folder}/run_${run_index}"
+        mkdir -p  ${run_output_folder}
 
         # Current time
         local current_time_ms=$(date +%s%3N)
 
         # Setup + warmup + experiment
-        local setup_time=120000        # 2 minutes
-        local warmup_time=30000        # 30 seconds
-        local experiment_time=120000   # 2 minutes
-        local cooldown_time=10000      # 10 seconds
+        local setup_time_ms=$((CLIENTS * 6000 + 3000)) # scales with clients
+        local warmup_time_ms=10000                      # 10 seconds
+        local experiment_time_ms=60000                  # 1 minute
+        local cooldown_time_ms=5000                     # 5 seconds
 
-        local duration_ms=$((setup_time+warmup_time+experiment_time+cooldown_time))
 
-        local experiment_start=$((current_time_ms + setup_time + warmup_time))
-        local experiment_end=$((experiment_start + experiment_time))
+        local experiment_start_ms=$((current_time_ms + setup_time + warmup_time))
+        local experiment_end_ms=$((experiment_start + experiment_time))
 
         echo "---------------------------------------------------------"
         echo "Running scenario: $SCENARIO"
         echo "Run ${run_index}/${RUN_COUNT}"
         echo "Architecture: $ARCHITECTURE, Clients: $CLIENTS"
-        echo "Resolution: $RESOLUTION, DL: ${DOWNLOAD_BW}Mbps, UL: ${UPLOAD_BW}Mbps"
+        echo "Resolution: $RESOLUTION, DL: ${DOWNLOAD_BW} Mbps, UL: ${UPLOAD_BW} Mbps"
         echo "Latency: $LATENCY, View: $VIEW_MODE"
         echo "---------------------------------------------------------"
 
         write_metadata "$SCENARIO" "$ARCHITECTURE" "$CLIENTS" "$RESOLUTION" \
                    "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY" "$VIEW_MODE" \
-                   "$run_output_folder" "$experiment_start" "$experiment_end"
+                   "$run_output_folder" "$experiment_start_ms" "$experiment_end_ms"
 
         create_clients "$CLIENTS" "$INPUT_FILE" $run_output_folder
-        create_host $run_output_folder $ARCHITECTURE $CLIENTS $setup_time $warmup_time $experiment_time
-        countdown_timer $run_output_folder $duration_ms
+        create_host $run_output_folder $ARCHITECTURE $CLIENTS $setup_time_ms $warmup_time_ms $experiment_time_ms $cooldown_time_ms
+        countdown_timer $run_output_folder $current_time_ms $setup_time_ms $warmup_time_ms $experiment_time_ms $cooldown_time_ms
         record_container_logs $run_output_folder
         cleanup
     done

@@ -77,7 +77,8 @@ write_metadata() {
     local view_mode="$8"
     local output_folder="$9"
     local start="${10}"
-    local end="${10}"
+    local end="${11}"
+
     local cpu_log="${output_folder}/cpu_usage.csv"
 
     local metadata_file="${output_folder}/metadata.txt"
@@ -300,8 +301,8 @@ run_scenario() {
         local cooldown_time_ms=5000                     # 5 seconds
 
 
-        local experiment_start_ms=$((current_time_ms + setup_time + warmup_time))
-        local experiment_end_ms=$((experiment_start + experiment_time))
+        local experiment_start_ms=$((current_time_ms + setup_time_ms + warmup_time_ms))
+        local experiment_end_ms=$((experiment_start_ms + experiment_time_ms))
 
         echo "---------------------------------------------------------"
         echo "Running scenario: $SCENARIO"

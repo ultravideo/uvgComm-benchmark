@@ -78,6 +78,7 @@ write_metadata() {
     local output_folder="$9"
     local start="${10}"
     local end="${11}"
+    local run="${12}"
 
     local cpu_log="${output_folder}/cpu_usage.csv"
 
@@ -99,6 +100,7 @@ write_metadata() {
         echo "View_Mode: $view_mode"
         echo "Start_Timestamp: $start"
         echo "End_timestamp: $end"
+        echo "Run: $run"
     } > "$metadata_file"
 
     echo "Metadata written successfully."
@@ -314,7 +316,7 @@ run_scenario() {
 
         write_metadata "$SCENARIO" "$ARCHITECTURE" "$CLIENTS" "$RESOLUTION" \
                    "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY" "$VIEW_MODE" \
-                   "$run_output_folder" "$experiment_start_ms" "$experiment_end_ms"
+                   "$run_output_folder" "$experiment_start_ms" "$experiment_end_ms" "$run_index"
 
         create_clients "$CLIENTS" "$INPUT_FILE" $run_output_folder
         create_host $run_output_folder $ARCHITECTURE $CLIENTS $setup_time_ms $warmup_time_ms $experiment_time_ms $cooldown_time_ms

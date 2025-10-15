@@ -96,7 +96,7 @@ write_metadata() {
         echo "Resolution: $resolution"
         echo "Download_BW: ${download_bw} Mbps"
         echo "Upload_BW: ${upload_bw} Mbps"
-        echo "Latency: $latency ms"
+        echo "Simulated_latencies: $latency"
         echo "View_Mode: $view_mode"
         echo "Start_Timestamp: $start"
         echo "End_timestamp: $end"

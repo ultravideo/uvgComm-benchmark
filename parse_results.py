@@ -397,6 +397,7 @@ def plot_cpu(results_by_arch, analysis_folder, scenario):
         if np.any(mask):
             m = markers[i % len(markers)]
             ls = '-' if i % 2 == 0 else '--'
+            # use default color cycle (will be set externally if desired)
             plt.plot(xs_arr[mask], ys_arr[mask], marker=m, linestyle=ls, label=arch)
     plt.xlabel('Number of Participants')
     plt.ylabel('Average Total CPU %')
@@ -466,25 +467,98 @@ def build_arch_map(scenario_folder):
             n = int(clients)
         except Exception:
             continue
-        # prefer inner run_* if present
+        # include all inner run_* directories if present, otherwise the folder itself
         runs = sorted([p for p in glob.glob(os.path.join(af, 'run_*')) if os.path.isdir(p)])
         if runs:
-            best = None
-            best_n = -1
             for r in runs:
-                base_r = os.path.basename(r)
-                try:
-                    rn = int(base_r.split('_', 1)[1])
-                except Exception:
-                    rn = -1
-                if rn > best_n:
-                    best_n = rn
-                    best = r
-            run_path = best or af
+                arch_map[arch].append((n, r))
         else:
-            run_path = af
-        arch_map[arch].append((n, run_path))
+            arch_map[arch].append((n, af))
     return arch_map
+
+
+def get_color_map(keys):
+    """Return a dict mapping each key to a color from matplotlib's default cycle."""
+    prop_cycle = plt.rcParams['axes.prop_cycle'].by_key().get('color', None)
+    if not prop_cycle:
+        prop_cycle = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
+    cmap = {}
+    for i, k in enumerate(sorted(keys)):
+        cmap[k] = prop_cycle[i % len(prop_cycle)]
+    return cmap
+
+
+def _extract_client_num_from_folder(folder_path):
+    """Helper to extract numeric client id from a folder name like uvgcomm-3. Falls back to None."""
+    if not folder_path:
+        return None
+    base = os.path.basename(folder_path)
+    nums = ''.join([c for c in base if c.isdigit()])
+    try:
+        return int(nums) if nums else None
+    except Exception:
+        return None
+
+
+def write_diagnostics(presence_records, missing_records, analysis_folder):
+    """Write a simple per-run diagnostics CSV with one row per run+client.
+
+    Columns (in order):
+      Architecture, Participants, RunPath, Client, LocalCSVCount, ParticipantCSVCount, FramesLost, Status
+
+    Status is one of: OK, missing frames, broken
+    """
+    pres_df = pd.DataFrame(presence_records)
+    miss_df = pd.DataFrame(missing_records)
+
+    rows = []
+    # Build a lookup for frames lost by (arch, participants, run_path, client_num)
+    miss_lookup = {}
+    if not miss_df.empty:
+        # ensure client_num exists on missing records
+        if 'client_num' not in miss_df.columns:
+            miss_df['client_num'] = miss_df.get('receiver_folder', '').apply(lambda x: _extract_client_num_from_folder(x))
+        for _, r in miss_df.iterrows():
+            key = (r.get('arch'), r.get('participants'), r.get('run_path'), r.get('client_num'))
+            # prefer raw missing count (integer)
+            miss_lookup[key] = int(r.get('missing') or 0)
+
+    # For every presence record (per run/client) create a diagnostics row
+    if not pres_df.empty:
+        for _, p in pres_df.iterrows():
+            arch = p.get('arch')
+            parts = p.get('participants')
+            runp = p.get('run_path')
+            client = p.get('client_num')
+            localc = int(p.get('local_count') or 0)
+            partc = int(p.get('part_count') or 0)
+            frames_lost = miss_lookup.get((arch, parts, runp, client), 0)
+            if localc == 0 and partc == 0:
+                status = 'broken'
+            elif frames_lost > 0:
+                status = 'missing frames'
+            else:
+                status = 'OK'
+            rows.append({'Architecture': arch, 'Participants': parts, 'RunPath': runp,
+                         'Client': client, 'LocalCSVCount': localc, 'ParticipantCSVCount': partc,
+                         'FramesLost': frames_lost, 'Status': status})
+    else:
+        # No presence records: still write a row per missing record (or one OK row)
+        if miss_lookup:
+            for (arch, parts, runp, client), frames_lost in miss_lookup.items():
+                rows.append({'Architecture': arch, 'Participants': parts, 'RunPath': runp,
+                             'Client': client, 'LocalCSVCount': 0, 'ParticipantCSVCount': 0,
+                             'FramesLost': frames_lost, 'Status': ('missing frames' if frames_lost > 0 else 'OK')})
+        else:
+            rows.append({'Architecture': None, 'Participants': None, 'RunPath': None,
+                         'Client': None, 'LocalCSVCount': 0, 'ParticipantCSVCount': 0,
+                         'FramesLost': 0, 'Status': 'OK'})
+
+    diag_df = pd.DataFrame(rows, columns=['Architecture', 'Participants', 'RunPath', 'Client',
+                                         'LocalCSVCount', 'ParticipantCSVCount', 'FramesLost', 'Status'])
+    diag_csv = os.path.join(analysis_folder, 'diagnostics_summary.csv')
+    diag_df.to_csv(diag_csv, index=False, sep=';')
+    print('Wrote diagnostics summary to', diag_csv)
 
 
 def process_scenario(ROOT_FOLDER, scenario):
@@ -500,31 +574,26 @@ def process_scenario(ROOT_FOLDER, scenario):
     arch_map = build_arch_map(scenario_folder)
 
     # compute per-architecture aggregated metrics
-    cpu_results = {}
-    psnr_stats = {}
+    cpu_results = defaultdict(list)  # arch -> list of (participants, cpu_avg) across all runs
+    psnr_stats = defaultdict(dict)
     missing_rows = []
     resolution_rows = []
-    frame_size_rows = []
     latency_rows = []
-    presence_rows = []
+    presence_records = []
 
     for arch, entries in arch_map.items():
-        cpu_results[arch] = []
-        psnr_stats[arch] = {}
-        for n, run_path in sorted(entries, key=lambda x: x[0]):
+        for n, run_path in sorted(entries, key=lambda x: (x[0], x[1])):
             # presence checks for debugging: per client folder, check local/participant files
             client_folders = sorted([p for p in glob.glob(os.path.join(run_path, 'uvgcomm-*')) if os.path.isdir(p)])
             # assign client numbers
             for idx, cf in enumerate(client_folders, start=1):
-                base = os.path.basename(cf)
-                try:
-                    client_num = int(''.join([c for c in base if c.isdigit()]))
-                except Exception:
-                    client_num = idx
+                client_num = _extract_client_num_from_folder(cf) or idx
                 local_paths = glob.glob(os.path.join(cf, 'local_*.csv'))
                 part_paths = glob.glob(os.path.join(cf, 'participant_*.csv'))
                 local_present = bool(local_paths)
                 part_present = bool(part_paths)
+                local_count = len(local_paths)
+                part_count = len(part_paths)
                 local_valid = False
                 part_valid = False
                 if local_present:
@@ -539,9 +608,24 @@ def process_scenario(ROOT_FOLDER, scenario):
                         part_valid = part_df is not None
                     except Exception:
                         part_valid = False
-                presence_rows.append({'arch_client': f"{arch}-{n}", 'client': client_num,
-                                      'local_present': local_present, 'part_present': part_present,
-                                      'local_valid': local_valid, 'part_valid': part_valid})
+                # compute single-letter code similar to previous implementation
+                code = None
+                if local_valid and part_valid:
+                    code = 'B'
+                elif local_valid and not part_present:
+                    code = 'L'
+                elif part_valid and not local_present:
+                    code = 'P'
+                elif not local_present and not part_present:
+                    code = 'M'
+                else:
+                    code = '-'
+                presence_records.append({'arch': arch, 'participants': n, 'client_num': client_num,
+                                         'local_present': local_present, 'part_present': part_present,
+                                         'local_valid': local_valid, 'part_valid': part_valid,
+                                         'local_count': local_count, 'part_count': part_count,
+                                         'code': code, 'run_path': run_path})
+
             metrics = analyze_run(run_path)
             cpu_results[arch].append((n, metrics.get('cpu_avg')))
 
@@ -552,10 +636,11 @@ def process_scenario(ROOT_FOLDER, scenario):
                     psnr_stats[arch][n] = []
                 psnr_stats[arch][n].append(psnr_val)
 
-            # missing frames summary appended
+            # missing frames summary appended (attach client_num inferred from receiver_folder)
             for m in metrics.get('missing_summary', []):
                 row = dict(m)
-                row.update({'arch': arch, 'participants': n, 'run_path': run_path})
+                row.update({'arch': arch, 'participants': n, 'run_path': run_path,
+                            'client_num': _extract_client_num_from_folder(m.get('receiver_folder'))})
                 missing_rows.append(row)
 
             # resolution/frame size + bitrates
@@ -563,7 +648,6 @@ def process_scenario(ROOT_FOLDER, scenario):
                       'avg_height': metrics.get('avg_height'), 'avg_frame_size': metrics.get('avg_frame_size'),
                       'outgoing_bps': metrics.get('outgoing_bps'), 'incoming_bps': metrics.get('incoming_bps')}
             resolution_rows.append(row_rs)
-            frame_size_rows.append(row_rs)
 
             # latency/encode/decode
             latency_rows.append({'arch': arch, 'participants': n,
@@ -589,12 +673,11 @@ def process_scenario(ROOT_FOLDER, scenario):
         psnr_mean[arch] = means
         psnr_std[arch] = stds
 
-    # save CSV summaries
-    if missing_rows:
-        miss_df = pd.DataFrame(missing_rows)
-        miss_csv = os.path.join(ANALYSIS_FOLDER, f'missing_summary.csv')
-        miss_df.to_csv(miss_csv, index=False, sep=';')
-        print('Wrote missing summary to', miss_csv)
+    # write diagnostics (always): combine presence and missing summaries into diagnostics_summary.csv
+    try:
+        write_diagnostics(presence_records=presence_records, missing_records=missing_rows, analysis_folder=ANALYSIS_FOLDER)
+    except Exception as e:
+        print('Failed to write diagnostics summary:', e)
 
     res_df = pd.DataFrame(resolution_rows)
     if not res_df.empty:
@@ -623,14 +706,24 @@ def process_scenario(ROOT_FOLDER, scenario):
         # also plot outgoing/incoming bandwidth per architecture/participants
         try:
             fig, ax = plt.subplots(figsize=(8,4))
+            # use consistent colors per architecture
+            cmap = get_color_map(out_df['Architecture'].unique())
             groups = out_df.groupby('Architecture')
             for i, (arch_name, g) in enumerate(groups):
-                ax.plot(g['Participants'], g['Outgoing_kbps'], marker='o', label=f'{arch_name} Out')
-                ax.plot(g['Participants'], g['Incoming_kbps'], marker='x', linestyle='--', label=f'{arch_name} In')
+                color = cmap.get(arch_name)
+                ax.plot(g['Participants'], g['Outgoing_kbps'], marker='o', label=f'{arch_name} Out', color=color)
+                ax.plot(g['Participants'], g['Incoming_kbps'], marker='x', linestyle='--', label=f'{arch_name} In', color=color)
             ax.set_xlabel('Participants')
             ax.set_ylabel('Bandwidth (kbps)')
             ax.set_title('Outgoing and Incoming Bandwidth')
-            ax.grid(True)
+            # match other plots: horizontal grid only
+            ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
+            # x-axis whole numbers
+            try:
+                xt = sorted(set(int(x) for x in out_df['Participants'].dropna().unique()))
+                ax.set_xticks(xt)
+            except Exception:
+                pass
             ax.legend(fontsize=8)
             plt.tight_layout()
             bw_out = os.path.join(ANALYSIS_FOLDER, 'bandwidth_kbps.svg')
@@ -640,40 +733,8 @@ def process_scenario(ROOT_FOLDER, scenario):
         except Exception as e:
             print('Failed to create bandwidth plot:', e)
 
-    # presence CSVs for debugging (matrix only) and legend
-    if presence_rows:
-        pres_df = pd.DataFrame(presence_rows)
-        try:
-            mat = pres_df.copy()
-            def code(row):
-                lp = row.get('local_present')
-                pp = row.get('part_present')
-                lv = row.get('local_valid')
-                pv = row.get('part_valid')
-                if lv and pv:
-                    return 'B'
-                if lv and not pp:
-                    return 'L'
-                if pv and not lp:
-                    return 'P'
-                if not lp and not pp:
-                    return 'M'
-                return '-'
-            mat['code'] = mat.apply(code, axis=1)
-            pivot = mat.pivot(index='arch_client', columns='client', values='code')
-            pivot_csv = os.path.join(ANALYSIS_FOLDER, 'presence_matrix.csv')
-            pivot.to_csv(pivot_csv, sep=';')
-            with open(pivot_csv, 'a') as lf:
-                lf.write('\n')
-                lf.write('Presence matrix legend:\n')
-                lf.write('B = both local and participant files present\n')
-                lf.write('L = local only\n')
-                lf.write('P = participant only\n')
-                lf.write('M = missing (no files)\n')
-                lf.write('- = invalid (file present but unreadable)\n')
-            print('Wrote presence (matrix + legend) to', pivot_csv)
-        except Exception as e:
-            print('Failed to write presence matrix:', e)
+    # presence matrix generation removed: we now always write a combined diagnostics CSV
+    # (see write_diagnostics). If you still want a matrix, implement a separate function.
 
     lat_df = pd.DataFrame(latency_rows)
     if not lat_df.empty:
@@ -687,42 +748,123 @@ def process_scenario(ROOT_FOLDER, scenario):
         lat_out.to_csv(lat_csv, index=False, sep=';')
         print('Wrote latency summary to', lat_csv)
 
-        # also produce bar chart with Encoding / Decoding / Other (other = total - enc - dec if available)
+        # also produce bar chart with Encoding / Decoding / Other aggregated across runs
         try:
-            fig, ax = plt.subplots(figsize=(8,4))
-            labels = []
-            enc = []
-            dec = []
-            oth = []
-            for _, r in lat_out.iterrows():
-                labels.append(f"{r['Architecture']}-{int(r['Participants'])}")
-                e = float(r.get('Avg. Encoding Time (ms)') or 0)
-                d = float(r.get('Avg. Decoding Time (ms)') or 0)
-                t = float(r.get('Avg. Latency(ms)') or (e + d))
-                o = max(0.0, t - e - d)
-                enc.append(e)
-                dec.append(d)
-                oth.append(o)
-            x = np.arange(len(labels))
-            ax.bar(x, enc, label='Encoding')
-            ax.bar(x, dec, bottom=enc, label='Decoding')
-            bottom_ed = np.array(enc) + np.array(dec)
-            ax.bar(x, oth, bottom=bottom_ed, label='Other')
-            ax.set_xticks(x)
-            ax.set_xticklabels(labels, rotation=45, ha='right')
-            ax.set_ylabel('Time (ms)')
-            ax.set_title('Latency breakdown')
-            ax.legend()
-            plt.tight_layout()
-            bar_out = os.path.join(ANALYSIS_FOLDER, 'latency_breakdown.svg')
-            fig.savefig(bar_out)
-            plt.close(fig)
-            print('Wrote latency breakdown plot to', bar_out)
+            # determine expected number of runs per (arch, participants)
+            expected_runs = {}
+            for arch, entries in arch_map.items():
+                for n, _ in entries:
+                    expected_runs[(arch, n)] = expected_runs.get((arch, n), 0) + 1
+
+            # group lat_df per arch/participants and compute averages only when all runs present
+            agg_rows = []
+            if not lat_df.empty:
+                grouped = lat_df.groupby(['arch', 'participants'])
+                for (arch, parts), g in grouped:
+                    try:
+                        parts_i = int(parts)
+                    except Exception:
+                        parts_i = parts
+                    key = (arch, parts_i)
+                    exp = expected_runs.get(key, 1)
+                    # Build total-latency list: existing values filled with 999 and pad missing runs with 999
+                    if 'avg_latency_ms' in g:
+                        tvals = list(pd.to_numeric(g['avg_latency_ms'], errors='coerce').fillna(999).astype(float).tolist())
+                    else:
+                        tvals = []
+                    if len(tvals) < exp:
+                        tvals.extend([999.0] * (exp - len(tvals)))
+                    mean_t = float(np.mean(tvals)) if tvals else 999.0
+
+                    # For encode/decode, only compute mean if we have exactly exp runs and none are null
+                    mean_e = None
+                    mean_d = None
+                    if len(g) == exp and 'avg_encode_ms' in g and 'avg_decode_ms' in g:
+                        if not g['avg_encode_ms'].isnull().any() and not g['avg_decode_ms'].isnull().any():
+                            mean_e = float(np.mean(g['avg_encode_ms']))
+                            mean_d = float(np.mean(g['avg_decode_ms']))
+
+                    agg_rows.append({'arch': arch, 'participants': parts_i, 'mean_encode': mean_e,
+                                     'mean_decode': mean_d, 'mean_total': mean_t})
+
+            # plot aggregated rows
+            if agg_rows:
+                fig, ax = plt.subplots(figsize=(8,4))
+                labels = []
+                enc = []
+                dec = []
+                oth = []
+                # sort for consistent ordering
+                agg_rows = sorted(agg_rows, key=lambda x: (x['arch'], x['participants']))
+                for r in agg_rows:
+                    labels.append(f"{r['arch']}-{int(r['participants'])}")
+                    # mean_total always present (we filled missing with 999 earlier)
+                    t = r['mean_total']
+                    # determine if encode/decode were present for all runs
+                    e = r.get('mean_encode')
+                    d = r.get('mean_decode')
+                    enc_present = e is not None
+                    dec_present = d is not None
+                    # compute 'other' as remainder; if enc/dec missing, they contribute 0
+                    enc_val = float(e) if enc_present else 0.0
+                    dec_val = float(d) if dec_present else 0.0
+                    o = max(0.0, float(t) - enc_val - dec_val)
+                    # append values for plotting; use capped decoding for visual
+                    if enc_present:
+                        enc.append(enc_val)
+                    else:
+                        enc.append(0.0)
+                    if dec_present:
+                        dec.append(min(dec_val, 999.0))
+                    else:
+                        dec.append(0.0)
+                    oth.append(o)
+                x = np.arange(len(labels))
+                # draw bars: only non-zero stacks will appear; legend will include all three
+                ax.bar(x, enc, label='Encoding')
+                ax.bar(x, dec, bottom=enc, label='Decoding')
+                bottom_ed = np.array(enc) + np.array(dec)
+                ax.bar(x, oth, bottom=bottom_ed, label='Other')
+                ax.set_xticks(x)
+                ax.set_xticklabels(labels, rotation=45, ha='right')
+                ax.set_ylabel('Time (ms)')
+                ax.set_title('Latency breakdown')
+                ax.legend()
+                plt.tight_layout()
+                bar_out = os.path.join(ANALYSIS_FOLDER, 'latency_breakdown.svg')
+                fig.savefig(bar_out)
+                plt.close(fig)
+                print('Wrote latency breakdown plot to', bar_out)
+            else:
+                # write a placeholder figure so the file is always updated and user sees why nothing plotted
+                try:
+                    fig, ax = plt.subplots(figsize=(6,3))
+                    ax.text(0.5, 0.5, 'No complete aggregated latency data available to plot', ha='center', va='center')
+                    ax.axis('off')
+                    bar_out = os.path.join(ANALYSIS_FOLDER, 'latency_breakdown.svg')
+                    fig.savefig(bar_out)
+                    plt.close(fig)
+                    print('Wrote placeholder latency breakdown plot to', bar_out)
+                except Exception as e:
+                    print('Failed to write placeholder latency plot:', e)
         except Exception as e:
             print('Failed to create latency breakdown plot:', e)
 
-    # CPU plot
-    plot_cpu(cpu_results, ANALYSIS_FOLDER, scenario)
+    # CPU plot: average across runs for same participant counts before plotting
+    averaged_cpu = {}
+    for arch, rows in cpu_results.items():
+        by_n = defaultdict(list)
+        for n, val in rows:
+            if val is not None:
+                by_n[n].append(val)
+        averaged = []
+        for n, vals in sorted(by_n.items()):
+            try:
+                averaged.append((n, float(np.mean(vals))))
+            except Exception:
+                averaged.append((n, None))
+        averaged_cpu[arch] = averaged
+    plot_cpu(averaged_cpu, ANALYSIS_FOLDER, scenario)
 
     # PSNR plot
     if not psnr_mean.empty:

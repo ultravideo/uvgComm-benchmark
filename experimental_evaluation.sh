@@ -23,6 +23,12 @@ RUN_FOLDER="./results/$RUN_ID"
 
 USERS_FILE="./usernames.conf"
 
+# Per-benchmark wait values (seconds). Edit these two values to tune timing.
+# - WAIT_AFTER_INVITE: seconds to wait after each client is called
+# - WAIT_AFTER_SETTINGS: seconds to wait after initial settings before calling clients
+WAIT_AFTER_INVITE=10
+WAIT_AFTER_SETTINGS=5
+
 # ----------------------- functions ------------------------
 
 prepare_tests() {
@@ -139,8 +145,9 @@ create_host_script() {
     local experiment_duration_ms=$6
     local cooldown_duration_ms=$7
 
-    local wait_after_invite=6      # seconds between calling each client
-    local wait_after_settings=3
+    # Use globally-configured wait times (default set at top of file)
+    local wait_after_invite=${WAIT_AFTER_INVITE}
+    local wait_after_settings=${WAIT_AFTER_SETTINGS}
 
 
     echo "# Auto-generated host script" > "$output_file"
@@ -297,7 +304,9 @@ run_scenario() {
         local current_time_ms=$(date +%s%3N)
 
         # Setup + warmup + experiment
-        local setup_time_ms=$((CLIENTS * 6000 + 3000)) # scales with clients
+        # setup time scales with number of clients and configured waits (in seconds)
+        # Each client: WAIT_AFTER_INVITE seconds after call, plus one initial settings wait
+        local setup_time_ms=$(( CLIENTS * WAIT_AFTER_INVITE * 1000 + WAIT_AFTER_SETTINGS * 1000 ))
         local warmup_time_ms=10000                      # 10 seconds
         local experiment_time_ms=60000                  # 1 minute
         local cooldown_time_ms=5000                     # 5 seconds

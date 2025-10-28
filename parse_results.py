@@ -93,6 +93,107 @@ def ensure_dir(p):
     os.makedirs(p, exist_ok=True)
 
 
+def detect_missing_frames(local_by_cname, participant_by_cname):
+    """Detect missing frames by comparing size sequences between local and participant traces.
+
+    Returns a list of dicts with keys: cname, receiver_folder, total_local_frames,
+    delivered, missing, pct_missing, intra_count, intra_offset
+    """
+    missing_summary = []
+    # Missing frame detection based on frame sizes (order-preserving). This is
+    # more robust than timestamp nearest-neighbor matching. Assumptions:
+    # - Local and participant CSVs list frames in chronological order.
+    # - Frame sizes are equal except for intra-frames where the receiver is
+    #   consistently ~86 bytes smaller. The intra period is 64 frames.
+    for cname, local_info in local_by_cname.items():
+        local_df = local_info['df']
+        # find size column
+        size_col = None
+        for col in ['Size(Bytes)', 'Size']:
+            if col in local_df.columns:
+                size_col = col
+                break
+        if size_col is None:
+            # fallback: can't perform size-based detection
+            continue
+        local_sizes = pd.to_numeric(local_df[size_col], errors='coerce').dropna().astype(int).tolist()
+
+        # for each participant that has this cname
+        if cname not in participant_by_cname:
+            continue
+        for pinfo in participant_by_cname[cname]:
+            p_df = pinfo['df']
+            part_size_col = None
+            for col in ['Size(Bytes)', 'Size']:
+                if col in p_df.columns:
+                    part_size_col = col
+                    break
+            if part_size_col is None:
+                # cannot analyze this participant
+                continue
+            part_sizes = pd.to_numeric(p_df[part_size_col], errors='coerce').dropna().astype(int).tolist()
+
+            delivered = 0
+            j = 0
+            lookahead = 3
+            # detect intra-frame offset by checking which modulo-64 offset yields the most
+            # matches where participant size ~= local_size - 86 (within tolerance)
+            intra_offset = 0
+            intra_detected = 0
+            if local_sizes and part_sizes:
+                best_count = -1
+                for off in range(64):
+                    cnt = 0
+                    for i_idx in range(off, len(local_sizes), 64):
+                        lsamp = local_sizes[i_idx]
+                        # check anywhere in participant sizes for match within tolerance
+                        for ps in part_sizes:
+                            if abs(lsamp - ps - 86) <= 16:
+                                cnt += 1
+                                break
+                    if cnt > best_count:
+                        best_count = cnt
+                        intra_offset = off
+                intra_detected = best_count if best_count > 0 else 0
+            for i, ls in enumerate(local_sizes):
+                if j >= len(part_sizes):
+                    break
+                matched = False
+                # check direct alignment first
+                ps = part_sizes[j]
+                # intra-frame detection: index modulo 64 == intra_offset
+                is_intra = ((i - intra_offset) % 64 == 0) if len(local_sizes) >= 64 else False
+                if (not is_intra and ls == ps) or (is_intra and abs(ls - ps - 86) <= 16):
+                    # count intra-frame deliveries when matched by intra rule
+                    if is_intra:
+                        intra_detected += 1
+                    delivered += 1
+                    j += 1
+                    continue
+                # search ahead a few frames in participant stream to allow small desync
+                for k in range(j+1, min(j+1+lookahead, len(part_sizes))):
+                    ps2 = part_sizes[k]
+                    if (not is_intra and ls == ps2) or (is_intra and abs(ls - ps2 - 86) <= 16):
+                        if is_intra:
+                            intra_detected += 1
+                        delivered += 1
+                        j = k + 1
+                        matched = True
+                        break
+                if not matched:
+                    # local frame not found in near future -> considered missing
+                    pass
+            total_local = len(local_sizes)
+            missing = max(0, total_local - delivered)
+            pct_missing = 100.0 * missing / total_local if total_local > 0 else None
+            missing_summary.append({'cname': cname, 'receiver_folder': pinfo.get('client_folder'),
+                                     'total_local_frames': total_local, 'delivered': delivered,
+                                     'missing': missing, 'pct_missing': pct_missing,
+                                     'intra_count': int(intra_detected), 'intra_offset': int(intra_offset)})
+
+    return missing_summary
+
+
 def analyze_run(run_path):
     """Analyze a single run directory (contains cpu_usage.csv, metadata.txt, uvgcomm-client* folders).
     Returns a dictionary of aggregated metrics.
@@ -309,73 +410,8 @@ def analyze_run(run_path):
     metrics['avg_decode_ms'] = float(np.mean(decode_times)) if decode_times else None
     metrics['avg_part_frame_size'] = float(np.mean(participant_sizes)) if participant_sizes else None
 
-    # Missing frame detection based on frame sizes (order-preserving). This is
-    # more robust than timestamp nearest-neighbor matching. Assumptions:
-    # - Local and participant CSVs list frames in chronological order.
-    # - Frame sizes are equal except for intra-frames where the receiver is
-    #   consistently ~86 bytes smaller. The intra period is 64 frames.
-    missing_summary = []
-    for cname, local_info in local_by_cname.items():
-        local_df = local_info['df']
-        # find size column
-        size_col = None
-        for col in ['Size(Bytes)', 'Size']:
-            if col in local_df.columns:
-                size_col = col
-                break
-        if size_col is None:
-            # fallback: can't perform size-based detection
-            continue
-        local_sizes = pd.to_numeric(local_df[size_col], errors='coerce').dropna().astype(int).tolist()
-
-        # for each participant that has this cname
-        if cname not in participant_by_cname:
-            continue
-        for pinfo in participant_by_cname[cname]:
-            p_df = pinfo['df']
-            part_size_col = None
-            for col in ['Size(Bytes)', 'Size']:
-                if col in p_df.columns:
-                    part_size_col = col
-                    break
-            if part_size_col is None:
-                # cannot analyze this participant
-                continue
-            part_sizes = pd.to_numeric(p_df[part_size_col], errors='coerce').dropna().astype(int).tolist()
-
-            delivered = 0
-            j = 0
-            lookahead = 3
-            for i, ls in enumerate(local_sizes):
-                if j >= len(part_sizes):
-                    break
-                matched = False
-                # check direct alignment first
-                ps = part_sizes[j]
-                # intra-frame detection: index modulo 64 == 0
-                is_intra = (i % 64 == 0)
-                if (not is_intra and ls == ps) or (is_intra and abs(ls - ps - 86) <= 16):
-                    delivered += 1
-                    j += 1
-                    continue
-                # search ahead a few frames in participant stream to allow small desync
-                for k in range(j+1, min(j+1+lookahead, len(part_sizes))):
-                    ps2 = part_sizes[k]
-                    if (not is_intra and ls == ps2) or (is_intra and abs(ls - ps2 - 86) <= 16):
-                        delivered += 1
-                        j = k + 1
-                        matched = True
-                        break
-                if not matched:
-                    # local frame not found in near future -> considered missing
-                    pass
-            total_local = len(local_sizes)
-            missing = max(0, total_local - delivered)
-            pct_missing = 100.0 * missing / total_local if total_local > 0 else None
-            missing_summary.append({'cname': cname, 'receiver_folder': pinfo.get('client_folder'),
-                                     'total_local_frames': total_local, 'delivered': delivered,
-                                     'missing': missing, 'pct_missing': pct_missing})
-
+    # Missing frame detection delegated to helper function for clarity
+    missing_summary = detect_missing_frames(local_by_cname, participant_by_cname)
     metrics['missing_summary'] = missing_summary
 
     return metrics
@@ -520,8 +556,11 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
             miss_df['client_num'] = miss_df.get('receiver_folder', '').apply(lambda x: _extract_client_num_from_folder(x))
         for _, r in miss_df.iterrows():
             key = (r.get('arch'), r.get('participants'), r.get('run_path'), r.get('client_num'))
-            # prefer raw missing count (integer)
-            miss_lookup[key] = int(r.get('missing') or 0)
+            # prefer raw missing count (integer) and capture intra_count if present
+            miss_lookup[key] = {
+                'missing': int(r.get('missing') or 0),
+                'intra_count': int(r.get('intra_count') or 0)
+            }
 
     # For every presence record (per run/client) create a diagnostics row
     if not pres_df.empty:
@@ -532,7 +571,9 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
             client = p.get('client_num')
             localc = int(p.get('local_count') or 0)
             partc = int(p.get('part_count') or 0)
-            frames_lost = miss_lookup.get((arch, parts, runp, client), 0)
+            mk = miss_lookup.get((arch, parts, runp, client), {'missing': 0, 'intra_count': 0})
+            frames_lost = mk.get('missing', 0)
+            intra_count = mk.get('intra_count', 0)
             if localc == 0 and partc == 0:
                 status = 'broken'
             elif frames_lost > 0:
@@ -541,21 +582,24 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
                 status = 'OK'
             rows.append({'Architecture': arch, 'Participants': parts, 'RunPath': runp,
                          'Client': client, 'LocalCSVCount': localc, 'ParticipantCSVCount': partc,
-                         'FramesLost': frames_lost, 'Status': status})
+                         'FramesLost': frames_lost, 'IntraFrames': intra_count, 'Status': status})
     else:
         # No presence records: still write a row per missing record (or one OK row)
         if miss_lookup:
-            for (arch, parts, runp, client), frames_lost in miss_lookup.items():
+            for (arch, parts, runp, client), val in miss_lookup.items():
+                frames_lost = val.get('missing', 0)
+                intra_count = val.get('intra_count', 0)
                 rows.append({'Architecture': arch, 'Participants': parts, 'RunPath': runp,
                              'Client': client, 'LocalCSVCount': 0, 'ParticipantCSVCount': 0,
-                             'FramesLost': frames_lost, 'Status': ('missing frames' if frames_lost > 0 else 'OK')})
+                             'FramesLost': frames_lost, 'IntraFrames': intra_count,
+                             'Status': ('missing frames' if frames_lost > 0 else 'OK')})
         else:
             rows.append({'Architecture': None, 'Participants': None, 'RunPath': None,
                          'Client': None, 'LocalCSVCount': 0, 'ParticipantCSVCount': 0,
                          'FramesLost': 0, 'Status': 'OK'})
 
     diag_df = pd.DataFrame(rows, columns=['Architecture', 'Participants', 'RunPath', 'Client',
-                                         'LocalCSVCount', 'ParticipantCSVCount', 'FramesLost', 'Status'])
+                                         'LocalCSVCount', 'ParticipantCSVCount', 'FramesLost', 'IntraFrames', 'Status'])
     diag_csv = os.path.join(analysis_folder, 'diagnostics_summary.csv')
     diag_df.to_csv(diag_csv, index=False, sep=';')
     print('Wrote diagnostics summary to', diag_csv)

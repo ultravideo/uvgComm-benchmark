@@ -128,7 +128,8 @@ def _match_with_offset(local_sizes, part_sizes, off, intra_delta, intra_period, 
     return delivered, intra_detected
 
 
-def detect_missing_frames(local_by_cname, participant_by_cname, intra_delta=86, intra_period=64, lookahead=3):
+def detect_missing_frames(local_by_cname, participant_by_cname, start_ts=None, end_ts=None,
+                                                    intra_delta=86, intra_period=64, lookahead=3):
     """Detect missing frames by comparing size sequences between local and participant traces.
 
     Uses a deterministic greedy matcher. It tries all possible intra-frame offsets
@@ -137,14 +138,34 @@ def detect_missing_frames(local_by_cname, participant_by_cname, intra_delta=86, 
       - normal frame: local_size == part_size
       - intra frame: local_size == part_size + intra_delta
 
-    Returns a list of dicts with keys: cname, receiver_folder, total_local_frames,
-    delivered, missing, pct_missing, intra_count, intra_offset
+        Optional arguments:
+            start_ts, end_ts: if provided, local frames will be filtered to the closed
+                interval [start_ts, end_ts] before matching. Participant traces are NOT
+                filtered here (they are used only for verification).
+
+        Returns a list of dicts with keys: cname, receiver_folder, total_local_frames,
+        delivered, missing, pct_missing, intra_count, intra_offset
     """
     missing_summary = []
 
     # for each cname in local results
     for cname, local_info in local_by_cname.items():
+        # Work on a local copy to avoid mutating input structures
         local_df = local_info['df']
+        if start_ts is not None and end_ts is not None:
+            try:
+                tscol = None
+                for c in local_df.columns:
+                    if 'timestamp' in c.lower() or 'time' == c.lower() or 'timestamp_ms' in c.lower():
+                        tscol = c
+                        break
+                if tscol is None:
+                    tscol = local_df.columns[0]
+                df_ts = pd.to_numeric(local_df[tscol], errors='coerce')
+                local_df = local_df[(df_ts >= start_ts) & (df_ts <= end_ts)]
+            except Exception:
+                # if filtering fails for any reason, proceed with the unfiltered local_df
+                pass
         # find size column in local
         size_col = None
         for col in ['Size(Bytes)', 'Size']:
@@ -207,6 +228,7 @@ def analyze_run(run_path):
     """Analyze a single run directory (contains cpu_usage.csv, metadata.txt, uvgcomm-client* folders).
     Returns a dictionary of aggregated metrics.
     """
+    print(f"Analyzing run: {run_path}")
     metrics = {}
     metadata = parse_metadata(os.path.join(run_path, 'metadata.txt'))
     metrics['metadata'] = metadata
@@ -420,7 +442,10 @@ def analyze_run(run_path):
     metrics['avg_part_frame_size'] = float(np.mean(participant_sizes)) if participant_sizes else None
 
     # Missing frame detection delegated to helper function for clarity
-    missing_summary = detect_missing_frames(local_by_cname, participant_by_cname)
+    # Pass the metadata start/end timestamps so matching only considers local
+    # frames captured during the run interval. Participant traces remain unfiltered.
+    missing_summary = detect_missing_frames(local_by_cname, participant_by_cname,
+                                            start_ts=start_ts, end_ts=end_ts)
     metrics['missing_summary'] = missing_summary
 
     return metrics
@@ -568,7 +593,9 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
             # prefer raw missing count (integer) and capture intra_count if present
             miss_lookup[key] = {
                 'missing': int(r.get('missing') or 0),
-                'intra_count': int(r.get('intra_count') or 0)
+                'intra_count': int(r.get('intra_count') or 0),
+                # number of local frames that were actually analyzed (after any local filtering)
+                'analyzed_frames': int(r.get('total_local_frames') or 0)
             }
 
     # For every presence record (per run/client) create a diagnostics row
@@ -580,9 +607,10 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
             client = p.get('client_num')
             localc = int(p.get('local_count') or 0)
             partc = int(p.get('part_count') or 0)
-            mk = miss_lookup.get((arch, parts, runp, client), {'missing': 0, 'intra_count': 0})
+            mk = miss_lookup.get((arch, parts, runp, client), {'missing': 0, 'intra_count': 0, 'analyzed_frames': 0})
             frames_lost = mk.get('missing', 0)
             intra_count = mk.get('intra_count', 0)
+            analyzed = mk.get('analyzed_frames', 0)
             if localc == 0 and partc == 0:
                 status = 'broken'
             elif frames_lost > 0:
@@ -590,8 +618,9 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
             else:
                 status = 'OK'
             rows.append({'Architecture': arch, 'Participants': parts, 'RunPath': runp,
-                         'Client': client, 'LocalCSVCount': localc, 'ParticipantCSVCount': partc,
-                         'FramesLost': frames_lost, 'IntraFrames': intra_count, 'Status': status})
+                         'Client': client, 'Local results': localc, 'Participant results': partc,
+                         'Frames Lost': frames_lost, 'Intra Frames': intra_count, 'Analyzed Frames': analyzed,
+                         'Status': status})
     else:
         # No presence records: still write a row per missing record (or one OK row)
         if miss_lookup:
@@ -599,16 +628,17 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
                 frames_lost = val.get('missing', 0)
                 intra_count = val.get('intra_count', 0)
                 rows.append({'Architecture': arch, 'Participants': parts, 'RunPath': runp,
-                             'Client': client, 'LocalCSVCount': 0, 'ParticipantCSVCount': 0,
-                             'FramesLost': frames_lost, 'IntraFrames': intra_count,
+                             'Client': client, 'Local results': 0, 'Participant results': 0,
+                             'Frames Lost': frames_lost, 'Intra Frames': intra_count,
+                             'Analyzed Frames': int(val.get('analyzed_frames', 0)),
                              'Status': ('missing frames' if frames_lost > 0 else 'OK')})
         else:
             rows.append({'Architecture': None, 'Participants': None, 'RunPath': None,
-                         'Client': None, 'LocalCSVCount': 0, 'ParticipantCSVCount': 0,
-                         'FramesLost': 0, 'Status': 'OK'})
+                         'Client': None, 'Local results': 0, 'Participant results': 0,
+                         'Frames Lost': 0, 'Analyzed Frames': 0, 'Status': 'OK'})
 
     diag_df = pd.DataFrame(rows, columns=['Architecture', 'Participants', 'RunPath', 'Client',
-                                         'LocalCSVCount', 'ParticipantCSVCount', 'FramesLost', 'IntraFrames', 'Status'])
+                                         'Local results', 'Participant results', 'Frames Lost', 'Intra Frames', 'Analyzed Frames', 'Status'])
     diag_csv = os.path.join(analysis_folder, 'diagnostics_summary.csv')
     diag_df.to_csv(diag_csv, index=False, sep=';')
     print('Wrote diagnostics summary to', diag_csv)

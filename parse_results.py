@@ -93,103 +93,112 @@ def ensure_dir(p):
     os.makedirs(p, exist_ok=True)
 
 
-def detect_missing_frames(local_by_cname, participant_by_cname):
+def _match_with_offset(local_sizes, part_sizes, off, intra_delta, intra_period, lookahead):
+    """Greedy matcher: given an intra offset, return (delivered, intra_detected).
+
+    delivered: number of matched local frames
+    intra_detected: number of intra frames matched according to this offset
+    """
+    delivered = 0
+    intra_detected = 0
+    j = 0
+    for i, ls in enumerate(local_sizes):
+        if j >= len(part_sizes):
+            break
+        is_intra = ((i - off) % intra_period == 0) if len(local_sizes) >= intra_period else False
+        ps = part_sizes[j]
+        if (is_intra and ls == ps + intra_delta) or (not is_intra and ls == ps):
+            delivered += 1
+            if is_intra:
+                intra_detected += 1
+            j += 1
+            continue
+        matched = False
+        for k in range(j+1, min(j+1+lookahead, len(part_sizes))):
+            ps2 = part_sizes[k]
+            if (is_intra and ls == ps2 + intra_delta) or (not is_intra and ls == ps2):
+                delivered += 1
+                if is_intra:
+                    intra_detected += 1
+                j = k + 1
+                matched = True
+                break
+        if not matched:
+            pass
+    return delivered, intra_detected
+
+
+def detect_missing_frames(local_by_cname, participant_by_cname, intra_delta=86, intra_period=64, lookahead=3):
     """Detect missing frames by comparing size sequences between local and participant traces.
+
+    Uses a deterministic greedy matcher. It tries all possible intra-frame offsets
+    (0..intra_period-1) and picks the offset that yields the maximum delivered frames
+    using exact equality checks:
+      - normal frame: local_size == part_size
+      - intra frame: local_size == part_size + intra_delta
 
     Returns a list of dicts with keys: cname, receiver_folder, total_local_frames,
     delivered, missing, pct_missing, intra_count, intra_offset
     """
     missing_summary = []
-    # Missing frame detection based on frame sizes (order-preserving). This is
-    # more robust than timestamp nearest-neighbor matching. Assumptions:
-    # - Local and participant CSVs list frames in chronological order.
-    # - Frame sizes are equal except for intra-frames where the receiver is
-    #   consistently ~86 bytes smaller. The intra period is 64 frames.
+
+    # for each cname in local results
     for cname, local_info in local_by_cname.items():
         local_df = local_info['df']
-        # find size column
+        # find size column in local
         size_col = None
         for col in ['Size(Bytes)', 'Size']:
             if col in local_df.columns:
                 size_col = col
                 break
         if size_col is None:
-            # fallback: can't perform size-based detection
             continue
+        # get the size column values as list of ints
         local_sizes = pd.to_numeric(local_df[size_col], errors='coerce').dropna().astype(int).tolist()
+        # If no sizes, skip
+        if not local_sizes:
+            print(f"Warning: Could not find size column in  results for cname: {cname}")
+            continue
 
-        # for each participant that has this cname
         if cname not in participant_by_cname:
+            print(f"Warning: Could not find cname in participant list: {cname}")
             continue
         for pinfo in participant_by_cname[cname]:
             p_df = pinfo['df']
+            # find size column in participant csv results
             part_size_col = None
             for col in ['Size(Bytes)', 'Size']:
                 if col in p_df.columns:
                     part_size_col = col
                     break
             if part_size_col is None:
-                # cannot analyze this participant
                 continue
             part_sizes = pd.to_numeric(p_df[part_size_col], errors='coerce').dropna().astype(int).tolist()
 
-            delivered = 0
-            j = 0
-            lookahead = 3
-            # detect intra-frame offset by checking which modulo-64 offset yields the most
-            # matches where participant size ~= local_size - 86 (within tolerance)
-            intra_offset = 0
-            intra_detected = 0
-            if local_sizes and part_sizes:
-                best_count = -1
-                for off in range(64):
-                    cnt = 0
-                    for i_idx in range(off, len(local_sizes), 64):
-                        lsamp = local_sizes[i_idx]
-                        # check anywhere in participant sizes for match within tolerance
-                        for ps in part_sizes:
-                            if abs(lsamp - ps - 86) <= 16:
-                                cnt += 1
-                                break
-                    if cnt > best_count:
-                        best_count = cnt
-                        intra_offset = off
-                intra_detected = best_count if best_count > 0 else 0
-            for i, ls in enumerate(local_sizes):
-                if j >= len(part_sizes):
-                    break
-                matched = False
-                # check direct alignment first
-                ps = part_sizes[j]
-                # intra-frame detection: index modulo 64 == intra_offset
-                is_intra = ((i - intra_offset) % 64 == 0) if len(local_sizes) >= 64 else False
-                if (not is_intra and ls == ps) or (is_intra and abs(ls - ps - 86) <= 16):
-                    # count intra-frame deliveries when matched by intra rule
-                    if is_intra:
-                        intra_detected += 1
-                    delivered += 1
-                    j += 1
-                    continue
-                # search ahead a few frames in participant stream to allow small desync
-                for k in range(j+1, min(j+1+lookahead, len(part_sizes))):
-                    ps2 = part_sizes[k]
-                    if (not is_intra and ls == ps2) or (is_intra and abs(ls - ps2 - 86) <= 16):
-                        if is_intra:
-                            intra_detected += 1
-                        delivered += 1
-                        j = k + 1
-                        matched = True
-                        break
-                if not matched:
-                    # local frame not found in near future -> considered missing
-                    pass
+            # If no sizes, skip
+            if not part_sizes:
+                print(f"Warning: Could not find size column in participant results for cname: {cname}")
+                continue
+
+            # Try each intra offset and pick the one that yields the most matches in small number
+            best_offset = 0
+            best_delivered = -1
+            for offset in range(intra_period):
+                delivered_try, _ = _match_with_offset(local_sizes, part_sizes, offset, intra_delta, intra_period, lookahead)
+                if delivered_try > best_delivered:
+                    best_delivered = delivered_try
+                    best_offset = offset
+
+            # Re-run match using best_offset to compute intra_detected and final delivered
+            delivered, intra_detected = _match_with_offset(local_sizes, part_sizes, best_offset, intra_delta, intra_period, lookahead)
+
             total_local = len(local_sizes)
             missing = max(0, total_local - delivered)
             pct_missing = 100.0 * missing / total_local if total_local > 0 else None
             missing_summary.append({'cname': cname, 'receiver_folder': pinfo.get('client_folder'),
                                      'total_local_frames': total_local, 'delivered': delivered,
                                      'missing': missing, 'pct_missing': pct_missing,
-                                     'intra_count': int(intra_detected), 'intra_offset': int(intra_offset)})
+                                     'intra_count': int(intra_detected), 'intra_offset': int(best_offset)})
 
     return missing_summary
 

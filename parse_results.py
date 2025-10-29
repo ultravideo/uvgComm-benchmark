@@ -29,6 +29,10 @@ from collections import defaultdict
 # Use non-interactive backend for matplotlib
 matplotlib.use("Agg")
 
+# limit unmatched-frame debug prints per detect_missing_frames run
+_UNMATCHED_PRINT_LIMIT = int(os.environ.get('UVGCOMM_UNMATCHED_PRINT_LIMIT', '50'))
+_unmatched_print_count = 0
+
 
 def read_csv_guess(path, na_values=["", "NA", "null"], dtype=None):
     """Try to read CSV using common separators. Returns DataFrame or None on failure."""
@@ -170,7 +174,7 @@ def get_min_max_ts(df):
     return None, None
 
 
-def _match_with_offset(local_sizes, part_sizes, off, intra_delta, intra_period, lookahead):
+def _match_with_offset(local_sizes, part_sizes, off, intra_delta, intra_period, lookahead, verbose=False):
     """Greedy matcher: given an intra offset, return (delivered, intra_detected).
 
     delivered: number of matched local frames
@@ -178,9 +182,23 @@ def _match_with_offset(local_sizes, part_sizes, off, intra_delta, intra_period, 
     """
     delivered = 0
     intra_detected = 0
+    # declare global counter up-front so any use in this function is valid
+    global _unmatched_print_count
     j = 0
     for i, ls in enumerate(local_sizes):
         if j >= len(part_sizes):
+            # Participant frames exhausted: remaining local frames are unmatched.
+            # If verbose, emit prints for trailing unmatched frames (respecting the global print limit).
+            if verbose:
+                for rem_pos in range(i, len(local_sizes)):
+                    if _unmatched_print_count >= _UNMATCHED_PRINT_LIMIT:
+                        break
+                    try:
+                        window = []
+                    except Exception:
+                        window = None
+                    print(f"Unmatched local frame (trailing): pos={rem_pos} size={local_sizes[rem_pos]} lookahead_window={window}")
+                    _unmatched_print_count += 1
             break
         is_intra = ((i - off) % intra_period == 0) if len(local_sizes) >= intra_period else False
         ps = part_sizes[j]
@@ -201,7 +219,15 @@ def _match_with_offset(local_sizes, part_sizes, off, intra_delta, intra_period, 
                 matched = True
                 break
         if not matched:
-            pass
+            # Debug: report unmatched local frame (index and size) and the current participant lookahead window
+            if verbose:
+                if _unmatched_print_count < _UNMATCHED_PRINT_LIMIT:
+                    try:
+                        window = part_sizes[j:j+lookahead+1]
+                    except Exception:
+                        window = None
+                    print(f"Unmatched local frame: pos={i} size={ls} lookahead_window={window}")
+                    _unmatched_print_count += 1
     return delivered, intra_detected
 
 
@@ -223,6 +249,9 @@ def detect_missing_frames(local_by_cname, participant_by_cname, start_ts=None, e
         Returns a list of dicts with keys: cname, receiver_folder, total_local_frames,
         delivered, missing, pct_missing, intra_count, intra_offset
     """
+    # reset per-run unmatched-frame print counter
+    global _unmatched_print_count
+    _unmatched_print_count = 0
     missing_summary = []
 
     # for each cname in local results
@@ -261,7 +290,8 @@ def detect_missing_frames(local_by_cname, participant_by_cname, start_ts=None, e
                     best_offset = offset
 
             # Re-run match using best_offset to compute intra_detected and final delivered
-            delivered, intra_detected = _match_with_offset(local_sizes, part_sizes, best_offset, intra_delta, intra_period, lookahead)
+            # enable verbose printing only for the final pass (not during the offset search)
+            delivered, intra_detected = _match_with_offset(local_sizes, part_sizes, best_offset, intra_delta, intra_period, lookahead, verbose=True)
 
             total_local = len(local_sizes)
             missing = max(0, total_local - delivered)
@@ -348,8 +378,18 @@ def analyze_run(run_path):
             df = read_csv_guess(path)
             if df is None:
                 continue
-            # filter by timestamp range if possible
-            df = filter_df_by_ts(df, start_ts, end_ts)
+            # Limit participant traces at the beginning of the run window (drop any rows
+            # with timestamps earlier than start_ts) but do NOT truncate the end —
+            # sent frames may arrive after the run end timestamp.
+            if start_ts is not None:
+                try:
+                    tscol = find_timestamp_column(df)
+                    if tscol is not None:
+                        df_ts = pd.to_numeric(df[tscol], errors='coerce')
+                        df = df[df_ts >= start_ts]
+                except Exception:
+                    # if filtering fails, keep original df
+                    pass
             participant_by_cname[cname].append({'path': path, 'df': df, 'client_folder': cfolder})
 
     metrics['local_by_cname'] = local_by_cname

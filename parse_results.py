@@ -93,6 +93,83 @@ def ensure_dir(p):
     os.makedirs(p, exist_ok=True)
 
 
+def find_timestamp_column(df):
+    """Return the best candidate timestamp column name or None."""
+    if df is None or df.columns is None:
+        return None
+    for c in df.columns:
+        lc = c.lower()
+        if 'timestamp' in lc or lc == 'time' or 'timestamp_ms' in lc:
+            return c
+    # fallback to first column
+    try:
+        return df.columns[0]
+    except Exception:
+        return None
+def filter_df_by_ts(df, start_ts, end_ts):
+    """Filter DataFrame by timestamp interval [start_ts, end_ts] using a guessed timestamp column.
+
+    If start_ts or end_ts is None, returns the original df.
+    If filtering fails for any reason, returns the original df.
+    """
+    if df is None or start_ts is None or end_ts is None:
+        return df
+    tscol = find_timestamp_column(df)
+    if tscol is None:
+        return df
+    try:
+        df_ts = pd.to_numeric(df[tscol], errors='coerce')
+        return df[(df_ts >= start_ts) & (df_ts <= end_ts)]
+    except Exception:
+        return df
+
+
+def extract_numeric_list(df, candidates, dtype=int):
+    """Search candidate column names in df and return a list of numeric values and the found column name.
+
+    Returns (values_list, column_name) where values_list is empty and column_name is None if nothing found.
+    """
+    if df is None or df.columns is None:
+        return [], None
+    # exact name match first
+    for col in candidates:
+        if col in df.columns:
+            vals = pd.to_numeric(df[col], errors='coerce').dropna()
+            try:
+                vals = vals.astype(dtype).tolist()
+            except Exception:
+                vals = vals.tolist()
+            return vals, col
+    # fallback: find by substring match
+    clow = [c.lower() for c in df.columns]
+    for i, col in enumerate(df.columns):
+        for cand in candidates:
+            if cand.lower() in clow[i]:
+                vals = pd.to_numeric(df[col], errors='coerce').dropna()
+                try:
+                    vals = vals.astype(dtype).tolist()
+                except Exception:
+                    vals = vals.tolist()
+                return vals, col
+    return [], None
+
+
+def get_min_max_ts(df):
+    """Return (min_ts, max_ts) found in DataFrame by guessing a timestamp column, or (None, None)."""
+    if df is None or df.columns is None:
+        return None, None
+    tscol = find_timestamp_column(df)
+    if tscol is None:
+        return None, None
+    try:
+        tsvals = pd.to_numeric(df[tscol], errors='coerce').dropna().astype(int).values
+        if tsvals.size:
+            return int(tsvals.min()), int(tsvals.max())
+    except Exception:
+        pass
+    return None, None
+
+
 def _match_with_offset(local_sizes, part_sizes, off, intra_delta, intra_period, lookahead):
     """Greedy matcher: given an intra offset, return (delivered, intra_detected).
 
@@ -152,30 +229,10 @@ def detect_missing_frames(local_by_cname, participant_by_cname, start_ts=None, e
     for cname, local_info in local_by_cname.items():
         # Work on a local copy to avoid mutating input structures
         local_df = local_info['df']
-        if start_ts is not None and end_ts is not None:
-            try:
-                tscol = None
-                for c in local_df.columns:
-                    if 'timestamp' in c.lower() or 'time' == c.lower() or 'timestamp_ms' in c.lower():
-                        tscol = c
-                        break
-                if tscol is None:
-                    tscol = local_df.columns[0]
-                df_ts = pd.to_numeric(local_df[tscol], errors='coerce')
-                local_df = local_df[(df_ts >= start_ts) & (df_ts <= end_ts)]
-            except Exception:
-                # if filtering fails for any reason, proceed with the unfiltered local_df
-                pass
-        # find size column in local
-        size_col = None
-        for col in ['Size(Bytes)', 'Size']:
-            if col in local_df.columns:
-                size_col = col
-                break
-        if size_col is None:
-            continue
-        # get the size column values as list of ints
-        local_sizes = pd.to_numeric(local_df[size_col], errors='coerce').dropna().astype(int).tolist()
+        # apply timestamp window filtering using helper
+        local_df = filter_df_by_ts(local_df, start_ts, end_ts)
+        # find size values in local using helper
+        local_sizes, size_col = extract_numeric_list(local_df, ['Size(Bytes)', 'Size'], dtype=int)
         # If no sizes, skip
         if not local_sizes:
             print(f"Warning: Could not find size column in  results for cname: {cname}")
@@ -187,14 +244,7 @@ def detect_missing_frames(local_by_cname, participant_by_cname, start_ts=None, e
         for pinfo in participant_by_cname[cname]:
             p_df = pinfo['df']
             # find size column in participant csv results
-            part_size_col = None
-            for col in ['Size(Bytes)', 'Size']:
-                if col in p_df.columns:
-                    part_size_col = col
-                    break
-            if part_size_col is None:
-                continue
-            part_sizes = pd.to_numeric(p_df[part_size_col], errors='coerce').dropna().astype(int).tolist()
+            part_sizes, part_size_col = extract_numeric_list(p_df, ['Size(Bytes)', 'Size'], dtype=int)
 
             # If no sizes, skip
             if not part_sizes:
@@ -289,20 +339,7 @@ def analyze_run(run_path):
             if df is None:
                 continue
             # filter by timestamp range if possible
-            if start_ts and end_ts:
-                # find a timestamp column
-                tscol = None
-                for c in df.columns:
-                    if 'timestamp' in c.lower() or 'time' == c.lower() or 'timestamp_ms' in c.lower():
-                        tscol = c
-                        break
-                if tscol is None:
-                    tscol = df.columns[0]
-                try:
-                    df_ts = pd.to_numeric(df[tscol], errors='coerce')
-                    df = df[(df_ts >= start_ts) & (df_ts <= end_ts)]
-                except Exception:
-                    pass
+            df = filter_df_by_ts(df, start_ts, end_ts)
             local_by_cname[cname] = {'path': path, 'df': df, 'client_folder': cfolder}
         # participant files
         for path in glob.glob(os.path.join(cfolder, 'participant_*.csv')):
@@ -312,19 +349,7 @@ def analyze_run(run_path):
             if df is None:
                 continue
             # filter by timestamp range if possible
-            if start_ts and end_ts:
-                tscol = None
-                for c in df.columns:
-                    if 'timestamp' in c.lower() or 'time' == c.lower() or 'timestamp_ms' in c.lower():
-                        tscol = c
-                        break
-                if tscol is None:
-                    tscol = df.columns[0]
-                try:
-                    df_ts = pd.to_numeric(df[tscol], errors='coerce')
-                    df = df[(df_ts >= start_ts) & (df_ts <= end_ts)]
-                except Exception:
-                    pass
+            df = filter_df_by_ts(df, start_ts, end_ts)
             participant_by_cname[cname].append({'path': path, 'df': df, 'client_folder': cfolder})
 
     metrics['local_by_cname'] = local_by_cname
@@ -334,6 +359,8 @@ def analyze_run(run_path):
     psnr_values = []
     for cname, info in local_by_cname.items():
         df = info['df']
+        if df is None:
+            continue
         if 'PSNR_Y' not in df.columns:
             print(f"ERROR: missing PSNR_Y column for local trace {info.get('path')}")
             continue
@@ -352,37 +379,30 @@ def analyze_run(run_path):
     out_max_ts = None
     for cname, info in local_by_cname.items():
         df = info['df']
-        for col in ['Size(Bytes)', 'Size']:
-            if col in df.columns:
-                vals = pd.to_numeric(df[col], errors='coerce').dropna().tolist()
-                sizes.extend(vals)
-                out_total_bytes += sum(vals)
-                break
-        # collect timestamps for duration
-        for c in df.columns:
-            if 'timestamp' in c.lower() or 'time' == c.lower() or 'timestamp_ms' in c.lower():
-                try:
-                    tsvals = pd.to_numeric(df[c], errors='coerce').dropna().astype(int).values
-                    if tsvals.size:
-                        mn = int(tsvals.min())
-                        mx = int(tsvals.max())
-                        out_min_ts = mn if out_min_ts is None else min(out_min_ts, mn)
-                        out_max_ts = mx if out_max_ts is None else max(out_max_ts, mx)
-                except Exception:
-                    pass
-                break
-        for col in ['Width', 'width', 'W']:
-            if col in df.columns:
-                widths.extend(pd.to_numeric(df[col], errors='coerce').dropna().tolist())
-                break
-        for col in ['Height', 'height', 'H']:
-            if col in df.columns:
-                heights.extend(pd.to_numeric(df[col], errors='coerce').dropna().tolist())
-                break
-        for col in ['EncodeTime(ms)', 'EncodeTime', 'EncodeTimeMs', 'EncodeTime (ms)']:
-            if col in df.columns:
-                encode_times.extend(pd.to_numeric(df[col], errors='coerce').dropna().tolist())
-                break
+        if df is None:
+            continue
+        vals, sc = extract_numeric_list(df, ['Size(Bytes)', 'Size'], dtype=int)
+        if vals:
+            sizes.extend(vals)
+            out_total_bytes += sum(vals)
+
+        mn_ts, mx_ts = get_min_max_ts(df)
+        if mn_ts is not None:
+            out_min_ts = mn_ts if out_min_ts is None else min(out_min_ts, mn_ts)
+        if mx_ts is not None:
+            out_max_ts = mx_ts if out_max_ts is None else max(out_max_ts, mx_ts)
+
+        wvals, _ = extract_numeric_list(df, ['Width', 'width', 'W'], dtype=float)
+        if wvals:
+            widths.extend(wvals)
+
+        hvals, _ = extract_numeric_list(df, ['Height', 'height', 'H'], dtype=float)
+        if hvals:
+            heights.extend(hvals)
+
+        encvals, _ = extract_numeric_list(df, ['EncodeTime(ms)', 'EncodeTime', 'EncodeTimeMs', 'EncodeTime (ms)'], dtype=float)
+        if encvals:
+            encode_times.extend(encvals)
     metrics['avg_frame_size'] = float(np.mean(sizes)) if sizes else None
     metrics['avg_width'] = float(np.mean(widths)) if widths else None
     metrics['avg_height'] = float(np.mean(heights)) if heights else None
@@ -398,33 +418,26 @@ def analyze_run(run_path):
     for cname, plist in participant_by_cname.items():
         for info in plist:
             df = info['df']
-            for col in ['Latency(ms)', 'Latency', 'latency']:
-                if col in df.columns:
-                    latencies.extend(pd.to_numeric(df[col], errors='coerce').dropna().tolist())
-                    break
-            for col in ['DecodeTime(ms)', 'DecodeTime', 'DecodeTimeMs']:
-                if col in df.columns:
-                    decode_times.extend(pd.to_numeric(df[col], errors='coerce').dropna().tolist())
-                    break
-            for col in ['Size(Bytes)', 'Size']:
-                if col in df.columns:
-                    vals = pd.to_numeric(df[col], errors='coerce').dropna().tolist()
-                    participant_sizes.extend(vals)
-                    in_total_bytes += sum(vals)
-                    break
-            # collect timestamps
-            for c in df.columns:
-                if 'timestamp' in c.lower() or 'time' == c.lower() or 'timestamp_ms' in c.lower():
-                    try:
-                        tsvals = pd.to_numeric(df[c], errors='coerce').dropna().astype(int).values
-                        if tsvals.size:
-                            mn = int(tsvals.min())
-                            mx = int(tsvals.max())
-                            in_min_ts = mn if in_min_ts is None else min(in_min_ts, mn)
-                            in_max_ts = mx if in_max_ts is None else max(in_max_ts, mx)
-                    except Exception:
-                        pass
-                    break
+            if df is None:
+                continue
+            lvals, _ = extract_numeric_list(df, ['Latency(ms)', 'Latency', 'latency'], dtype=float)
+            if lvals:
+                latencies.extend(lvals)
+
+            dvals, _ = extract_numeric_list(df, ['DecodeTime(ms)', 'DecodeTime', 'DecodeTimeMs'], dtype=float)
+            if dvals:
+                decode_times.extend(dvals)
+
+            pvals, _ = extract_numeric_list(df, ['Size(Bytes)', 'Size'], dtype=int)
+            if pvals:
+                participant_sizes.extend(pvals)
+                in_total_bytes += sum(pvals)
+
+            mn_ts, mx_ts = get_min_max_ts(df)
+            if mn_ts is not None:
+                in_min_ts = mn_ts if in_min_ts is None else min(in_min_ts, mn_ts)
+            if mx_ts is not None:
+                in_max_ts = mx_ts if in_max_ts is None else max(in_max_ts, mx_ts)
 
     # compute outgoing/incoming average bitrates (bps) using collected bytes and timestamp ranges
     out_bps = None
@@ -644,101 +657,98 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
     print('Wrote diagnostics summary to', diag_csv)
 
 
-def process_scenario(ROOT_FOLDER, scenario):
-    """Process one scenario directory: analyze architectures and write CSVs/plots."""
-    scenario_folder = os.path.join(ROOT_FOLDER, scenario)
-    # create analysis folder under the run root and then per-scenario subfolder
+def setup_analysis_folders(ROOT_FOLDER, scenario):
+    """Create and return the per-scenario analysis folder path."""
     base_analysis = os.path.join(ROOT_FOLDER, 'analysis')
     ensure_dir(base_analysis)
     scenario_analysis = os.path.join(base_analysis, scenario)
     ensure_dir(scenario_analysis)
-    ANALYSIS_FOLDER = scenario_analysis
+    return scenario_analysis
 
-    arch_map = build_arch_map(scenario_folder)
 
-    # compute per-architecture aggregated metrics
-    cpu_results = defaultdict(list)  # arch -> list of (participants, cpu_avg) across all runs
-    psnr_stats = defaultdict(dict)
-    missing_rows = []
-    resolution_rows = []
-    latency_rows = []
-    presence_records = []
-
-    for arch, entries in arch_map.items():
-        for n, run_path in sorted(entries, key=lambda x: (x[0], x[1])):
-            # presence checks for debugging: per client folder, check local/participant files
-            client_folders = sorted([p for p in glob.glob(os.path.join(run_path, 'uvgcomm-*')) if os.path.isdir(p)])
-            # assign client numbers
-            for idx, cf in enumerate(client_folders, start=1):
-                client_num = _extract_client_num_from_folder(cf) or idx
-                local_paths = glob.glob(os.path.join(cf, 'local_*.csv'))
-                part_paths = glob.glob(os.path.join(cf, 'participant_*.csv'))
-                local_present = bool(local_paths)
-                part_present = bool(part_paths)
-                local_count = len(local_paths)
-                part_count = len(part_paths)
+def collect_presence_records_for_run(run_path, arch, n):
+    """Return a list of presence record dicts for given run_path (same logic previously inlined)."""
+    records = []
+    client_folders = sorted([p for p in glob.glob(os.path.join(run_path, 'uvgcomm-*')) if os.path.isdir(p)])
+    for idx, cf in enumerate(client_folders, start=1):
+        client_num = _extract_client_num_from_folder(cf) or idx
+        local_paths = glob.glob(os.path.join(cf, 'local_*.csv'))
+        part_paths = glob.glob(os.path.join(cf, 'participant_*.csv'))
+        local_present = bool(local_paths)
+        part_present = bool(part_paths)
+        local_count = len(local_paths)
+        part_count = len(part_paths)
+        local_valid = False
+        part_valid = False
+        if local_present:
+            try:
+                local_df = read_csv_guess(local_paths[0])
+                local_valid = local_df is not None
+            except Exception:
                 local_valid = False
+        if part_present:
+            try:
+                part_df = read_csv_guess(part_paths[0])
+                part_valid = part_df is not None
+            except Exception:
                 part_valid = False
-                if local_present:
-                    try:
-                        local_df = read_csv_guess(local_paths[0])
-                        local_valid = local_df is not None
-                    except Exception:
-                        local_valid = False
-                if part_present:
-                    try:
-                        part_df = read_csv_guess(part_paths[0])
-                        part_valid = part_df is not None
-                    except Exception:
-                        part_valid = False
-                # compute single-letter code similar to previous implementation
-                code = None
-                if local_valid and part_valid:
-                    code = 'B'
-                elif local_valid and not part_present:
-                    code = 'L'
-                elif part_valid and not local_present:
-                    code = 'P'
-                elif not local_present and not part_present:
-                    code = 'M'
-                else:
-                    code = '-'
-                presence_records.append({'arch': arch, 'participants': n, 'client_num': client_num,
-                                         'local_present': local_present, 'part_present': part_present,
-                                         'local_valid': local_valid, 'part_valid': part_valid,
-                                         'local_count': local_count, 'part_count': part_count,
-                                         'code': code, 'run_path': run_path})
+        # compute single-letter code similar to previous implementation
+        code = None
+        if local_valid and part_valid:
+            code = 'B'
+        elif local_valid and not part_present:
+            code = 'L'
+        elif part_valid and not local_present:
+            code = 'P'
+        elif not local_present and not part_present:
+            code = 'M'
+        else:
+            code = '-'
+        records.append({'arch': arch, 'participants': n, 'client_num': client_num,
+                        'local_present': local_present, 'part_present': part_present,
+                        'local_valid': local_valid, 'part_valid': part_valid,
+                        'local_count': local_count, 'part_count': part_count,
+                        'code': code, 'run_path': run_path})
+    return records
 
-            metrics = analyze_run(run_path)
-            cpu_results[arch].append((n, metrics.get('cpu_avg')))
 
-            # PSNR per run - we have avg_psnr and count. Keep mean and std as single-run values.
-            psnr_val = metrics.get('avg_psnr')
-            if psnr_val is not None:
-                if n not in psnr_stats[arch]:
-                    psnr_stats[arch][n] = []
-                psnr_stats[arch][n].append(psnr_val)
+def accumulate_run_results(metrics, arch, n, run_path,
+                           cpu_results, psnr_stats, missing_rows, resolution_rows, latency_rows):
+    """Accumulate per-run metrics into the provided containers (mutates lists/dicts).
 
-            # missing frames summary appended (attach client_num inferred from receiver_folder)
-            for m in metrics.get('missing_summary', []):
-                row = dict(m)
-                row.update({'arch': arch, 'participants': n, 'run_path': run_path,
-                            'client_num': _extract_client_num_from_folder(m.get('receiver_folder'))})
-                missing_rows.append(row)
+    Mirrors the original inlined logic.
+    """
+    cpu_results[arch].append((n, metrics.get('cpu_avg')))
 
-            # resolution/frame size + bitrates
-            row_rs = {'arch': arch, 'participants': n, 'avg_width': metrics.get('avg_width'),
-                      'avg_height': metrics.get('avg_height'), 'avg_frame_size': metrics.get('avg_frame_size'),
-                      'outgoing_bps': metrics.get('outgoing_bps'), 'incoming_bps': metrics.get('incoming_bps')}
-            resolution_rows.append(row_rs)
+    # PSNR per run - we have avg_psnr and count. Keep mean and std as single-run values.
+    psnr_val = metrics.get('avg_psnr')
+    if psnr_val is not None:
+        if n not in psnr_stats[arch]:
+            psnr_stats[arch][n] = []
+        psnr_stats[arch][n].append(psnr_val)
 
-            # latency/encode/decode
-            latency_rows.append({'arch': arch, 'participants': n,
-                                 'avg_latency_ms': metrics.get('avg_latency_ms'),
-                                 'avg_encode_ms': metrics.get('avg_encode_ms'),
-                                 'avg_decode_ms': metrics.get('avg_decode_ms')})
+    # missing frames summary appended (attach client_num inferred from receiver_folder)
+    for m in metrics.get('missing_summary', []):
+        row = dict(m)
+        row.update({'arch': arch, 'participants': n, 'run_path': run_path,
+                    'client_num': _extract_client_num_from_folder(m.get('receiver_folder'))})
+        missing_rows.append(row)
 
-    # Prepare PSNR mean/std DataFrames: index participants, columns per-architecture
+    # resolution/frame size + bitrates
+    row_rs = {'arch': arch, 'participants': n, 'avg_width': metrics.get('avg_width'),
+              'avg_height': metrics.get('avg_height'), 'avg_frame_size': metrics.get('avg_frame_size'),
+              'outgoing_bps': metrics.get('outgoing_bps'), 'incoming_bps': metrics.get('incoming_bps')}
+    resolution_rows.append(row_rs)
+
+    # latency/encode/decode
+    latency_rows.append({'arch': arch, 'participants': n,
+                         'avg_latency_ms': metrics.get('avg_latency_ms'),
+                         'avg_encode_ms': metrics.get('avg_encode_ms'),
+                         'avg_decode_ms': metrics.get('avg_decode_ms')})
+
+
+def build_psnr_dfs(psnr_stats):
+    """Build psnr_mean and psnr_std DataFrames from psnr_stats mapping."""
     idx = sorted({n for arch in psnr_stats for n in psnr_stats[arch]})
     psnr_mean = pd.DataFrame(index=idx)
     psnr_std = pd.DataFrame(index=idx)
@@ -755,185 +765,162 @@ def process_scenario(ROOT_FOLDER, scenario):
                 stds.append(np.nan)
         psnr_mean[arch] = means
         psnr_std[arch] = stds
+    return psnr_mean, psnr_std
 
-    # write diagnostics (always): combine presence and missing summaries into diagnostics_summary.csv
-    try:
-        write_diagnostics(presence_records=presence_records, missing_records=missing_rows, analysis_folder=ANALYSIS_FOLDER)
-    except Exception as e:
-        print('Failed to write diagnostics summary:', e)
 
+def process_resolution_rows(resolution_rows, ANALYSIS_FOLDER):
+    """Write resolution/frame-size CSV and bandwidth plot from resolution_rows."""
     res_df = pd.DataFrame(resolution_rows)
-    if not res_df.empty:
-        # convert bitrates to kbps and improve headers
-        def _bps_to_kbps(x):
-            try:
-                return float(x) / 1000.0 if x is not None else None
-            except Exception:
-                return None
+    if res_df.empty:
+        return
 
-        out_rows = []
-        for _, r in res_df.iterrows():
-            out_rows.append({
-                'Architecture': r.get('arch'),
-                'Participants': int(r.get('participants')) if pd.notna(r.get('participants')) else None,
-                'Avg_Width_px': r.get('avg_width'),
-                'Avg_Height_px': r.get('avg_height'),
-                'Avg_FrameSize_bytes': r.get('avg_frame_size'),
-                'Outgoing_kbps': _bps_to_kbps(r.get('outgoing_bps')),
-                'Incoming_kbps': _bps_to_kbps(r.get('incoming_bps'))
-            })
-        out_df = pd.DataFrame(out_rows)
-        res_csv = os.path.join(ANALYSIS_FOLDER, f'resolution_framesize.csv')
-        out_df.to_csv(res_csv, index=False, sep=';')
-        print('Wrote resolution/frame-size summary to', res_csv)
-        # also plot outgoing/incoming bandwidth per architecture/participants
+    def _bps_to_kbps(x):
         try:
-            fig, ax = plt.subplots(figsize=(8,4))
-            # use consistent colors per architecture
-            cmap = get_color_map(out_df['Architecture'].unique())
-            groups = out_df.groupby('Architecture')
-            for i, (arch_name, g) in enumerate(groups):
-                color = cmap.get(arch_name)
-                ax.plot(g['Participants'], g['Outgoing_kbps'], marker='o', label=f'{arch_name} Out', color=color)
-                ax.plot(g['Participants'], g['Incoming_kbps'], marker='x', linestyle='--', label=f'{arch_name} In', color=color)
-            ax.set_xlabel('Participants')
-            ax.set_ylabel('Bandwidth (kbps)')
-            ax.set_title('Outgoing and Incoming Bandwidth')
-            # match other plots: horizontal grid only
-            ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
-            # x-axis whole numbers
-            try:
-                xt = sorted(set(int(x) for x in out_df['Participants'].dropna().unique()))
-                ax.set_xticks(xt)
-            except Exception:
-                pass
-            ax.legend(fontsize=8)
-            plt.tight_layout()
-            bw_out = os.path.join(ANALYSIS_FOLDER, 'bandwidth_kbps.svg')
-            fig.savefig(bw_out)
-            plt.close(fig)
-            print('Wrote bandwidth plot to', bw_out)
-        except Exception as e:
-            print('Failed to create bandwidth plot:', e)
+            return float(x) / 1000.0 if x is not None else None
+        except Exception:
+            return None
 
-    # presence matrix generation removed: we now always write a combined diagnostics CSV
-    # (see write_diagnostics). If you still want a matrix, implement a separate function.
-
-    lat_df = pd.DataFrame(latency_rows)
-    if not lat_df.empty:
-        # pretty column names
-        lat_out = lat_df.rename(columns={
-            'arch': 'Architecture', 'participants': 'Participants',
-            'avg_latency_ms': 'Avg. Latency(ms)', 'avg_encode_ms': 'Avg. Encoding Time (ms)',
-            'avg_decode_ms': 'Avg. Decoding Time (ms)'
+    out_rows = []
+    for _, r in res_df.iterrows():
+        out_rows.append({
+            'Architecture': r.get('arch'),
+            'Participants': int(r.get('participants')) if pd.notna(r.get('participants')) else None,
+            'Avg_Width_px': r.get('avg_width'),
+            'Avg_Height_px': r.get('avg_height'),
+            'Avg_FrameSize_bytes': r.get('avg_frame_size'),
+            'Outgoing_kbps': _bps_to_kbps(r.get('outgoing_bps')),
+            'Incoming_kbps': _bps_to_kbps(r.get('incoming_bps'))
         })
-        lat_csv = os.path.join(ANALYSIS_FOLDER, f'latency_summary.csv')
-        lat_out.to_csv(lat_csv, index=False, sep=';')
-        print('Wrote latency summary to', lat_csv)
+    out_df = pd.DataFrame(out_rows)
+    res_csv = os.path.join(ANALYSIS_FOLDER, f'resolution_framesize.csv')
+    out_df.to_csv(res_csv, index=False, sep=';')
+    print('Wrote resolution/frame-size summary to', res_csv)
 
-        # also produce bar chart with Encoding / Decoding / Other aggregated across runs
+    # also plot outgoing/incoming bandwidth per architecture/participants
+    try:
+        fig, ax = plt.subplots(figsize=(8,4))
+        cmap = get_color_map(out_df['Architecture'].unique())
+        groups = out_df.groupby('Architecture')
+        for i, (arch_name, g) in enumerate(groups):
+            color = cmap.get(arch_name)
+            ax.plot(g['Participants'], g['Outgoing_kbps'], marker='o', label=f'{arch_name} Out', color=color)
+            ax.plot(g['Participants'], g['Incoming_kbps'], marker='x', linestyle='--', label=f'{arch_name} In', color=color)
+        ax.set_xlabel('Participants')
+        ax.set_ylabel('Bandwidth (kbps)')
+        ax.set_title('Outgoing and Incoming Bandwidth')
+        ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
         try:
-            # determine expected number of runs per (arch, participants)
-            expected_runs = {}
-            for arch, entries in arch_map.items():
-                for n, _ in entries:
-                    expected_runs[(arch, n)] = expected_runs.get((arch, n), 0) + 1
+            xt = sorted(set(int(x) for x in out_df['Participants'].dropna().unique()))
+            ax.set_xticks(xt)
+        except Exception:
+            pass
+        ax.legend(fontsize=8)
+        plt.tight_layout()
+        bw_out = os.path.join(ANALYSIS_FOLDER, 'bandwidth_kbps.svg')
+        fig.savefig(bw_out)
+        plt.close(fig)
+        print('Wrote bandwidth plot to', bw_out)
+    except Exception as e:
+        print('Failed to create bandwidth plot:', e)
 
-            # group lat_df per arch/participants and compute averages only when all runs present
-            agg_rows = []
-            if not lat_df.empty:
-                grouped = lat_df.groupby(['arch', 'participants'])
-                for (arch, parts), g in grouped:
-                    try:
-                        parts_i = int(parts)
-                    except Exception:
-                        parts_i = parts
-                    key = (arch, parts_i)
-                    exp = expected_runs.get(key, 1)
-                    # Build total-latency list: existing values filled with 999 and pad missing runs with 999
-                    if 'avg_latency_ms' in g:
-                        tvals = list(pd.to_numeric(g['avg_latency_ms'], errors='coerce').fillna(999).astype(float).tolist())
-                    else:
-                        tvals = []
-                    if len(tvals) < exp:
-                        tvals.extend([999.0] * (exp - len(tvals)))
-                    mean_t = float(np.mean(tvals)) if tvals else 999.0
 
-                    # For encode/decode, only compute mean if we have exactly exp runs and none are null
-                    mean_e = None
-                    mean_d = None
-                    if len(g) == exp and 'avg_encode_ms' in g and 'avg_decode_ms' in g:
-                        if not g['avg_encode_ms'].isnull().any() and not g['avg_decode_ms'].isnull().any():
-                            mean_e = float(np.mean(g['avg_encode_ms']))
-                            mean_d = float(np.mean(g['avg_decode_ms']))
+def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
+    """Write latency CSV and latency breakdown plot from latency_rows."""
+    lat_df = pd.DataFrame(latency_rows)
+    if lat_df.empty:
+        return
 
-                    agg_rows.append({'arch': arch, 'participants': parts_i, 'mean_encode': mean_e,
-                                     'mean_decode': mean_d, 'mean_total': mean_t})
+    lat_out = lat_df.rename(columns={
+        'arch': 'Architecture', 'participants': 'Participants',
+        'avg_latency_ms': 'Avg. Latency(ms)', 'avg_encode_ms': 'Avg. Encoding Time (ms)',
+        'avg_decode_ms': 'Avg. Decoding Time (ms)'
+    })
+    lat_csv = os.path.join(ANALYSIS_FOLDER, f'latency_summary.csv')
+    lat_out.to_csv(lat_csv, index=False, sep=';')
+    print('Wrote latency summary to', lat_csv)
 
-            # plot aggregated rows
-            if agg_rows:
-                fig, ax = plt.subplots(figsize=(8,4))
-                labels = []
-                enc = []
-                dec = []
-                oth = []
-                # sort for consistent ordering
-                agg_rows = sorted(agg_rows, key=lambda x: (x['arch'], x['participants']))
-                for r in agg_rows:
-                    labels.append(f"{r['arch']}-{int(r['participants'])}")
-                    # mean_total always present (we filled missing with 999 earlier)
-                    t = r['mean_total']
-                    # determine if encode/decode were present for all runs
-                    e = r.get('mean_encode')
-                    d = r.get('mean_decode')
-                    enc_present = e is not None
-                    dec_present = d is not None
-                    # compute 'other' as remainder; if enc/dec missing, they contribute 0
-                    enc_val = float(e) if enc_present else 0.0
-                    dec_val = float(d) if dec_present else 0.0
-                    o = max(0.0, float(t) - enc_val - dec_val)
-                    # append values for plotting; use capped decoding for visual
-                    if enc_present:
-                        enc.append(enc_val)
-                    else:
-                        enc.append(0.0)
-                    if dec_present:
-                        dec.append(min(dec_val, 999.0))
-                    else:
-                        dec.append(0.0)
-                    oth.append(o)
-                x = np.arange(len(labels))
-                # draw bars: only non-zero stacks will appear; legend will include all three
-                ax.bar(x, enc, label='Encoding')
-                ax.bar(x, dec, bottom=enc, label='Decoding')
-                bottom_ed = np.array(enc) + np.array(dec)
-                ax.bar(x, oth, bottom=bottom_ed, label='Other')
-                ax.set_xticks(x)
-                ax.set_xticklabels(labels, rotation=45, ha='right')
-                ax.set_ylabel('Time (ms)')
-                ax.set_title('Latency breakdown')
-                ax.legend()
-                plt.tight_layout()
-                bar_out = os.path.join(ANALYSIS_FOLDER, 'latency_breakdown.svg')
-                fig.savefig(bar_out)
-                plt.close(fig)
-                print('Wrote latency breakdown plot to', bar_out)
+    try:
+        expected_runs = {}
+        for arch, entries in arch_map.items():
+            for n, _ in entries:
+                expected_runs[(arch, n)] = expected_runs.get((arch, n), 0) + 1
+
+        agg_rows = []
+        grouped = lat_df.groupby(['arch', 'participants'])
+        for (arch, parts), g in grouped:
+            try:
+                parts_i = int(parts)
+            except Exception:
+                parts_i = parts
+            key = (arch, parts_i)
+            exp = expected_runs.get(key, 1)
+            if 'avg_latency_ms' in g:
+                tvals = list(pd.to_numeric(g['avg_latency_ms'], errors='coerce').fillna(999).astype(float).tolist())
             else:
-                # write a placeholder figure so the file is always updated and user sees why nothing plotted
-                try:
-                    fig, ax = plt.subplots(figsize=(6,3))
-                    ax.text(0.5, 0.5, 'No complete aggregated latency data available to plot', ha='center', va='center')
-                    ax.axis('off')
-                    bar_out = os.path.join(ANALYSIS_FOLDER, 'latency_breakdown.svg')
-                    fig.savefig(bar_out)
-                    plt.close(fig)
-                    print('Wrote placeholder latency breakdown plot to', bar_out)
-                except Exception as e:
-                    print('Failed to write placeholder latency plot:', e)
-        except Exception as e:
-            print('Failed to create latency breakdown plot:', e)
+                tvals = []
+            if len(tvals) < exp:
+                tvals.extend([999.0] * (exp - len(tvals)))
+            mean_t = float(np.mean(tvals)) if tvals else 999.0
 
-    # CPU plot: average across runs for same participant counts before plotting
+            mean_e = None
+            mean_d = None
+            if len(g) == exp and 'avg_encode_ms' in g and 'avg_decode_ms' in g:
+                if not g['avg_encode_ms'].isnull().any() and not g['avg_decode_ms'].isnull().any():
+                    mean_e = float(np.mean(g['avg_encode_ms']))
+                    mean_d = float(np.mean(g['avg_decode_ms']))
+
+            agg_rows.append({'arch': arch, 'participants': parts_i, 'mean_encode': mean_e,
+                             'mean_decode': mean_d, 'mean_total': mean_t})
+
+        if agg_rows:
+            fig, ax = plt.subplots(figsize=(8,4))
+            labels = []
+            enc = []
+            dec = []
+            oth = []
+            agg_rows = sorted(agg_rows, key=lambda x: (x['arch'], x['participants']))
+            for r in agg_rows:
+                labels.append(f"{r['arch']}-{int(r['participants'])}")
+                t = r['mean_total']
+                e = r.get('mean_encode')
+                d = r.get('mean_decode')
+                enc_present = e is not None
+                dec_present = d is not None
+                enc_val = float(e) if enc_present else 0.0
+                dec_val = float(d) if dec_present else 0.0
+                o = max(0.0, float(t) - enc_val - dec_val)
+                enc.append(enc_val if enc_present else 0.0)
+                dec.append(min(dec_val, 999.0) if dec_present else 0.0)
+                oth.append(o)
+            x = np.arange(len(labels))
+            ax.bar(x, enc, label='Encoding')
+            ax.bar(x, dec, bottom=enc, label='Decoding')
+            bottom_ed = np.array(enc) + np.array(dec)
+            ax.bar(x, oth, bottom=bottom_ed, label='Other')
+            ax.set_xticks(x)
+            ax.set_xticklabels(labels, rotation=45, ha='right')
+            ax.set_ylabel('Time (ms)')
+            ax.set_title('Latency breakdown')
+            ax.legend()
+            plt.tight_layout()
+            bar_out = os.path.join(ANALYSIS_FOLDER, 'latency_breakdown.svg')
+            fig.savefig(bar_out)
+            plt.close(fig)
+            print('Wrote latency breakdown plot to', bar_out)
+        else:
+            fig, ax = plt.subplots(figsize=(6,3))
+            ax.text(0.5, 0.5, 'No complete aggregated latency data available to plot', ha='center', va='center')
+            ax.axis('off')
+            bar_out = os.path.join(ANALYSIS_FOLDER, 'latency_breakdown.svg')
+            fig.savefig(bar_out)
+            plt.close(fig)
+            print('Wrote placeholder latency breakdown plot to', bar_out)
+    except Exception as e:
+        print('Failed to create latency breakdown plot:', e)
+
+
+def finalize_cpu_and_psnr(cpu_results, psnr_mean, psnr_std, ANALYSIS_FOLDER, scenario):
+    """Aggregate CPU results and produce CPU/PSNR plots."""
     averaged_cpu = {}
     for arch, rows in cpu_results.items():
         by_n = defaultdict(list)
@@ -949,9 +936,51 @@ def process_scenario(ROOT_FOLDER, scenario):
         averaged_cpu[arch] = averaged
     plot_cpu(averaged_cpu, ANALYSIS_FOLDER, scenario)
 
-    # PSNR plot
     if not psnr_mean.empty:
         plot_psnr(psnr_mean, psnr_std, ANALYSIS_FOLDER, scenario)
+
+
+def process_scenario(ROOT_FOLDER, scenario):
+    """Process one scenario directory: analyze architectures and write CSVs/plots."""
+    scenario_folder = os.path.join(ROOT_FOLDER, scenario)
+    ANALYSIS_FOLDER = setup_analysis_folders(ROOT_FOLDER, scenario)
+
+    arch_map = build_arch_map(scenario_folder)
+
+    # compute per-architecture aggregated metrics
+    cpu_results = defaultdict(list)  # arch -> list of (participants, cpu_avg) across all runs
+    psnr_stats = defaultdict(dict)
+    missing_rows = []
+    resolution_rows = []
+    latency_rows = []
+    presence_records = []
+
+    for arch, entries in arch_map.items():
+        for n, run_path in sorted(entries, key=lambda x: (x[0], x[1])):
+            # collect presence records for this run
+            presence_records.extend(collect_presence_records_for_run(run_path, arch, n))
+
+            metrics = analyze_run(run_path)
+
+            # accumulate results into the various summary containers
+            accumulate_run_results(metrics, arch, n, run_path,
+                                   cpu_results, psnr_stats, missing_rows, resolution_rows, latency_rows)
+
+    # Prepare PSNR mean/std and write diagnostics
+    psnr_mean, psnr_std = build_psnr_dfs(psnr_stats)
+    try:
+        write_diagnostics(presence_records=presence_records, missing_records=missing_rows, analysis_folder=ANALYSIS_FOLDER)
+    except Exception as e:
+        print('Failed to write diagnostics summary:', e)
+
+    # Handle resolution/bitrate summaries and plots
+    process_resolution_rows(resolution_rows, ANALYSIS_FOLDER)
+
+    # Handle latency/encode/decode summaries and plots
+    process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER)
+
+    # Finalize CPU and PSNR plots
+    finalize_cpu_and_psnr(cpu_results, psnr_mean, psnr_std, ANALYSIS_FOLDER, scenario)
 
 def main():
     parser = argparse.ArgumentParser(description='Analyze experimental results')

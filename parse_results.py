@@ -174,14 +174,12 @@ def get_min_max_ts(df):
     return None, None
 
 
-def _match_with_offset(local_sizes, part_sizes, off, intra_delta, intra_period, lookahead, verbose=False):
-    """Greedy matcher: given an intra offset, return (delivered, intra_detected).
+def _match_with_offset(local_sizes, part_sizes, lookahead, verbose=False):
+    """Greedy matcher: return delivered count.
 
-    delivered: number of matched local frames
-    intra_detected: number of intra frames matched according to this offset
+    delivered: number of matched local frames (normal-frame matching only)
     """
     delivered = 0
-    intra_detected = 0
     # declare global counter up-front so any use in this function is valid
     global _unmatched_print_count
     j = 0
@@ -200,21 +198,17 @@ def _match_with_offset(local_sizes, part_sizes, off, intra_delta, intra_period, 
                     print(f"Unmatched local frame (trailing): pos={rem_pos} size={local_sizes[rem_pos]} lookahead_window={window}")
                     _unmatched_print_count += 1
             break
-        is_intra = ((i - off) % intra_period == 0) if len(local_sizes) >= intra_period else False
         ps = part_sizes[j]
-        if (is_intra and ls == ps + intra_delta) or (not is_intra and ls == ps):
+        # allow participant frames to be up to 4 bytes larger than expected (but not smaller)
+        if (ps >= ls and ps <= ls + 4):
             delivered += 1
-            if is_intra:
-                intra_detected += 1
             j += 1
             continue
         matched = False
         for k in range(j+1, min(j+1+lookahead, len(part_sizes))):
             ps2 = part_sizes[k]
-            if (is_intra and ls == ps2 + intra_delta) or (not is_intra and ls == ps2):
+            if (ps2 >= ls and ps2 <= ls + 4):
                 delivered += 1
-                if is_intra:
-                    intra_detected += 1
                 j = k + 1
                 matched = True
                 break
@@ -228,26 +222,22 @@ def _match_with_offset(local_sizes, part_sizes, off, intra_delta, intra_period, 
                         window = None
                     print(f"Unmatched local frame: pos={i} size={ls} lookahead_window={window}")
                     _unmatched_print_count += 1
-    return delivered, intra_detected
+    return delivered
 
 
 def detect_missing_frames(local_by_cname, participant_by_cname, start_ts=None, end_ts=None,
-                                                    intra_delta=86, intra_period=64, lookahead=3):
+                                                    lookahead=3):
     """Detect missing frames by comparing size sequences between local and participant traces.
 
-    Uses a deterministic greedy matcher. It tries all possible intra-frame offsets
-    (0..intra_period-1) and picks the offset that yields the maximum delivered frames
-    using exact equality checks:
-      - normal frame: local_size == part_size
-      - intra frame: local_size == part_size + intra_delta
+    Uses a deterministic greedy matcher (normal-frame matching only with a small tolerance).
 
-        Optional arguments:
-            start_ts, end_ts: if provided, local frames will be filtered to the closed
-                interval [start_ts, end_ts] before matching. Participant traces are NOT
-                filtered here (they are used only for verification).
+    Optional arguments:
+        start_ts, end_ts: if provided, local frames will be filtered to the closed
+            interval [start_ts, end_ts] before matching. Participant traces are trimmed
+            at the start to align with start_ts but are not truncated at the end.
 
-        Returns a list of dicts with keys: cname, receiver_folder, total_local_frames,
-        delivered, missing, pct_missing, intra_count, intra_offset
+    Returns a list of dicts with keys: cname, receiver_folder, total_local_frames,
+    delivered, missing, pct_missing
     """
     # reset per-run unmatched-frame print counter
     global _unmatched_print_count
@@ -280,26 +270,15 @@ def detect_missing_frames(local_by_cname, participant_by_cname, start_ts=None, e
                 print(f"Warning: Could not find size column in participant results for cname: {cname}")
                 continue
 
-            # Try each intra offset and pick the one that yields the most matches in small number
-            best_offset = 0
-            best_delivered = -1
-            for offset in range(intra_period):
-                delivered_try, _ = _match_with_offset(local_sizes, part_sizes, offset, intra_delta, intra_period, lookahead)
-                if delivered_try > best_delivered:
-                    best_delivered = delivered_try
-                    best_offset = offset
-
-            # Re-run match using best_offset to compute intra_detected and final delivered
-            # enable verbose printing only for the final pass (not during the offset search)
-            delivered, intra_detected = _match_with_offset(local_sizes, part_sizes, best_offset, intra_delta, intra_period, lookahead, verbose=True)
+            # Run matcher once (no intra/offset heuristics)
+            delivered = _match_with_offset(local_sizes, part_sizes, lookahead, verbose=True)
 
             total_local = len(local_sizes)
             missing = max(0, total_local - delivered)
             pct_missing = 100.0 * missing / total_local if total_local > 0 else None
             missing_summary.append({'cname': cname, 'receiver_folder': pinfo.get('client_folder'),
                                      'total_local_frames': total_local, 'delivered': delivered,
-                                     'missing': missing, 'pct_missing': pct_missing,
-                                     'intra_count': int(intra_detected), 'intra_offset': int(best_offset)})
+                                     'missing': missing, 'pct_missing': pct_missing})
 
     return missing_summary
 
@@ -643,10 +622,9 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
             miss_df['client_num'] = miss_df.get('receiver_folder', '').apply(lambda x: _extract_client_num_from_folder(x))
         for _, r in miss_df.iterrows():
             key = (r.get('arch'), r.get('participants'), r.get('run_path'), r.get('client_num'))
-            # prefer raw missing count (integer) and capture intra_count if present
+            # prefer raw missing count (integer) and capture analyzed_frames if present
             miss_lookup[key] = {
                 'missing': int(r.get('missing') or 0),
-                'intra_count': int(r.get('intra_count') or 0),
                 # number of local frames that were actually analyzed (after any local filtering)
                 'analyzed_frames': int(r.get('total_local_frames') or 0)
             }
@@ -660,9 +638,8 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
             client = p.get('client_num')
             localc = int(p.get('local_count') or 0)
             partc = int(p.get('part_count') or 0)
-            mk = miss_lookup.get((arch, parts, runp, client), {'missing': 0, 'intra_count': 0, 'analyzed_frames': 0})
+            mk = miss_lookup.get((arch, parts, runp, client), {'missing': 0, 'analyzed_frames': 0})
             frames_lost = mk.get('missing', 0)
-            intra_count = mk.get('intra_count', 0)
             analyzed = mk.get('analyzed_frames', 0)
             if localc == 0 and partc == 0:
                 status = 'broken'
@@ -672,17 +649,16 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
                 status = 'OK'
             rows.append({'Architecture': arch, 'Participants': parts, 'RunPath': runp,
                          'Client': client, 'Local results': localc, 'Participant results': partc,
-                         'Frames Lost': frames_lost, 'Intra Frames': intra_count, 'Analyzed Frames': analyzed,
+                         'Frames Lost': frames_lost, 'Analyzed Frames': analyzed,
                          'Status': status})
     else:
         # No presence records: still write a row per missing record (or one OK row)
         if miss_lookup:
             for (arch, parts, runp, client), val in miss_lookup.items():
                 frames_lost = val.get('missing', 0)
-                intra_count = val.get('intra_count', 0)
                 rows.append({'Architecture': arch, 'Participants': parts, 'RunPath': runp,
                              'Client': client, 'Local results': 0, 'Participant results': 0,
-                             'Frames Lost': frames_lost, 'Intra Frames': intra_count,
+                             'Frames Lost': frames_lost,
                              'Analyzed Frames': int(val.get('analyzed_frames', 0)),
                              'Status': ('missing frames' if frames_lost > 0 else 'OK')})
         else:
@@ -691,7 +667,7 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
                          'Frames Lost': 0, 'Analyzed Frames': 0, 'Status': 'OK'})
 
     diag_df = pd.DataFrame(rows, columns=['Architecture', 'Participants', 'RunPath', 'Client',
-                                         'Local results', 'Participant results', 'Frames Lost', 'Intra Frames', 'Analyzed Frames', 'Status'])
+                                         'Local results', 'Participant results', 'Analyzed Frames', 'Frames Lost', 'Status'])
     diag_csv = os.path.join(analysis_folder, 'diagnostics_summary.csv')
     diag_df.to_csv(diag_csv, index=False, sep=';')
     print('Wrote diagnostics summary to', diag_csv)

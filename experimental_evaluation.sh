@@ -352,6 +352,9 @@ trap cleanup EXIT # remove containers if this script crashes
 
 prepare_tests # prepares test files and creates network
 
+# Print the selected docker image (one-line): Repository:Tag ID CreatedAt (first match)
+echo "Docker image: $(docker images --format '{{.Repository}}:{{.Tag}} {{.ID}} {{.CreatedAt}}' 2>/dev/null | grep -E "^${DOCKER_IMAGE}:" | head -n1 || echo "${DOCKER_IMAGE}: not found")"
+
 run_count=3
 
 for clients in {2..6}; do

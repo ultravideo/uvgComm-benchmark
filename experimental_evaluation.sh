@@ -7,8 +7,17 @@ HOST_NAME="uvgcomm-host"
 CLIENT_PREFIX="uvgcomm-client"
 
 # Inputs and configs
-INPUT_FILE="./input/johnny30.yuv"
-SOURCE_FILE="./input/johnny60.y4m"
+# 720p (Johnny) source/input
+SOURCE_FILE_720_URL="https://media.xiph.org/video/derf/y4m/Johnny_1280x720_60.y4m"
+SOURCE_FILE_720="./input/Johnny_1280x720_60.y4m"
+INPUT_FILE_720="./input/Johnny_1280x720_30fps.yuv"
+
+# 4K (Beauty) source archive and input placeholder
+SOURCE_4K_URL="https://ultravideo.fi/video/Beauty_3840x2160_120fps_420_8bit_YUV_RAW.7z"
+SOURCE_4K_ARCHIVE="./input/Beauty_3840x2160_120fps_420_8bit_YUV_RAW.7z"
+EXTRACTED_4K_FILE="./input/Beauty_3840x2160.yuv"
+INPUT_FILE_4K="./input/Beauty_3840x2160_30fps.yuv"
+
 CONFIG_FOLDER="./configs"
 
 # Container paths
@@ -50,26 +59,56 @@ prepare_tests() {
         exit 1
     fi
 
-    # Download source video if missing
-    if [ ! -f "$SOURCE_FILE" ]; then
+    # For 7z extraction we prefer the `7z` utility (p7zip-full). If not present we will try `p7zip`.
+    if ! command -v 7z >/dev/null 2>&1 && ! command -v p7zip >/dev/null 2>&1; then
+        echo "ERROR: 7z (p7zip) not found. Please install p7zip-full (provides '7z')."
+        exit 1
+    fi
+
+    # Download / prepare 720p Johnny video if missing
+    if [ ! -f "$SOURCE_FILE_720" ]; then
         echo "Downloading Johnny test video..."
-        wget -O "$SOURCE_FILE" "https://media.xiph.org/video/derf/y4m/Johnny_1280x720_60.y4m"
+        wget -O "$SOURCE_FILE_720" "$SOURCE_FILE_720_URL"
     fi
 
     local frame_rate=30
 
-    if [ ! -f "$INPUT_FILE" ]; then
-        echo "Converting source file $SOURCE_FILE to $INPUT_FILE"
-        ffmpeg -y -i "$SOURCE_FILE" \
+    if [ ! -f "$INPUT_FILE_720" ]; then
+        echo "Converting source file $SOURCE_FILE_720 to $INPUT_FILE_720"
+        ffmpeg -y -i "$SOURCE_FILE_720" \
                -vf "select='not(mod(n,2))',setpts=N/($frame_rate*TB)" \
                -vsync vfr \
                -c:v rawvideo \
                -pix_fmt yuv420p \
-               "$INPUT_FILE"
+               "$INPUT_FILE_720"
+    fi
+
+    if [ ! -f "$SOURCE_4K_ARCHIVE" ]; then
+        wget -O "$SOURCE_4K_ARCHIVE" "$SOURCE_4K_URL"
+    fi
+
+    if [ ! -f "$EXTRACTED_4K_FILE" ] && [ -f "$SOURCE_4K_ARCHIVE" ]; then
+        if command -v 7z >/dev/null 2>&1; then
+            7z x -y -o"input" "$SOURCE_4K_ARCHIVE"
+        else
+            p7zip -d "$SOURCE_4K_ARCHIVE" || true
+        fi
+    fi
+
+    if [ ! -f "$EXTRACTED_4K_FILE" ]; then
+        extracted=$(find input -maxdepth 1 -type f -iname '*3840*2160*.yuv' -print -quit)
+        if [ -n "$extracted" ]; then
+            mv "$extracted" "$EXTRACTED_4K_FILE" 2>/dev/null || true
+        fi
+    fi
+
+    if [ ! -f "$INPUT_FILE_4K" ] && [ -f "$EXTRACTED_4K_FILE" ]; then
+        ffmpeg -y -f rawvideo -pixel_format yuv420p -video_size 3840x2160 -framerate 120 -i "$EXTRACTED_4K_FILE" \
+            -vf "select='not(mod(n,4))',setpts=N/($frame_rate*TB)" -vsync vfr -c:v rawvideo -pix_fmt yuv420p "$INPUT_FILE_4K"
     fi
 
     mkdir -p "$RUN_FOLDER"
-    echo "Preparation complete. Input file ready: $INPUT_FILE"
+    echo "Preparation complete. Input files ready: $INPUT_FILE_720 and $INPUT_FILE_4K"
 }
 
 write_metadata() {
@@ -285,13 +324,16 @@ record_container_logs() {
 run_scenario() {
     local SCENARIO="$1"
     local ARCHITECTURE="$2"
-    local CLIENTS="$3"
+    # set CLIENTS as a global variable so other helper functions (cleanup, record_container_logs)
+    # see the number of clients.
+    CLIENTS="$3"
     local RESOLUTION="$4"
     local DOWNLOAD_BW="$5"
     local UPLOAD_BW="$6"
     local LATENCY="$7"
     local VIEW_MODE="$8"
-    local RUN_COUNT="$9"
+    local INPUT_FILE="$9"
+    local RUN_COUNT="${10}"
 
     local base_output_folder="${RUN_FOLDER}/${SCENARIO}/${ARCHITECTURE}-${CLIENTS}"
 
@@ -335,6 +377,22 @@ run_scenario() {
     done
 }
 
+run_architectures() {
+    local SCENARIO="$1"
+    local CLIENTS="$2"
+    local RESOLUTION="$3"
+    local DOWNLOAD_BW="$4"
+    local UPLOAD_BW="$5"
+    local LATENCY="$6"
+    local VIEW_MODE="$7"
+    local INPUT_FILE="$8"
+    local RUN_COUNT="$9"
+
+    run_scenario "$SCENARIO" "P2P_Mesh" "$CLIENTS" "$RESOLUTION" "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY" "$VIEW_MODE" "$INPUT_FILE" "$RUN_COUNT"
+    run_scenario "$SCENARIO" "SFU"      "$CLIENTS" "$RESOLUTION" "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY" "$VIEW_MODE" "$INPUT_FILE" "$RUN_COUNT"
+    run_scenario "$SCENARIO" "Hybrid"   "$CLIENTS" "$RESOLUTION" "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY" "$VIEW_MODE" "$INPUT_FILE" "$RUN_COUNT"
+}
+
 
 cleanup() {
     echo "Stopping and removing containers if they exist"
@@ -357,10 +415,9 @@ echo "Docker image: $(docker images --format '{{.Repository}}:{{.Tag}} {{.ID}} {
 
 run_count=3
 
-for clients in {2..6}; do
-    run_scenario "720p" "P2P_Mesh" "$clients" "1280x720" 1.0 1.0 false "gallery" "$run_count"
-    run_scenario "720p" "SFU" "$clients" "1280x720" 1.0 1.0 false "gallery" "$run_count"
-    run_scenario "720p" "Hybrid" "$clients" "1280x720" 1.0 1.0 false "gallery" "$run_count"
+for clients in 2 3 4 5 6; do
+    run_architectures "720p" "$clients" "1280x720" 1.0 1.0 false "gallery" "$INPUT_FILE_720" "$run_count"
+    run_architectures "4K" "$clients" "3840x2160" 6.0 6.0 false "gallery" "$INPUT_FILE_4K" "$run_count"
 done
 
 # Cleanup will be triggered automatically by trap

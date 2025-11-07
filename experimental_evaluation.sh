@@ -374,8 +374,7 @@ run_scenario() {
         local setup_time_ms=$(( CLIENTS * WAIT_AFTER_INVITE * 1000 + WAIT_AFTER_SETTINGS * 1000 ))
         local warmup_time_ms=10000                      # 10 seconds
         local experiment_time_ms=60000                  # 1 minute
-        local cooldown_time_ms=5000                     # 5 seconds
-
+        local cooldown_time_ms=10000                    # 10 seconds
 
         local experiment_start_ms=$((current_time_ms + setup_time_ms + warmup_time_ms))
         local experiment_end_ms=$((experiment_start_ms + experiment_time_ms))
@@ -443,8 +442,6 @@ for clients in 2 3 4 5 6; do
 
     # TODO: 4K test needs implementation of input file in application 
     #run_architectures "4K" "$clients" "3840x2160" 6.0 6.0 false "gallery" "$INPUT_FILE_4K" "$run_count"
-
-
 done
 
 # Cleanup will be triggered automatically by trap

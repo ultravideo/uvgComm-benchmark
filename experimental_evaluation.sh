@@ -179,10 +179,13 @@ create_host_script() {
     local output_file=$1
     local architecture=$2
     local clients=$3
-    local setup_duration_ms=$4
-    local warmup_duration_ms=$5
-    local experiment_duration_ms=$6
-    local cooldown_duration_ms=$7
+    local resolution=$4
+    local download_bw=$5
+    local upload_bw=$6
+    local setup_duration_ms=$7
+    local warmup_duration_ms=$8
+    local experiment_duration_ms=$9
+    local cooldown_duration_ms=${10}
 
     # Use globally-configured wait times (default set at top of file)
     local wait_after_invite=${WAIT_AFTER_INVITE}
@@ -191,7 +194,24 @@ create_host_script() {
 
     echo "# Auto-generated host script" > "$output_file"
     echo "setting sip/Topology $architecture" >> "$output_file"
+
+    # parse resolution WIDTHxHEIGHT
+    if [[ "$resolution" == *x* ]]; then
+        local width="${resolution%x*}"
+        local height="${resolution#*x}"
+    else
+        local width="0"
+        local height="0"
+    fi
+
+    echo "setting sip/upBandwidth $upload_bw" >> "$output_file"
+    echo "setting sip/downBandwidth $download_bw" >> "$output_file"
     echo "setCall" >> "$output_file"
+
+    echo "setting video/FileResolutionWidth $width" >> "$output_file"
+    echo "setting video/FileResolutionHeight $height" >> "$output_file"
+    echo "setVideo" >> "$output_file"
+
     echo "wait $wait_after_settings" >> "$output_file"
 
     # Read clients from USERS_FILE
@@ -234,12 +254,15 @@ create_host() {
     local script_file="$1/script.txt"
     local architecture="$2"
     local clients="$3"
-    local setup_time="$4"
-    local warmup_time="$5"
-    local experiment_time="$6"
-    local cooldown_time="$7"
+    local resolution="$4"
+    local download_bw="$5"
+    local upload_bw="$6"
+    local setup_time="$7"
+    local warmup_time="$8"
+    local experiment_time="$9"
+    local cooldown_time=${10}
 
-    create_host_script "${script_file}" $architecture $clients $setup_time $warmup_time $experiment_time $cooldown_time
+    create_host_script "${script_file}" $architecture $clients $resolution $download_bw $upload_bw $setup_time $warmup_time $experiment_time $cooldown_time
 
     echo "Starting host"
     docker run -d --name $HOST_NAME --network $NETWORK_NAME --ip 172.28.0.2 \
@@ -369,8 +392,8 @@ run_scenario() {
                    "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY" "$VIEW_MODE" \
                    "$run_output_folder" "$experiment_start_ms" "$experiment_end_ms" "$run_index"
 
-        create_clients "$CLIENTS" "$INPUT_FILE" $run_output_folder
-        create_host $run_output_folder $ARCHITECTURE $CLIENTS $setup_time_ms $warmup_time_ms $experiment_time_ms $cooldown_time_ms
+    create_clients "$CLIENTS" "$INPUT_FILE" $run_output_folder
+    create_host $run_output_folder $ARCHITECTURE $CLIENTS "$RESOLUTION" "$DOWNLOAD_BW" "$UPLOAD_BW" $setup_time_ms $warmup_time_ms $experiment_time_ms $cooldown_time_ms
         countdown_timer $run_output_folder $current_time_ms $setup_time_ms $warmup_time_ms $experiment_time_ms $cooldown_time_ms
         record_container_logs $run_output_folder
         cleanup
@@ -413,11 +436,15 @@ prepare_tests # prepares test files and creates network
 # Print the selected docker image (one-line): Repository:Tag ID CreatedAt (first match)
 echo "Docker image: $(docker images --format '{{.Repository}}:{{.Tag}} {{.ID}} {{.CreatedAt}}' 2>/dev/null | grep -E "^${DOCKER_IMAGE}:" | head -n1 || echo "${DOCKER_IMAGE}: not found")"
 
-run_count=3
+run_count=1
 
 for clients in 2 3 4 5 6; do
     run_architectures "720p" "$clients" "1280x720" 1.0 1.0 false "gallery" "$INPUT_FILE_720" "$run_count"
-    run_architectures "4K" "$clients" "3840x2160" 6.0 6.0 false "gallery" "$INPUT_FILE_4K" "$run_count"
+
+    # TODO: 4K test needs implementation of input file in application 
+    #run_architectures "4K" "$clients" "3840x2160" 6.0 6.0 false "gallery" "$INPUT_FILE_4K" "$run_count"
+
+
 done
 
 # Cleanup will be triggered automatically by trap

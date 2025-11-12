@@ -33,7 +33,14 @@ RUN_FOLDER="./results/$RUN_ID"
 # Where to write the generated usernames list. 
 USERS_FILE="./configs/usernames.conf"
 
-MAX_CLIENTS=32
+# Default experiment parameters (can be overridden with env vars or CLI)
+# RUN_COUNT: how many times to repeat each scenario
+# CLIENTS_LIST: comma- or space-separated list of client counts to test
+# ARCHS: comma-separated architectures to test, or the special value "all"
+RUN_COUNT=${RUN_COUNT:-1}
+CLIENTS_LIST=${CLIENTS_LIST:-"2,3,4,5,6"}
+ARCHS=${ARCHS:-"P2P_Mesh,SFU,Hybrid"}
+SCENARIOS=${SCENARIOS:-"720p"}
 
 # Per-benchmark wait values (seconds). Edit these two values to tune timing.
 # - WAIT_AFTER_INVITE: seconds to wait after each client is called
@@ -42,6 +49,64 @@ WAIT_AFTER_INVITE=10
 WAIT_AFTER_SETTINGS=5
 
 # ----------------------- functions ------------------------
+
+usage() {
+    cat <<EOF
+Usage: $0 [-r RUNS] [-c CLIENTS] [-a ARCHS] [-m MAX_CLIENTS] [-h]
+
+Options:
+  -r RUNS        Number of runs per scenario (overrides RUN_COUNT env). Example: -r 3
+  -c CLIENTS     Comma or space separated client counts, e.g. "2,3,4" or "2 3 4". Defaults to ${CLIENTS_LIST}
+  -a ARCHS       Comma separated architectures or "all" to include defaults (P2P_Mesh,SFU,Hybrid). Defaults to ${ARCHS}
+    -s SCENARIOS    Comma separated scenarios to run, or "all" to include defaults (720p,4K). Defaults to ${SCENARIOS}
+  -h             Show this help
+EOF
+}
+
+parse_args() {
+    while getopts ":r:c:a:s:h" opt; do
+        case ${opt} in
+            r ) RUN_COUNT="$OPTARG" ;;
+            c ) CLIENTS_LIST="$OPTARG" ;;
+            a ) ARCHS="$OPTARG" ;;
+            s ) SCENARIOS="$OPTARG" ;;
+            h ) usage; exit 0 ;;
+            \? ) echo "Invalid Option: -$OPTARG" 1>&2; usage; exit 1 ;;
+            : ) echo "Invalid Option: -$OPTARG requires an argument" 1>&2; usage; exit 1 ;;
+        esac
+    done
+
+    # Normalize CLIENTS_LIST to comma-separated, allow both spaces and commas
+    CLIENTS_LIST=$(echo "$CLIENTS_LIST" | tr ' ' ',')
+
+    # If user asked for 'all' architectures, expand to defaults
+    if [ "$ARCHS" = "all" ]; then
+        ARCHS="P2P_Mesh,SFU,Hybrid"
+    fi
+
+    # If user asked for 'all' scenarios, expand to defaults
+    if [ "$SCENARIOS" = "all" ]; then
+        SCENARIOS="720p,4K"
+    fi
+
+    # Convert CLIENTS_LIST to array for iteration
+    IFS=',' read -r -a CLIENTS_ARRAY <<< "$CLIENTS_LIST"
+
+    # Compute MAX_CLIENTS as the maximum of CLIENTS_ARRAY (use provided clients as maximum)
+    MAX_CLIENTS=0
+    for c in "${CLIENTS_ARRAY[@]}"; do
+        # only consider numeric entries
+        if [[ "$c" =~ ^[0-9]+$ ]]; then
+            if [ "$c" -gt "$MAX_CLIENTS" ]; then
+                MAX_CLIENTS=$c
+            fi
+        fi
+    done
+    # fallback to 16 if nothing is found
+    if [ "$MAX_CLIENTS" -le 0 ]; then
+        MAX_CLIENTS=16
+    fi
+}
 
 prepare_tests() {
     # do all actions in preparation for tests
@@ -461,18 +526,37 @@ cleanup() {
 cleanup # make sure the containers don't exist
 trap cleanup EXIT # remove containers if this script crashes
 
+# Parse CLI args (if any) to override defaults/env
+parse_args "$@"
+
 prepare_tests # prepares test files and creates network
 
 # Print the selected docker image (one-line): Repository:Tag ID CreatedAt (first match)
 echo "Docker image: $(docker images --format '{{.Repository}}:{{.Tag}} {{.ID}} {{.CreatedAt}}' 2>/dev/null | grep -E "^${DOCKER_IMAGE}:" | head -n1 || echo "${DOCKER_IMAGE}: not found")"
 
-run_count=3
+echo "Running with RUN_COUNT=${RUN_COUNT}, CLIENTS=${CLIENTS_LIST}, ARCHS=${ARCHS}, SCENARIOS=${SCENARIOS}, MAX_CLIENTS=${MAX_CLIENTS}"
 
-for clients in 2 3 4 5 6; do
-    run_architectures "720p" "$clients" "1280x720" 1.0 1.0 false "gallery" "$INPUT_FILE_720" "$run_count"
+# Convert ARCHS and SCENARIOS to arrays
+IFS=',' read -r -a ARCHS_ARRAY <<< "$(echo ${ARCHS} | tr ' ' ',')"
+IFS=',' read -r -a SCENARIOS_ARRAY <<< "$(echo ${SCENARIOS} | tr ' ' ',')"
 
-    # TODO: 4K test needs implementation of input file in application 
-    #run_architectures "4K" "$clients" "3840x2160" 6.0 6.0 false "gallery" "$INPUT_FILE_4K" "$run_count"
+# Iterate scenarios, client counts and architectures
+for scenario in "${SCENARIOS_ARRAY[@]}"; do
+    for clients in ${CLIENTS_LIST//,/ } ; do
+        for arch in "${ARCHS_ARRAY[@]}"; do
+                case "$scenario" in
+                    720p)
+                        run_scenario "720p" "$arch" "$clients" "1280x720" 1.0 1.0 false "gallery" "$INPUT_FILE_720" "$RUN_COUNT"
+                        ;;
+                    4K)
+                        run_scenario "4K" "$arch" "$clients" "3840x2160" 6.0 6.0 false "gallery" "$INPUT_FILE_4K" "$RUN_COUNT"
+                        ;;
+                    *)
+                        echo "Skipping unknown scenario: $scenario"
+                        ;;
+                esac
+        done
+    done
 done
 
 # Cleanup will be triggered automatically by trap

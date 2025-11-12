@@ -208,6 +208,9 @@ prepare_tests() {
     # a reasonable upper bound; the file will be written in configs/.
     generate_usernames "$MAX_CLIENTS"
 
+    # Generate per-client configs from template. 
+    generate_client_configs || true
+
     echo "Preparation complete. Input files ready: $INPUT_FILE_720 and $INPUT_FILE_4K"
 }
 
@@ -273,6 +276,49 @@ generate_usernames() {
     done
 
     echo "Generated ${users_file} with ${num_clients} clients"
+}
+
+
+generate_client_configs() {
+    # Generate per-client configs from template configs/uvgComm_client.ini.
+    # Idempotent: skip files that already exist.
+    local template="${CONFIG_FOLDER}/uvgComm_client.ini"
+    mkdir -p "${CONFIG_FOLDER}"
+
+    if [ ! -f "${template}" ]; then
+        echo "ERROR: Client template '${template}' not found. Please create it." >&2
+        return 1
+    fi
+
+    for i in $(seq 1 "${MAX_CLIENTS}"); do
+        local out="${CONFIG_FOLDER}/uvgComm${i}.ini"
+        # Skip if already present
+        [ -f "${out}" ] && continue
+
+        # Copy template, then replace or append Username, ServerAddress and Name
+        cp "${template}" "${out}"
+
+        # Replace Username=, ServerAddress= and Name= if present; otherwise append
+        if grep -qE '^Username=' "${out}"; then
+            sed -i "s/^Username=.*/Username=user${i}/" "${out}"
+        else
+            echo "Username=user${i}" >> "${out}"
+        fi
+
+        if grep -qE '^ServerAddress=' "${out}"; then
+            sed -i "s/^ServerAddress=.*/ServerAddress=172.28.0.$((2 + i))/" "${out}"
+        else
+            echo "ServerAddress=172.28.0.$((2 + i))" >> "${out}"
+        fi
+
+        if grep -qE '^Name=' "${out}"; then
+            sed -i "s/^Name=.*/Name=user${i}/" "${out}"
+        else
+            echo "Name=user${i}" >> "${out}"
+        fi
+    done
+
+    echo "Generated per-client configs up to ${MAX_CLIENTS} in ${CONFIG_FOLDER}"
 }
 
 
@@ -390,7 +436,7 @@ create_host() {
 
     echo "Starting host"
     docker run -d --name $HOST_NAME --network $NETWORK_NAME --ip 172.28.0.2 \
-        -v ${CONFIG_FOLDER}/uvgComm.ini:$CONTAINER_CONFIG_FILE \
+        -v ${CONFIG_FOLDER}/uvgComm_host.ini:$CONTAINER_CONFIG_FILE \
         -v ${script_file}:${CONTAINER_HOST_SCRIPT_FILE} \
         ${DOCKER_IMAGE}:latest --script $CONTAINER_HOST_SCRIPT_FILE
 }

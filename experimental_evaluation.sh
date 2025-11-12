@@ -30,7 +30,10 @@ CONTAINER_INPUT_FILE="/uvgcomm/input/input.yuv"
 RUN_ID=$(date +"%Y%m%d_%H%M%S")
 RUN_FOLDER="./results/$RUN_ID"
 
-USERS_FILE="./usernames.conf"
+# Where to write the generated usernames list. 
+USERS_FILE="./configs/usernames.conf"
+
+MAX_CLIENTS=32
 
 # Per-benchmark wait values (seconds). Edit these two values to tune timing.
 # - WAIT_AFTER_INVITE: seconds to wait after each client is called
@@ -108,6 +111,10 @@ prepare_tests() {
     fi
 
     mkdir -p "$RUN_FOLDER"
+    # Generate usernames.conf once here (not per-scenario). Use MAX_CLIENTS as
+    # a reasonable upper bound; the file will be written in configs/.
+    generate_usernames "$MAX_CLIENTS"
+
     echo "Preparation complete. Input files ready: $INPUT_FILE_720 and $INPUT_FILE_4K"
 }
 
@@ -149,6 +156,30 @@ write_metadata() {
     } > "$metadata_file"
 
     echo "Metadata written successfully."
+}
+
+
+generate_usernames() {
+    # Generates the usernames.conf file dynamically so the user doesn't need to
+    # maintain it manually. The format is:
+    # host=host:172.28.0.2
+    # client1=user1:172.28.0.3
+    local num_clients="$1"
+    local users_file="${USERS_FILE}"
+
+    # Ensure directory exists for the users file
+    mkdir -p "$(dirname "${users_file}")" 2>/dev/null || true
+
+    # Write host line
+    echo "host=host:172.28.0.2" > "${users_file}"
+
+    # Write client lines
+    for i in $(seq 1 "$num_clients"); do
+        # client IPs follow the same scheme as docker run calls: 172.28.0.$((2+i))
+        echo "client${i}=user${i}:172.28.0.$((2 + i))" >> "${users_file}"
+    done
+
+    echo "Generated ${users_file} with ${num_clients} clients"
 }
 
 
@@ -435,7 +466,7 @@ prepare_tests # prepares test files and creates network
 # Print the selected docker image (one-line): Repository:Tag ID CreatedAt (first match)
 echo "Docker image: $(docker images --format '{{.Repository}}:{{.Tag}} {{.ID}} {{.CreatedAt}}' 2>/dev/null | grep -E "^${DOCKER_IMAGE}:" | head -n1 || echo "${DOCKER_IMAGE}: not found")"
 
-run_count=1
+run_count=3
 
 for clients in 2 3 4 5 6; do
     run_architectures "720p" "$clients" "1280x720" 1.0 1.0 false "gallery" "$INPUT_FILE_720" "$run_count"

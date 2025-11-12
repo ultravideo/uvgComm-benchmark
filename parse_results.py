@@ -459,14 +459,32 @@ def analyze_run(run_path):
                 in_max_ts = mx_ts if in_max_ts is None else max(in_max_ts, mx_ts)
 
     # compute outgoing/incoming average bitrates (bps) using collected bytes and timestamp ranges
+    # Prefer using the run metadata window (Start_Timestamp..End_timestamp) to avoid including
+    # setup/teardown intervals in the duration calculation. Fall back to trace-derived min/max
+    # timestamps when metadata is not available.
     out_bps = None
-    if out_total_bytes and out_min_ts is not None and out_max_ts is not None and out_max_ts > out_min_ts:
-        dur_s = (out_max_ts - out_min_ts) / 1000.0
-        out_bps = (out_total_bytes * 8.0) / dur_s if dur_s > 0 else None
+    try:
+        if out_total_bytes:
+            if start_ts is not None and end_ts is not None and end_ts > start_ts:
+                dur_s = (end_ts - start_ts) / 1000.0
+                out_bps = (out_total_bytes * 8.0) / dur_s if dur_s > 0 else None
+            elif out_min_ts is not None and out_max_ts is not None and out_max_ts > out_min_ts:
+                dur_s = (out_max_ts - out_min_ts) / 1000.0
+                out_bps = (out_total_bytes * 8.0) / dur_s if dur_s > 0 else None
+    except Exception:
+        out_bps = None
+
     in_bps = None
-    if in_total_bytes and in_min_ts is not None and in_max_ts is not None and in_max_ts > in_min_ts:
-        dur_s = (in_max_ts - in_min_ts) / 1000.0
-        in_bps = (in_total_bytes * 8.0) / dur_s if dur_s > 0 else None
+    try:
+        if in_total_bytes:
+            if start_ts is not None and end_ts is not None and end_ts > start_ts:
+                dur_s = (end_ts - start_ts) / 1000.0
+                in_bps = (in_total_bytes * 8.0) / dur_s if dur_s > 0 else None
+            elif in_min_ts is not None and in_max_ts is not None and in_max_ts > in_min_ts:
+                dur_s = (in_max_ts - in_min_ts) / 1000.0
+                in_bps = (in_total_bytes * 8.0) / dur_s if dur_s > 0 else None
+    except Exception:
+        in_bps = None
     metrics['outgoing_bps'] = out_bps
     metrics['incoming_bps'] = in_bps
     metrics['avg_latency_ms'] = float(np.mean(latencies)) if latencies else None
@@ -789,23 +807,31 @@ def process_resolution_rows(resolution_rows, ANALYSIS_FOLDER):
     res_df = pd.DataFrame(resolution_rows)
     if res_df.empty:
         return
-
-    def _bps_to_kbps(x):
+    # Convert aggregate bps to per-client Mbps for clearer interpretation
+    def _bps_to_mbps_per_client(bps, participants):
         try:
-            return float(x) / 1000.0 if x is not None else None
+            if bps is None:
+                return None
+            if participants is None or participants == 0:
+                return float(bps) / 1e6
+            return float(bps) / float(participants) / 1e6
         except Exception:
             return None
 
     out_rows = []
     for _, r in res_df.iterrows():
+        parts = int(r.get('participants')) if pd.notna(r.get('participants')) else None
+        out_mbps = _bps_to_mbps_per_client(r.get('outgoing_bps'), parts)
+        in_mbps = _bps_to_mbps_per_client(r.get('incoming_bps'), parts)
         out_rows.append({
             'Architecture': r.get('arch'),
-            'Participants': int(r.get('participants')) if pd.notna(r.get('participants')) else None,
+            'Participants': parts,
             'Avg_Width_px': r.get('avg_width'),
             'Avg_Height_px': r.get('avg_height'),
             'Avg_FrameSize_bytes': r.get('avg_frame_size'),
-            'Outgoing_kbps': _bps_to_kbps(r.get('outgoing_bps')),
-            'Incoming_kbps': _bps_to_kbps(r.get('incoming_bps'))
+            # Use per-client Mbps (not aggregate kbps)
+            'Outgoing_Mbps_per_client': out_mbps,
+            'Incoming_Mbps_per_client': in_mbps
         })
     out_df = pd.DataFrame(out_rows)
     res_csv = os.path.join(ANALYSIS_FOLDER, f'resolution_framesize.csv')
@@ -816,23 +842,47 @@ def process_resolution_rows(resolution_rows, ANALYSIS_FOLDER):
     try:
         fig, ax = plt.subplots(figsize=(8,4))
         cmap = get_color_map(out_df['Architecture'].unique())
+        markers = ['o', 's', '^', 'D', 'v', 'P', 'X', '*']
+        # Plot per-architecture lines with distinct marker and color
         groups = out_df.groupby('Architecture')
+        max_val = 0.0
         for i, (arch_name, g) in enumerate(groups):
             color = cmap.get(arch_name)
-            ax.plot(g['Participants'], g['Outgoing_kbps'], marker='o', label=f'{arch_name} Out', color=color)
-            ax.plot(g['Participants'], g['Incoming_kbps'], marker='x', linestyle='--', label=f'{arch_name} In', color=color)
+            marker = markers[i % len(markers)]
+            # sort by Participants for nicer lines
+            try:
+                g_sorted = g.sort_values('Participants')
+            except Exception:
+                g_sorted = g
+            x = g_sorted['Participants']
+            y_out = g_sorted['Outgoing_Mbps_per_client']
+            y_in = g_sorted['Incoming_Mbps_per_client']
+            # track max for y-limits
+            try:
+                max_val = max(max_val, float(np.nanmax(np.array(y_out.fillna(0.0)))), float(np.nanmax(np.array(y_in.fillna(0.0)))))
+            except Exception:
+                pass
+            ax.plot(x, y_out, marker=marker, linestyle='-', label=f'{arch_name} Out', color=color)
+            # use a different marker for incoming but same color
+            ax.plot(x, y_in, marker='x', linestyle='--', label=f'{arch_name} In', color=color)
+
         ax.set_xlabel('Participants')
-        ax.set_ylabel('Bandwidth (kbps)')
-        ax.set_title('Outgoing and Incoming Bandwidth')
+        ax.set_ylabel('Per-Client Bandwidth (Mbps)')
+        ax.set_title('Outgoing and Incoming Bandwidth (per-client)')
         ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
         try:
             xt = sorted(set(int(x) for x in out_df['Participants'].dropna().unique()))
             ax.set_xticks(xt)
         except Exception:
             pass
+        # set y-axis to start at 0 and upper bound slightly above max
+        if max_val is not None and max_val > 0:
+            ax.set_ylim(0, max(max_val * 1.05, 0.1))
+        else:
+            ax.set_ylim(0, 1)
         ax.legend(fontsize=8)
         plt.tight_layout()
-        bw_out = os.path.join(ANALYSIS_FOLDER, 'bandwidth_kbps.svg')
+        bw_out = os.path.join(ANALYSIS_FOLDER, 'bandwidth_mbps_per_client.svg')
         fig.savefig(bw_out)
         plt.close(fig)
         print('Wrote bandwidth plot to', bw_out)

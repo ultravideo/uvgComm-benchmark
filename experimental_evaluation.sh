@@ -51,15 +51,15 @@ WAIT_AFTER_SETTINGS=5
 # ----------------------- functions ------------------------
 
 usage() {
-    cat <<EOF
-Usage: $0 [-r RUNS] [-c CLIENTS] [-a ARCHS] [-m MAX_CLIENTS] [-h]
+        cat <<EOF
+Usage: $0 [-r RUNS] [-c CLIENTS] [-a ARCHS] [-s SCENARIOS] [-h]
 
 Options:
-  -r RUNS        Number of runs per scenario (overrides RUN_COUNT env). Example: -r 3
-  -c CLIENTS     Comma or space separated client counts, e.g. "2,3,4" or "2 3 4". Defaults to ${CLIENTS_LIST}
-  -a ARCHS       Comma separated architectures or "all" to include defaults (P2P_Mesh,SFU,Hybrid). Defaults to ${ARCHS}
-    -s SCENARIOS    Comma separated scenarios to run, or "all" to include defaults (720p,4K). Defaults to ${SCENARIOS}
-  -h             Show this help
+    -r RUNS        Number of runs per scenario. Example: -r 3
+    -c CLIENTS     Comma-separated client counts, e.g. "2,3,4". Defaults to ${CLIENTS_LIST}
+    -a ARCHS       Comma separated architectures or "all" to include defaults (P2P_Mesh,SFU,Hybrid). Defaults to ${ARCHS}
+    -s SCENARIOS   Comma separated scenarios to run, or "all" to include defaults (720p,4K,speaker,1080p,simlat,low_send_bw). Defaults to ${SCENARIOS}
+    -h             Show this help
 EOF
 }
 
@@ -76,7 +76,7 @@ parse_args() {
         esac
     done
 
-    # Normalize CLIENTS_LIST to comma-separated, allow both spaces and commas
+    # Normalize CLIENTS_LIST to comma-separated. Quote multi-value arguments to avoid shell splitting.
     CLIENTS_LIST=$(echo "$CLIENTS_LIST" | tr ' ' ',')
 
     # If user asked for 'all' architectures, expand to defaults
@@ -84,9 +84,9 @@ parse_args() {
         ARCHS="P2P_Mesh,SFU,Hybrid"
     fi
 
-    # If user asked for 'all' scenarios, expand to defaults
+    # If user asked for 'all' scenarios, expand to defaults (include new scenarios)
     if [ "$SCENARIOS" = "all" ]; then
-        SCENARIOS="720p,4K"
+        SCENARIOS="720p,4K,speaker,1080p,simlat,low_send_bw"
     fi
 
     # Convert CLIENTS_LIST to array for iteration
@@ -106,6 +106,34 @@ parse_args() {
     if [ "$MAX_CLIENTS" -le 0 ]; then
         MAX_CLIENTS=16
     fi
+}
+
+# Compact parameter validation function moved to functions section so the main
+# script flow remains clean. This validates architectures, scenarios and
+# client counts and exits with a one-line error on invalid input.
+validate_params() {
+    # Strict validation on the raw, normalized strings. Use regex to ensure
+    # every token is exactly one of the allowed canonical values.
+    local arch_re='^(P2P_Mesh|SFU|Hybrid)(,(P2P_Mesh|SFU|Hybrid))*$'
+    local scen_re='^(720p|4K|speaker|1080p|simlat|low_send_bw)(,(720p|4K|speaker|1080p|simlat|low_send_bw))*$'
+    local clients_re='^[0-9]+(,[0-9]+)*$'
+
+    if ! [[ "$ARCHS" =~ $arch_re ]]; then
+        echo "ERROR: Unknown architecture '$ARCHS' (allowed: P2P_Mesh,SFU,Hybrid)" >&2; exit 1
+    fi
+
+    if ! [[ "$SCENARIOS" =~ $scen_re ]]; then
+        echo "ERROR: Unknown scenario '$SCENARIOS' (allowed: 720p,4K,speaker,1080p,simlat,low_send_bw)" >&2; exit 1
+    fi
+
+    if ! [[ "$CLIENTS_LIST" =~ $clients_re ]]; then
+        echo "ERROR: Invalid CLIENTS list '$CLIENTS_LIST' (must be comma-separated positive integers)" >&2; exit 1
+    fi
+
+    # Populate arrays for later iteration (safe now that inputs are validated)
+    IFS=',' read -r -a ARCHS_ARRAY <<< "$ARCHS"
+    IFS=',' read -r -a SCENARIOS_ARRAY <<< "$SCENARIOS"
+    IFS=',' read -r -a CLIENTS_ARRAY <<< "$CLIENTS_LIST"
 }
 
 prepare_tests() {
@@ -529,16 +557,24 @@ trap cleanup EXIT # remove containers if this script crashes
 # Parse CLI args (if any) to override defaults/env
 parse_args "$@"
 
+# Normalize ARCHS/SCENARIOS/CLIENTS_LIST (spaces -> commas) so validation
+# can treat comma-separated lists consistently, then validate strictly.
+ARCHS=$(echo "$ARCHS" | tr ' ' ',')
+SCENARIOS=$(echo "$SCENARIOS" | tr ' ' ',')
+CLIENTS_LIST=$(echo "$CLIENTS_LIST" | tr ' ' ',')
+
+# Run strict validation now (will exit on error). validate_params will also
+# populate ARCHS_ARRAY, SCENARIOS_ARRAY and CLIENTS_ARRAY on success.
+validate_params
+
 prepare_tests # prepares test files and creates network
 
 # Print the selected docker image (one-line): Repository:Tag ID CreatedAt (first match)
 echo "Docker image: $(docker images --format '{{.Repository}}:{{.Tag}} {{.ID}} {{.CreatedAt}}' 2>/dev/null | grep -E "^${DOCKER_IMAGE}:" | head -n1 || echo "${DOCKER_IMAGE}: not found")"
 
-echo "Running with RUN_COUNT=${RUN_COUNT}, CLIENTS=${CLIENTS_LIST}, ARCHS=${ARCHS}, SCENARIOS=${SCENARIOS}, MAX_CLIENTS=${MAX_CLIENTS}"
+echo "Running with RUN_COUNT=${RUN_COUNT}, CLIENTS=${CLIENTS_LIST}, ARCHS=${ARCHS}, SCENARIOS=${SCENARIOS}"
 
-# Convert ARCHS and SCENARIOS to arrays
-IFS=',' read -r -a ARCHS_ARRAY <<< "$(echo ${ARCHS} | tr ' ' ',')"
-IFS=',' read -r -a SCENARIOS_ARRAY <<< "$(echo ${SCENARIOS} | tr ' ' ',')"
+# (arrays normalized and validated earlier)
 
 # Iterate scenarios, client counts and architectures
 for scenario in "${SCENARIOS_ARRAY[@]}"; do
@@ -550,6 +586,22 @@ for scenario in "${SCENARIOS_ARRAY[@]}"; do
                         ;;
                     4K)
                         run_scenario "4K" "$arch" "$clients" "3840x2160" 6.0 6.0 false "gallery" "$INPUT_FILE_4K" "$RUN_COUNT"
+                        ;;
+                    speaker)
+                        # Speaker mode: same resolution as 720p but speaker view
+                        run_scenario "speaker" "$arch" "$clients" "1280x720" 1.0 1.0 false "speaker" "$INPUT_FILE_720" "$RUN_COUNT"
+                        ;;
+                    1080p)
+                        # 1080p placeholder: use 4K input file until a dedicated 1080p file is available
+                        run_scenario "1080p" "$arch" "$clients" "1920x1080" 3.0 3.0 false "gallery" "$INPUT_FILE_4K" "$RUN_COUNT"
+                        ;;
+                    simlat)
+                        # Simulated latencies: enable latency flag (true)
+                        run_scenario "simlat" "$arch" "$clients" "1280x720" 1.0 1.0 true "gallery" "$INPUT_FILE_720" "$RUN_COUNT"
+                        ;;
+                    low_send_bw)
+                        # Low send bandwidth: send (upload) is 50% of conference bandwidth
+                        run_scenario "low_send_bw" "$arch" "$clients" "1280x720" 1.0 0.5 false "gallery" "$INPUT_FILE_720" "$RUN_COUNT"
                         ;;
                     *)
                         echo "Skipping unknown scenario: $scenario"

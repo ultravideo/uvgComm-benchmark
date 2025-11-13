@@ -374,8 +374,16 @@ create_host_script() {
         local height="0"
     fi
 
-    echo "setting sip/upBandwidth $upload_bw" >> "$output_file"
-    echo "setting sip/downBandwidth $download_bw" >> "$output_file"
+    # Convert provided bandwidth values (given as Mbps, possibly floats like 1.0)
+    # to integer bits-per-second expected by the host. Use 1 Mbps = 1,000,000 bps.
+    local upload_bps
+    local download_bps
+    # Use awk for floating point multiplication and integer formatting
+    upload_bps=$(awk "BEGIN {printf \"%d\", ($upload_bw) * 1000000}")
+    download_bps=$(awk "BEGIN {printf \"%d\", ($download_bw) * 1000000}")
+
+    echo "setting sip/upBandwidth $upload_bps" >> "$output_file"
+    echo "setting sip/downBandwidth $download_bps" >> "$output_file"
     echo "setCall" >> "$output_file"
 
     echo "setting video/FileResolutionWidth $width" >> "$output_file"
@@ -514,6 +522,105 @@ record_container_logs() {
     docker logs $HOST_NAME &> ${output_location}/${HOST_NAME}.log
 }
 
+
+# Bandwidth monitor: polls per-container rx/tx byte counters inside each
+# container and writes CSV files with timestamp, cumulative bytes and
+# bytes/second deltas. Uses docker exec to read
+# /sys/class/net/eth0/statistics/{rx,tx}_bytes which gives raw counters.
+# The monitor runs in background and is signalled to stop by creating a
+# stopfile in the run output folder.
+start_bandwidth_monitor() {
+    local output_location="$1"
+    local interval=${2:-1}  # seconds between polls
+
+    # Stopfile used to terminate the background loop.
+    BW_MONITOR_STOPFILE="${output_location}/.bw_monitor_stop"
+    # ensure previous stopfile removed
+    [ -f "$BW_MONITOR_STOPFILE" ] && rm -f "$BW_MONITOR_STOPFILE"
+
+    # Log file for monitor internal messages
+    BW_MONITOR_LOG="${output_location}/bandwidth_monitor.log"
+    : > "$BW_MONITOR_LOG"
+
+    (
+        # containers list (clients then host)
+        containers=()
+        for i in $(seq 1 $CLIENTS); do
+            containers+=("${CLIENT_PREFIX}${i}")
+        done
+        containers+=("${HOST_NAME}")
+
+        # Initialize CSVs and read initial counters
+        prev_rx=()
+        prev_tx=()
+        for idx in "${!containers[@]}"; do
+            c=${containers[$idx]}
+            mkdir -p "${output_location}/${c}"
+            csv="${output_location}/${c}/bandwidth.csv"
+            echo "timestamp_ms;rx_bytes;tx_bytes;rx_bps;tx_bps" > "$csv"
+
+            # Wait briefly for container to appear/finish starting
+            attempts=0
+            while [ $attempts -lt 10 ]; do
+                if docker ps -q -f name="^/${c}$" >/dev/null 2>&1 && [ -n "$(docker ps -q -f name="^/${c}$")" ]; then
+                    break
+                fi
+                attempts=$((attempts+1))
+                sleep 0.3
+            done
+
+            rx=$(docker exec "$c" cat /sys/class/net/eth0/statistics/rx_bytes 2>/dev/null || echo 0)
+            tx=$(docker exec "$c" cat /sys/class/net/eth0/statistics/tx_bytes 2>/dev/null || echo 0)
+            prev_rx[$idx]=$rx
+            prev_tx[$idx]=$tx
+        done
+
+        # Poll loop
+        while [ ! -f "$BW_MONITOR_STOPFILE" ]; do
+            now_ms=$(date +%s%3N)
+            for idx in "${!containers[@]}"; do
+                c=${containers[$idx]}
+                rx=$(docker exec "$c" cat /sys/class/net/eth0/statistics/rx_bytes 2>/dev/null || echo 0)
+                tx=$(docker exec "$c" cat /sys/class/net/eth0/statistics/tx_bytes 2>/dev/null || echo 0)
+
+                prx=${prev_rx[$idx]:-0}
+                ptx=${prev_tx[$idx]:-0}
+
+                drx=$((rx - prx))
+                dtx=$((tx - ptx))
+
+                # bytes per second (approx). If interval >1, this is averaged.
+                rx_bps=$(( drx / (interval>0?interval:1) )) || rx_bps=0
+                tx_bps=$(( dtx / (interval>0?interval:1) )) || tx_bps=0
+
+                echo "${now_ms};${rx};${tx};${rx_bps};${tx_bps}" >> "${output_location}/${c}/bandwidth.csv"
+
+                prev_rx[$idx]=$rx
+                prev_tx[$idx]=$tx
+            done
+            sleep $interval
+        done
+
+        echo "Bandwidth monitor loop exiting" >> "$BW_MONITOR_LOG"
+    ) &
+
+    BW_MONITOR_PID=$!
+    echo "Started bandwidth monitor (pid=$BW_MONITOR_PID) -> ${output_location}"
+}
+
+stop_bandwidth_monitor() {
+    if [ -n "$BW_MONITOR_PID" ]; then
+        # Create stopfile so background loop ends cleanly
+        if [ -n "$BW_MONITOR_STOPFILE" ]; then
+            touch "$BW_MONITOR_STOPFILE"
+        fi
+        # Wait a bit for background process to exit
+        wait "$BW_MONITOR_PID" 2>/dev/null || true
+        unset BW_MONITOR_PID
+        echo "Bandwidth monitor stopped"
+    fi
+}
+
 run_scenario() {
     local SCENARIO="$1"
     local ARCHITECTURE="$2"
@@ -544,7 +651,7 @@ run_scenario() {
         local setup_time_ms=$(( CLIENTS * WAIT_AFTER_INVITE * 1000 + WAIT_AFTER_SETTINGS * 1000 ))
         local warmup_time_ms=10000                      # 10 seconds
         local experiment_time_ms=60000                  # 1 minute
-        local cooldown_time_ms=10000                    # 10 seconds
+        local cooldown_time_ms=15000                    # 10 seconds
 
         local experiment_start_ms=$((current_time_ms + setup_time_ms + warmup_time_ms))
         local experiment_end_ms=$((experiment_start_ms + experiment_time_ms))
@@ -563,7 +670,13 @@ run_scenario() {
 
     create_clients "$CLIENTS" "$INPUT_FILE" $run_output_folder
     create_host $run_output_folder $ARCHITECTURE $CLIENTS "$RESOLUTION" "$DOWNLOAD_BW" "$UPLOAD_BW" $setup_time_ms $warmup_time_ms $experiment_time_ms $cooldown_time_ms
+        # Start bandwidth monitor (polling interval 1s) - writes per-container CSVs
+        start_bandwidth_monitor "$run_output_folder" 1
+
         countdown_timer $run_output_folder $current_time_ms $setup_time_ms $warmup_time_ms $experiment_time_ms $cooldown_time_ms
+
+        # Stop bandwidth monitor and collect logs
+        stop_bandwidth_monitor
         record_container_logs $run_output_folder
         cleanup
     done
@@ -588,6 +701,10 @@ run_architectures() {
 
 cleanup() {
     echo "Stopping and removing containers if they exist"
+    # Ensure bandwidth monitor stopped if running
+    if [ -n "${BW_MONITOR_PID-}" ]; then
+        stop_bandwidth_monitor || true
+    fi
     for i in $(seq 1 $CLIENTS); do
         docker rm -f "${CLIENT_PREFIX}${i}" 2>/dev/null || true
     done

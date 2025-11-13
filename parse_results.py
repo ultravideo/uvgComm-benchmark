@@ -499,6 +499,13 @@ def analyze_run(run_path):
                                             start_ts=start_ts, end_ts=end_ts)
     metrics['missing_summary'] = missing_summary
 
+    # Parse measured bandwidth using helper (separate client vs host)
+    c_out_bps_meas, c_in_bps_meas, h_out_bps_meas, h_in_bps_meas = parse_measured_bandwidth(client_folders, start_ts, end_ts)
+    metrics['measured_outgoing_bps_per_client'] = c_out_bps_meas
+    metrics['measured_incoming_bps_per_client'] = c_in_bps_meas
+    metrics['measured_host_outgoing_bps'] = h_out_bps_meas
+    metrics['measured_host_incoming_bps'] = h_in_bps_meas
+
     return metrics
 
 
@@ -525,7 +532,7 @@ def plot_cpu(results_by_arch, analysis_folder, scenario):
     plt.title(f'CPU usage - {scenario}')
     # nicer grid: horizontal lines only
     plt.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
-    plt.legend(fontsize=10)
+    plt.legend(prop={'size': 10})
     # enforce y-axis 0-100 and ticks every 10%
     plt.ylim(0, 100)
     plt.yticks(np.arange(0, 101, 10))
@@ -537,10 +544,116 @@ def plot_cpu(results_by_arch, analysis_folder, scenario):
         xticks = sorted(set(int(x) for x in all_x if x is not None))
         plt.xticks(xticks)
     plt.tight_layout()
-    out = os.path.join(analysis_folder, f'{scenario}_cpu.svg')
+    out = os.path.join(analysis_folder, 'cpu.svg')
     plt.savefig(out)
     plt.close()
     print('Saved CPU plot:', out)
+
+
+def parse_measured_bandwidth(client_folders, start_ts=None, end_ts=None):
+    """Parse per-container bandwidth.csv files and return per-client mean (out_bps, in_bps).
+
+    Returns tuple (measured_outgoing_bps_per_client, measured_incoming_bps_per_client) in bps
+    or (None, None) if no data.
+    """
+    measured_out_clients = []
+    measured_in_clients = []
+    measured_out_host = []
+    measured_in_host = []
+    try:
+        for cfolder in client_folders:
+            bw_path = os.path.join(cfolder, 'bandwidth.csv')
+            if not os.path.isfile(bw_path):
+                continue
+            df = read_csv_guess(bw_path)
+            if df is None:
+                continue
+
+            # Filter by run window if possible
+            df = filter_df_by_ts(df, start_ts, end_ts)
+
+            cols_lc = [c.lower() for c in df.columns]
+            rx_bps_col = None
+            tx_bps_col = None
+            for i, c in enumerate(cols_lc):
+                if 'rx_bps' in c or 'rxps' in c or 'rx_bytes/s' in c or 'rx_b/s' in c:
+                    rx_bps_col = df.columns[i]
+                if 'tx_bps' in c or 'txps' in c or 'tx_bytes/s' in c or 'tx_b/s' in c:
+                    tx_bps_col = df.columns[i]
+
+            rx_mean = None
+            tx_mean = None
+            try:
+                if rx_bps_col is not None:
+                    rx_mean = float(pd.to_numeric(df[rx_bps_col], errors='coerce').dropna().mean())
+                if tx_bps_col is not None:
+                    tx_mean = float(pd.to_numeric(df[tx_bps_col], errors='coerce').dropna().mean())
+            except Exception:
+                rx_mean = None
+                tx_mean = None
+
+            # Fallback: compute from cumulative rx_bytes/tx_bytes
+            if (rx_mean is None or tx_mean is None):
+                rx_bytes_col = None
+                tx_bytes_col = None
+                for i, c in enumerate(cols_lc):
+                    if 'rx_bytes' in c:
+                        rx_bytes_col = df.columns[i]
+                    if 'tx_bytes' in c:
+                        tx_bytes_col = df.columns[i]
+
+                try:
+                    tscol = find_timestamp_column(df)
+                    if tscol is not None:
+                        ts = pd.to_numeric(df[tscol], errors='coerce')
+                        ts_valid = ts.dropna()
+                        if not ts_valid.empty:
+                            tmin = float(ts_valid.iloc[0])
+                            tmax = float(ts_valid.iloc[-1])
+                            dur_s = max(0.001, (tmax - tmin) / 1000.0)
+                        else:
+                            dur_s = None
+                    else:
+                        dur_s = None
+                except Exception:
+                    dur_s = None
+
+                if dur_s and rx_bytes_col is not None:
+                    try:
+                        rx_vals = pd.to_numeric(df[rx_bytes_col], errors='coerce').dropna()
+                        if len(rx_vals) >= 2:
+                            rx_mean = float((rx_vals.iloc[-1] - rx_vals.iloc[0]) / dur_s)
+                    except Exception:
+                        pass
+                if dur_s and tx_bytes_col is not None:
+                    try:
+                        tx_vals = pd.to_numeric(df[tx_bytes_col], errors='coerce').dropna()
+                        if len(tx_vals) >= 2:
+                            tx_mean = float((tx_vals.iloc[-1] - tx_vals.iloc[0]) / dur_s)
+                    except Exception:
+                        pass
+
+            # classify folder: treat explicit host folder separately
+            base = os.path.basename(cfolder)
+            is_host = (base == 'uvgcomm-host' or 'host' in base.lower())
+            if is_host:
+                if rx_mean is not None:
+                    measured_in_host.append(rx_mean)
+                if tx_mean is not None:
+                    measured_out_host.append(tx_mean)
+            else:
+                if rx_mean is not None:
+                    measured_in_clients.append(rx_mean)
+                if tx_mean is not None:
+                    measured_out_clients.append(tx_mean)
+    except Exception:
+        pass
+
+    c_out_mean = float(np.mean(measured_out_clients)) if measured_out_clients else None
+    c_in_mean = float(np.mean(measured_in_clients)) if measured_in_clients else None
+    h_out_mean = float(np.mean(measured_out_host)) if measured_out_host else None
+    h_in_mean = float(np.mean(measured_in_host)) if measured_in_host else None
+    return c_out_mean, c_in_mean, h_out_mean, h_in_mean
 
 
 def plot_psnr(mean_df, std_df, analysis_folder, scenario):
@@ -564,9 +677,9 @@ def plot_psnr(mean_df, std_df, analysis_folder, scenario):
     # Force y-limits to 0..50 and add horizontal 8-bit max line before legend so it's shown
     plt.ylim(0, 50)
     plt.axhline(48.131, color='gray', linestyle=':', linewidth=2.0, label='Max PSNR (8-bit)', zorder=5)
-    plt.legend(fontsize=10)
+    plt.legend(prop={'size': 10})
     plt.tight_layout()
-    out = os.path.join(analysis_folder, f'{scenario}_psnr.svg')
+    out = os.path.join(analysis_folder, 'psnr.svg')
     plt.savefig(out)
     plt.close()
     print('Saved PSNR plot:', out)
@@ -748,7 +861,7 @@ def collect_presence_records_for_run(run_path, arch, n):
 
 
 def accumulate_run_results(metrics, arch, n, run_path,
-                           cpu_results, psnr_stats, missing_rows, resolution_rows, latency_rows):
+                           cpu_results, psnr_stats, missing_rows, resolution_rows, latency_rows, measured_rows):
     """Accumulate per-run metrics into the provided containers (mutates lists/dicts).
 
     Mirrors the original inlined logic.
@@ -774,6 +887,17 @@ def accumulate_run_results(metrics, arch, n, run_path,
               'avg_height': metrics.get('avg_height'), 'avg_frame_size': metrics.get('avg_frame_size'),
               'outgoing_bps': metrics.get('outgoing_bps'), 'incoming_bps': metrics.get('incoming_bps')}
     resolution_rows.append(row_rs)
+
+    # Measured bandwidth collected from per-container monitoring (clients vs host)
+    measured_row = {
+        'arch': arch,
+        'participants': n,
+        'measured_outgoing_bps_clients': metrics.get('measured_outgoing_bps_per_client'),
+        'measured_incoming_bps_clients': metrics.get('measured_incoming_bps_per_client'),
+        'measured_outgoing_bps_host': metrics.get('measured_host_outgoing_bps'),
+        'measured_incoming_bps_host': metrics.get('measured_host_incoming_bps')
+    }
+    measured_rows.append(measured_row)
 
     # latency/encode/decode
     latency_rows.append({'arch': arch, 'participants': n,
@@ -905,6 +1029,117 @@ def process_resolution_rows(resolution_rows, ANALYSIS_FOLDER):
         print('Failed to create bandwidth plot:', e)
 
 
+def process_measured_bandwidth_rows(measured_rows, ANALYSIS_FOLDER):
+    """Write measured per-client bandwidth CSV and produce a plot similar to
+    bandwidth_mbps_per_client.svg but using the docker-measured bandwidth.csv
+    values.
+    """
+    mb_df = pd.DataFrame(measured_rows)
+    if mb_df.empty:
+        return
+
+    out_rows = []
+    for _, r in mb_df.iterrows():
+        parts = int(r.get('participants')) if pd.notna(r.get('participants')) else None
+        out_bps_clients = r.get('measured_outgoing_bps_clients')
+        in_bps_clients = r.get('measured_incoming_bps_clients')
+        out_bps_host = r.get('measured_outgoing_bps_host')
+        in_bps_host = r.get('measured_incoming_bps_host')
+        out_rows.append({
+            'Architecture': r.get('arch'),
+            'Participants': parts,
+            'Measured_Client_Outgoing_Mbps_per_client': (float(out_bps_clients) / 1e6) if out_bps_clients is not None else None,
+            'Measured_Client_Incoming_Mbps_per_client': (float(in_bps_clients) / 1e6) if in_bps_clients is not None else None,
+            'Measured_Host_Outgoing_Mbps': (float(out_bps_host) / 1e6) if out_bps_host is not None else None,
+            'Measured_Host_Incoming_Mbps': (float(in_bps_host) / 1e6) if in_bps_host is not None else None
+        })
+
+    out_df = pd.DataFrame(out_rows)
+    mb_csv = os.path.join(ANALYSIS_FOLDER, 'measured_bandwidth_per_client.csv')
+    out_df.to_csv(mb_csv, index=False, sep=';')
+    print('Wrote measured bandwidth summary to', mb_csv)
+
+    # Plot measured bandwidth per architecture
+    try:
+        fig, ax = plt.subplots(figsize=(8,4))
+        cmap = get_color_map(out_df['Architecture'].unique())
+        markers = ['o', 's', '^', 'D', 'v', 'P', 'X', '*']
+        groups = out_df.groupby('Architecture')
+        max_val = 0.0
+        for i, (arch_name, g) in enumerate(groups):
+            color = cmap.get(arch_name)
+            marker = markers[i % len(markers)]
+            try:
+                gagg_mean = g.groupby('Participants')[[
+                    'Measured_Client_Outgoing_Mbps_per_client', 'Measured_Client_Incoming_Mbps_per_client',
+                    'Measured_Host_Outgoing_Mbps', 'Measured_Host_Incoming_Mbps']].mean()
+                gagg_std = g.groupby('Participants')[[
+                    'Measured_Client_Outgoing_Mbps_per_client', 'Measured_Client_Incoming_Mbps_per_client',
+                    'Measured_Host_Outgoing_Mbps', 'Measured_Host_Incoming_Mbps']].std().fillna(0.0)
+            except Exception:
+                try:
+                    gagg_mean = g.set_index('Participants')[[
+                        'Measured_Client_Outgoing_Mbps_per_client', 'Measured_Client_Incoming_Mbps_per_client',
+                        'Measured_Host_Outgoing_Mbps', 'Measured_Host_Incoming_Mbps']]
+                    gagg_std = gagg_mean * 0.0
+                except Exception:
+                    continue
+
+            x = list(gagg_mean.index)
+            # client lines
+            y_client_out = gagg_mean['Measured_Client_Outgoing_Mbps_per_client']
+            y_client_in = gagg_mean['Measured_Client_Incoming_Mbps_per_client']
+            y_client_out_std = gagg_std['Measured_Client_Outgoing_Mbps_per_client']
+            y_client_in_std = gagg_std['Measured_Client_Incoming_Mbps_per_client']
+            # host lines (not per-client)
+            y_host_out = gagg_mean['Measured_Host_Outgoing_Mbps']
+            y_host_in = gagg_mean['Measured_Host_Incoming_Mbps']
+            y_host_out_std = gagg_std['Measured_Host_Outgoing_Mbps']
+            y_host_in_std = gagg_std['Measured_Host_Incoming_Mbps']
+            try:
+                max_val = max(max_val,
+                              float(np.nanmax((y_client_out + y_client_out_std).fillna(0.0))),
+                              float(np.nanmax((y_client_in + y_client_in_std).fillna(0.0))),
+                              float(np.nanmax((y_host_out + y_host_out_std).fillna(0.0))),
+                              float(np.nanmax((y_host_in + y_host_in_std).fillna(0.0))))
+            except Exception:
+                pass
+
+            # plot client measured lines
+            ax.plot(x, y_client_out, marker=marker, linestyle='-', label=f'{arch_name} Client Out', color=color)
+            ax.plot(x, y_client_in, marker='x', linestyle='--', label=f'{arch_name} Client In', color=color)
+            # plot host measured lines with different linestyle (same color)
+            ax.plot(x, y_host_out, marker='o', linestyle=':', label=f'{arch_name} Host Out', color=color)
+            ax.plot(x, y_host_in, marker='x', linestyle='-.', label=f'{arch_name} Host In', color=color)
+            try:
+                ax.fill_between(x, (y_client_out - y_client_out_std), (y_client_out + y_client_out_std), color=color, alpha=0.12)
+                ax.fill_between(x, (y_client_in - y_client_in_std), (y_client_in + y_client_in_std), color=color, alpha=0.06)
+            except Exception:
+                pass
+
+        ax.set_xlabel('Participants')
+        ax.set_ylabel('Measured Per-Client Bandwidth (Mbps)')
+        ax.set_title('Measured Outgoing and Incoming Bandwidth (per-client)')
+        ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
+        try:
+            xt = sorted(set(int(x) for x in out_df['Participants'].dropna().unique()))
+            ax.set_xticks(xt)
+        except Exception:
+            pass
+        if max_val is not None and max_val > 0:
+            ax.set_ylim(0, max(max_val * 1.05, 0.1))
+        else:
+            ax.set_ylim(0, 1)
+        ax.legend(fontsize=8)
+        plt.tight_layout()
+        bw_out = os.path.join(ANALYSIS_FOLDER, 'measured_bandwidth_mbps_per_client.svg')
+        fig.savefig(bw_out)
+        plt.close(fig)
+        print('Wrote measured bandwidth plot to', bw_out)
+    except Exception as e:
+        print('Failed to create measured bandwidth plot:', e)
+
+
 def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
     """Write latency CSV and latency breakdown plot from latency_rows."""
     lat_df = pd.DataFrame(latency_rows)
@@ -1033,6 +1268,7 @@ def process_scenario(ROOT_FOLDER, scenario):
     psnr_stats = defaultdict(dict)
     missing_rows = []
     resolution_rows = []
+    measured_rows = []
     latency_rows = []
     presence_records = []
 
@@ -1057,7 +1293,7 @@ def process_scenario(ROOT_FOLDER, scenario):
                     continue
                 # accumulate results into the various summary containers
                 accumulate_run_results(metrics, arch, n, run_path,
-                                       cpu_results, psnr_stats, missing_rows, resolution_rows, latency_rows)
+                                       cpu_results, psnr_stats, missing_rows, resolution_rows, latency_rows, measured_rows)
 
     # Prepare PSNR mean/std and write diagnostics
     psnr_mean, psnr_std = build_psnr_dfs(psnr_stats)
@@ -1071,6 +1307,13 @@ def process_scenario(ROOT_FOLDER, scenario):
 
     # Handle latency/encode/decode summaries and plots
     process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER)
+
+    # Handle measured docker bandwidth summaries and plots (separate from
+    # synthetic bandwidth estimates computed from frame sizes).
+    try:
+        process_measured_bandwidth_rows(measured_rows, ANALYSIS_FOLDER)
+    except Exception as e:
+        print('Failed to process measured bandwidth rows:', e)
 
     # Finalize CPU and PSNR plots
     finalize_cpu_and_psnr(cpu_results, psnr_mean, psnr_std, ANALYSIS_FOLDER, scenario)

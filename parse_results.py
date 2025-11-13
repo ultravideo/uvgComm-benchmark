@@ -24,6 +24,7 @@ import matplotlib.pyplot as plt
 import argparse
 import matplotlib
 import numpy as np
+import concurrent.futures
 from collections import defaultdict
 
 # Use non-interactive backend for matplotlib
@@ -849,22 +850,36 @@ def process_resolution_rows(resolution_rows, ANALYSIS_FOLDER):
         for i, (arch_name, g) in enumerate(groups):
             color = cmap.get(arch_name)
             marker = markers[i % len(markers)]
-            # sort by Participants for nicer lines
+            # Aggregate by Participants: compute mean and std so each x is averaged
             try:
-                g_sorted = g.sort_values('Participants')
+                gagg_mean = g.groupby('Participants')[['Outgoing_Mbps_per_client', 'Incoming_Mbps_per_client']].mean()
+                gagg_std = g.groupby('Participants')[['Outgoing_Mbps_per_client', 'Incoming_Mbps_per_client']].std().fillna(0.0)
             except Exception:
-                g_sorted = g
-            x = g_sorted['Participants']
-            y_out = g_sorted['Outgoing_Mbps_per_client']
-            y_in = g_sorted['Incoming_Mbps_per_client']
-            # track max for y-limits
+                # fallback: use raw group if aggregation fails
+                try:
+                    gagg_mean = g.set_index('Participants')[[ 'Outgoing_Mbps_per_client', 'Incoming_Mbps_per_client' ]]
+                    gagg_std = gagg_mean * 0.0
+                except Exception:
+                    continue
+            x = list(gagg_mean.index)
+            y_out = gagg_mean['Outgoing_Mbps_per_client']
+            y_in = gagg_mean['Incoming_Mbps_per_client']
+            y_out_std = gagg_std['Outgoing_Mbps_per_client']
+            y_in_std = gagg_std['Incoming_Mbps_per_client']
+            # track max for y-limits (mean + std)
             try:
-                max_val = max(max_val, float(np.nanmax(np.array(y_out.fillna(0.0)))), float(np.nanmax(np.array(y_in.fillna(0.0)))))
+                max_val = max(max_val, float(np.nanmax((y_out + y_out_std).fillna(0.0))), float(np.nanmax((y_in + y_in_std).fillna(0.0))))
             except Exception:
                 pass
+            # plot mean lines
             ax.plot(x, y_out, marker=marker, linestyle='-', label=f'{arch_name} Out', color=color)
-            # use a different marker for incoming but same color
             ax.plot(x, y_in, marker='x', linestyle='--', label=f'{arch_name} In', color=color)
+            # fill +/- std to show variance (subtle)
+            try:
+                ax.fill_between(x, (y_out - y_out_std), (y_out + y_out_std), color=color, alpha=0.12)
+                ax.fill_between(x, (y_in - y_in_std), (y_in + y_in_std), color=color, alpha=0.06)
+            except Exception:
+                pass
 
         ax.set_xlabel('Participants')
         ax.set_ylabel('Per-Client Bandwidth (Mbps)')
@@ -1021,16 +1036,28 @@ def process_scenario(ROOT_FOLDER, scenario):
     latency_rows = []
     presence_records = []
 
+    # Build task list and collect presence records first (cheap).
+    tasks = []
     for arch, entries in arch_map.items():
         for n, run_path in sorted(entries, key=lambda x: (x[0], x[1])):
-            # collect presence records for this run
             presence_records.extend(collect_presence_records_for_run(run_path, arch, n))
+            tasks.append((arch, n, run_path))
 
-            metrics = analyze_run(run_path)
-
-            # accumulate results into the various summary containers
-            accumulate_run_results(metrics, arch, n, run_path,
-                                   cpu_results, psnr_stats, missing_rows, resolution_rows, latency_rows)
+    # Analyze runs in parallel using threads to speed up I/O-bound work.
+    if tasks:
+        max_workers = min((os.cpu_count() or 4), len(tasks), 8)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as exc:
+            future_to_task = {exc.submit(analyze_run, t[2]): t for t in tasks}
+            for fut in concurrent.futures.as_completed(future_to_task):
+                arch, n, run_path = future_to_task[fut]
+                try:
+                    metrics = fut.result()
+                except Exception as e:
+                    print(f"analyze_run failed for {run_path}: {e}")
+                    continue
+                # accumulate results into the various summary containers
+                accumulate_run_results(metrics, arch, n, run_path,
+                                       cpu_results, psnr_stats, missing_rows, resolution_rows, latency_rows)
 
     # Prepare PSNR mean/std and write diagnostics
     psnr_mean, psnr_std = build_psnr_dfs(psnr_stats)
@@ -1063,8 +1090,21 @@ def main():
         print('No scenarios found in', ROOT_FOLDER)
         return
 
-    for scenario in scenarios:
-        process_scenario(ROOT_FOLDER, scenario)
+    # If there are multiple scenarios, run them in parallel at the scenario level.
+    if len(scenarios) > 1:
+        max_workers = min(len(scenarios), (os.cpu_count() or 2))
+        # Use process-based parallelism to better utilize multiple CPUs for heavy analysis
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as exc:
+            futures = {exc.submit(process_scenario, ROOT_FOLDER, sc): sc for sc in scenarios}
+            for fut in concurrent.futures.as_completed(futures):
+                sc = futures[fut]
+                try:
+                    fut.result()
+                except Exception as e:
+                    print(f"process_scenario failed for {sc}: {e}")
+    else:
+        for scenario in scenarios:
+            process_scenario(ROOT_FOLDER, scenario)
     print('Analysis complete.')
 
 

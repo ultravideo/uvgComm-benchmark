@@ -42,6 +42,10 @@ CLIENTS_LIST=${CLIENTS_LIST:-"2,3,4,5,6"}
 ARCHS=${ARCHS:-"P2P_Mesh,SFU,Hybrid"}
 SCENARIOS=${SCENARIOS:-"720p"}
 
+# Number of visible participants shown in gallery view. Template contains value 9.
+# Can be overridden with -v on the CLI or via env var. Default is 9.
+VISIBLE_PARTICIPANTS=${VISIBLE_PARTICIPANTS:-9}
+
 # Per-benchmark wait values (seconds). Edit these two values to tune timing.
 # - WAIT_AFTER_INVITE: seconds to wait after each client is called
 # - WAIT_AFTER_SETTINGS: seconds to wait after initial settings before calling clients
@@ -59,17 +63,19 @@ Options:
     -c CLIENTS     Comma-separated client counts, e.g. "2,3,4". Defaults to ${CLIENTS_LIST}
     -a ARCHS       Comma separated architectures or "all" to include defaults (P2P_Mesh,SFU,Hybrid). Defaults to ${ARCHS}
     -s SCENARIOS   Comma separated scenarios to run, or "all" to include defaults (720p,4K,speaker,1080p,simlat,low_send_bw). Defaults to ${SCENARIOS}
+    -v VISIBLE     Number of visible participants in gallery view (default: ${VISIBLE_PARTICIPANTS}).
     -h             Show this help
 EOF
 }
 
 parse_args() {
-    while getopts ":r:c:a:s:h" opt; do
+    while getopts ":r:c:a:s:v:h" opt; do
         case ${opt} in
             r ) RUN_COUNT="$OPTARG" ;;
             c ) CLIENTS_LIST="$OPTARG" ;;
             a ) ARCHS="$OPTARG" ;;
             s ) SCENARIOS="$OPTARG" ;;
+            v ) VISIBLE_PARTICIPANTS="$OPTARG" ;;
             h ) usage; exit 0 ;;
             \? ) echo "Invalid Option: -$OPTARG" 1>&2; usage; exit 1 ;;
             : ) echo "Invalid Option: -$OPTARG requires an argument" 1>&2; usage; exit 1 ;;
@@ -118,6 +124,9 @@ validate_params() {
     local scen_re='^(720p|4K|speaker|1080p|simlat|low_send_bw)(,(720p|4K|speaker|1080p|simlat|low_send_bw))*$'
     local clients_re='^[0-9]+(,[0-9]+)*$'
 
+    # visible participants must be positive integer
+    local visible_re='^[0-9]+$'
+
     if ! [[ "$ARCHS" =~ $arch_re ]]; then
         echo "ERROR: Unknown architecture '$ARCHS' (allowed: P2P_Mesh,SFU,Hybrid)" >&2; exit 1
     fi
@@ -128,6 +137,10 @@ validate_params() {
 
     if ! [[ "$CLIENTS_LIST" =~ $clients_re ]]; then
         echo "ERROR: Invalid CLIENTS list '$CLIENTS_LIST' (must be comma-separated positive integers)" >&2; exit 1
+    fi
+
+    if ! [[ "$VISIBLE_PARTICIPANTS" =~ $visible_re ]]; then
+        echo "ERROR: Invalid visible participants value '$VISIBLE_PARTICIPANTS' (must be a positive integer)" >&2; exit 1
     fi
 
     # Populate arrays for later iteration (safe now that inputs are validated)
@@ -246,6 +259,7 @@ write_metadata() {
         echo "Upload_BW: ${upload_bw} Mbps"
         echo "Simulated_latencies: $latency"
         echo "View_Mode: $view_mode"
+        echo "Visible_Participants: ${VISIBLE_PARTICIPANTS}"
         echo "Start_Timestamp: $start"
         echo "End_timestamp: $end"
         echo "Run: $run"
@@ -253,6 +267,7 @@ write_metadata() {
 
     echo "Metadata written successfully."
 }
+
 
 
 generate_usernames() {
@@ -287,7 +302,7 @@ generate_client_configs() {
 
     if [ ! -f "${template}" ]; then
         echo "ERROR: Client template '${template}' not found. Please create it." >&2
-        return 1
+        exit 1
     fi
 
     for i in $(seq 1 "${MAX_CLIENTS}"); do
@@ -298,23 +313,33 @@ generate_client_configs() {
         # Copy template, then replace or append Username, ServerAddress and Name
         cp "${template}" "${out}"
 
-        # Replace Username=, ServerAddress= and Name= if present; otherwise append
+        # Replace Username=, ServerAddress=, Name= and visibleParticipants= if present, else error out.
         if grep -qE '^Username=' "${out}"; then
             sed -i "s/^Username=.*/Username=user${i}/" "${out}"
         else
-            echo "Username=user${i}" >> "${out}"
+            echo "ERROR: '${template}' (copied to ${out}) does not contain the key 'Username'. Exiting." >&2
+            exit 1
         fi
 
         if grep -qE '^ServerAddress=' "${out}"; then
             sed -i "s/^ServerAddress=.*/ServerAddress=172.28.0.$((2 + i))/" "${out}"
         else
-            echo "ServerAddress=172.28.0.$((2 + i))" >> "${out}"
+            echo "ERROR: '${template}' (copied to ${out}) does not contain the key 'ServerAddress'. Exiting." >&2
+            exit 1
         fi
 
         if grep -qE '^Name=' "${out}"; then
             sed -i "s/^Name=.*/Name=user${i}/" "${out}"
         else
-            echo "Name=user${i}" >> "${out}"
+            echo "ERROR: '${template}' (copied to ${out}) does not contain the key 'Name'. Exiting." >&2
+            exit 1
+        fi
+
+        if grep -qE '^visibleParticipants=' "${out}"; then
+            sed -i "s/^visibleParticipants=.*/visibleParticipants=${VISIBLE_PARTICIPANTS}/" "${out}"
+        else
+            echo "ERROR: '${template}' (copied to ${out}) does not contain the key 'visibleParticipants'. Exiting." >&2
+            exit 1
         fi
     done
 

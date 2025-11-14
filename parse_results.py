@@ -959,74 +959,92 @@ def process_resolution_rows(resolution_rows, ANALYSIS_FOLDER):
             'Incoming_Mbps_per_client': in_mbps
         })
     out_df = pd.DataFrame(out_rows)
-    res_csv = os.path.join(ANALYSIS_FOLDER, f'resolution_framesize.csv')
+    # Mark this CSV as diagnostic because the bandwidth values are estimated
+    # from frame sizes and are not always accurate. Keep it for diagnostics.
+    res_csv = os.path.join(ANALYSIS_FOLDER, f'diagnostic_resolution_framesize.csv')
     out_df.to_csv(res_csv, index=False, sep=';')
-    print('Wrote resolution/frame-size summary to', res_csv)
+    print('Wrote diagnostic resolution/frame-size summary to', res_csv)
 
-    # also plot outgoing/incoming bandwidth per architecture/participants
+    # Plot outgoing/incoming bandwidth per architecture/participants using
+    # the generic measured-bandwidth plotting helper. Mark the plot as
+    # diagnostic to indicate estimates may be inaccurate.
     try:
-        fig, ax = plt.subplots(figsize=(8,4))
-        cmap = get_color_map(out_df['Architecture'].unique())
-        markers = ['o', 's', '^', 'D', 'v', 'P', 'X', '*']
-        # Plot per-architecture lines with distinct marker and color
-        groups = out_df.groupby('Architecture')
-        max_val = 0.0
-        for i, (arch_name, g) in enumerate(groups):
-            color = cmap.get(arch_name)
-            marker = markers[i % len(markers)]
-            # Aggregate by Participants: compute mean and std so each x is averaged
+        _plot_measured_bandwidth_generic(out_df,
+                                         'Participants', 'Architecture',
+                                         ['Outgoing_Mbps_per_client', 'Incoming_Mbps_per_client'],
+                                         ['Out', 'In'],
+                                         ANALYSIS_FOLDER,
+                                         'diagnostic_bandwidth_mbps_per_client.svg',
+                                         'Outgoing and Incoming Bandwidth (per-client) (diagnostic)',
+                                         'Per-Client Bandwidth (Mbps)')
+    except Exception as e:
+        print('Failed to create diagnostic bandwidth plot:', e)
+
+
+def _plot_measured_bandwidth_generic(df, participants_col, arch_col, ycols, labels, ANALYSIS_FOLDER, out_filename, title, ylabel):
+    """Generic helper to plot measured bandwidth grouped by architecture and participants.
+
+    df: DataFrame containing at least arch_col, participants_col and the ycols.
+    ycols: list of column names to plot (one or more), labels: list of labels for legend suffix.
+    out_filename: relative filename to write under ANALYSIS_FOLDER.
+    """
+    fig, ax = plt.subplots(figsize=(8,4))
+    cmap = get_color_map(df[arch_col].unique())
+    markers = ['o', 's', '^', 'D', 'v', 'P', 'X', '*']
+    groups = df.groupby(arch_col)
+    max_val = 0.0
+
+    # linestyles for multiple series per-arch
+    linestyles = ['-', '--', ':', '-.']
+
+    for i, (arch_name, g) in enumerate(groups):
+        color = cmap.get(arch_name)
+        marker = markers[i % len(markers)]
+        try:
+            gagg_mean = g.groupby(participants_col)[ycols].mean()
+            gagg_std = g.groupby(participants_col)[ycols].std().fillna(0.0)
+        except Exception:
             try:
-                gagg_mean = g.groupby('Participants')[['Outgoing_Mbps_per_client', 'Incoming_Mbps_per_client']].mean()
-                gagg_std = g.groupby('Participants')[['Outgoing_Mbps_per_client', 'Incoming_Mbps_per_client']].std().fillna(0.0)
+                gagg_mean = g.set_index(participants_col)[ycols]
+                gagg_std = gagg_mean * 0.0
             except Exception:
-                # fallback: use raw group if aggregation fails
-                try:
-                    gagg_mean = g.set_index('Participants')[[ 'Outgoing_Mbps_per_client', 'Incoming_Mbps_per_client' ]]
-                    gagg_std = gagg_mean * 0.0
-                except Exception:
-                    continue
-            x = list(gagg_mean.index)
-            y_out = gagg_mean['Outgoing_Mbps_per_client']
-            y_in = gagg_mean['Incoming_Mbps_per_client']
-            y_out_std = gagg_std['Outgoing_Mbps_per_client']
-            y_in_std = gagg_std['Incoming_Mbps_per_client']
-            # track max for y-limits (mean + std)
+                continue
+
+        x = list(gagg_mean.index)
+        for j, ycol in enumerate(ycols):
+            y = gagg_mean[ycol]
+            ystd = gagg_std[ycol]
+            ls = linestyles[j % len(linestyles)]
+            mk = marker if j == 0 else 'x'
             try:
-                max_val = max(max_val, float(np.nanmax((y_out + y_out_std).fillna(0.0))), float(np.nanmax((y_in + y_in_std).fillna(0.0))))
+                max_val = max(max_val, float(np.nanmax((y + ystd).fillna(0.0))))
             except Exception:
                 pass
-            # plot mean lines
-            ax.plot(x, y_out, marker=marker, linestyle='-', label=f'{arch_name} Out', color=color)
-            ax.plot(x, y_in, marker='x', linestyle='--', label=f'{arch_name} In', color=color)
-            # fill +/- std to show variance (subtle)
+            ax.plot(x, y, marker=mk, linestyle=ls, label=f'{arch_name} {labels[j]}', color=color)
             try:
-                ax.fill_between(x, (y_out - y_out_std), (y_out + y_out_std), color=color, alpha=0.12)
-                ax.fill_between(x, (y_in - y_in_std), (y_in + y_in_std), color=color, alpha=0.06)
+                ax.fill_between(x, (y - ystd), (y + ystd), color=color, alpha=0.12)
             except Exception:
                 pass
 
-        ax.set_xlabel('Participants')
-        ax.set_ylabel('Per-Client Bandwidth (Mbps)')
-        ax.set_title('Outgoing and Incoming Bandwidth (per-client)')
-        ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
-        try:
-            xt = sorted(set(int(x) for x in out_df['Participants'].dropna().unique()))
-            ax.set_xticks(xt)
-        except Exception:
-            pass
-        # set y-axis to start at 0 and upper bound slightly above max
-        if max_val is not None and max_val > 0:
-            ax.set_ylim(0, max(max_val * 1.05, 0.1))
-        else:
-            ax.set_ylim(0, 1)
-        ax.legend(fontsize=8)
-        plt.tight_layout()
-        bw_out = os.path.join(ANALYSIS_FOLDER, 'bandwidth_mbps_per_client.svg')
-        fig.savefig(bw_out)
-        plt.close(fig)
-        print('Wrote bandwidth plot to', bw_out)
-    except Exception as e:
-        print('Failed to create bandwidth plot:', e)
+    ax.set_xlabel('Participants')
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
+    try:
+        xt = sorted(set(int(x) for x in df[participants_col].dropna().unique()))
+        ax.set_xticks(xt)
+    except Exception:
+        pass
+    if max_val is not None and max_val > 0:
+        ax.set_ylim(0, max(max_val * 1.05, 0.1))
+    else:
+        ax.set_ylim(0, 1)
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    out_path = os.path.join(ANALYSIS_FOLDER, out_filename)
+    fig.savefig(out_path)
+    plt.close(fig)
+    print('Wrote measured bandwidth plot to', out_path)
 
 
 def process_measured_bandwidth_rows(measured_rows, ANALYSIS_FOLDER):
@@ -1055,89 +1073,42 @@ def process_measured_bandwidth_rows(measured_rows, ANALYSIS_FOLDER):
         })
 
     out_df = pd.DataFrame(out_rows)
-    mb_csv = os.path.join(ANALYSIS_FOLDER, 'measured_bandwidth_per_client.csv')
+    mb_csv = os.path.join(ANALYSIS_FOLDER, 'diagnostic_measured_bandwidth_per_client.csv')
     out_df.to_csv(mb_csv, index=False, sep=';')
-    print('Wrote measured bandwidth summary to', mb_csv)
+    print('Wrote diagnostic measured bandwidth summary to', mb_csv)
 
-    # Plot measured bandwidth per architecture
+    # Split dataframes for client-only and host-only plotting
+    client_cols = ['Architecture', 'Participants', 'Measured_Client_Outgoing_Mbps_per_client', 'Measured_Client_Incoming_Mbps_per_client']
+    host_cols = ['Architecture', 'Participants', 'Measured_Host_Outgoing_Mbps', 'Measured_Host_Incoming_Mbps']
+
+    client_df = out_df[client_cols].copy()
+    host_df = out_df[host_cols].copy()
+
+    # Clients plot (per-client Mbps) using generic helper
     try:
-        fig, ax = plt.subplots(figsize=(8,4))
-        cmap = get_color_map(out_df['Architecture'].unique())
-        markers = ['o', 's', '^', 'D', 'v', 'P', 'X', '*']
-        groups = out_df.groupby('Architecture')
-        max_val = 0.0
-        for i, (arch_name, g) in enumerate(groups):
-            color = cmap.get(arch_name)
-            marker = markers[i % len(markers)]
-            try:
-                gagg_mean = g.groupby('Participants')[[
-                    'Measured_Client_Outgoing_Mbps_per_client', 'Measured_Client_Incoming_Mbps_per_client',
-                    'Measured_Host_Outgoing_Mbps', 'Measured_Host_Incoming_Mbps']].mean()
-                gagg_std = g.groupby('Participants')[[
-                    'Measured_Client_Outgoing_Mbps_per_client', 'Measured_Client_Incoming_Mbps_per_client',
-                    'Measured_Host_Outgoing_Mbps', 'Measured_Host_Incoming_Mbps']].std().fillna(0.0)
-            except Exception:
-                try:
-                    gagg_mean = g.set_index('Participants')[[
-                        'Measured_Client_Outgoing_Mbps_per_client', 'Measured_Client_Incoming_Mbps_per_client',
-                        'Measured_Host_Outgoing_Mbps', 'Measured_Host_Incoming_Mbps']]
-                    gagg_std = gagg_mean * 0.0
-                except Exception:
-                    continue
-
-            x = list(gagg_mean.index)
-            # client lines
-            y_client_out = gagg_mean['Measured_Client_Outgoing_Mbps_per_client']
-            y_client_in = gagg_mean['Measured_Client_Incoming_Mbps_per_client']
-            y_client_out_std = gagg_std['Measured_Client_Outgoing_Mbps_per_client']
-            y_client_in_std = gagg_std['Measured_Client_Incoming_Mbps_per_client']
-            # host lines (not per-client)
-            y_host_out = gagg_mean['Measured_Host_Outgoing_Mbps']
-            y_host_in = gagg_mean['Measured_Host_Incoming_Mbps']
-            y_host_out_std = gagg_std['Measured_Host_Outgoing_Mbps']
-            y_host_in_std = gagg_std['Measured_Host_Incoming_Mbps']
-            try:
-                max_val = max(max_val,
-                              float(np.nanmax((y_client_out + y_client_out_std).fillna(0.0))),
-                              float(np.nanmax((y_client_in + y_client_in_std).fillna(0.0))),
-                              float(np.nanmax((y_host_out + y_host_out_std).fillna(0.0))),
-                              float(np.nanmax((y_host_in + y_host_in_std).fillna(0.0))))
-            except Exception:
-                pass
-
-            # plot client measured lines
-            ax.plot(x, y_client_out, marker=marker, linestyle='-', label=f'{arch_name} Client Out', color=color)
-            ax.plot(x, y_client_in, marker='x', linestyle='--', label=f'{arch_name} Client In', color=color)
-            # plot host measured lines with different linestyle (same color)
-            ax.plot(x, y_host_out, marker='o', linestyle=':', label=f'{arch_name} Host Out', color=color)
-            ax.plot(x, y_host_in, marker='x', linestyle='-.', label=f'{arch_name} Host In', color=color)
-            try:
-                ax.fill_between(x, (y_client_out - y_client_out_std), (y_client_out + y_client_out_std), color=color, alpha=0.12)
-                ax.fill_between(x, (y_client_in - y_client_in_std), (y_client_in + y_client_in_std), color=color, alpha=0.06)
-            except Exception:
-                pass
-
-        ax.set_xlabel('Participants')
-        ax.set_ylabel('Measured Per-Client Bandwidth (Mbps)')
-        ax.set_title('Measured Outgoing and Incoming Bandwidth (per-client)')
-        ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
-        try:
-            xt = sorted(set(int(x) for x in out_df['Participants'].dropna().unique()))
-            ax.set_xticks(xt)
-        except Exception:
-            pass
-        if max_val is not None and max_val > 0:
-            ax.set_ylim(0, max(max_val * 1.05, 0.1))
-        else:
-            ax.set_ylim(0, 1)
-        ax.legend(fontsize=8)
-        plt.tight_layout()
-        bw_out = os.path.join(ANALYSIS_FOLDER, 'measured_bandwidth_mbps_per_client.svg')
-        fig.savefig(bw_out)
-        plt.close(fig)
-        print('Wrote measured bandwidth plot to', bw_out)
+        _plot_measured_bandwidth_generic(client_df,
+                                         'Participants', 'Architecture',
+                                         ['Measured_Client_Outgoing_Mbps_per_client', 'Measured_Client_Incoming_Mbps_per_client'],
+                                         ['Client Out', 'Client In'],
+                                         ANALYSIS_FOLDER,
+                                         'diagnostic_measured_bandwidth_clients_mbps_per_client.svg',
+                                         'Measured Outgoing and Incoming Bandwidth (clients only)',
+                                         'Measured Per-Client Bandwidth (Mbps)')
     except Exception as e:
-        print('Failed to create measured bandwidth plot:', e)
+        print('Failed to create measured client bandwidth plot:', e)
+
+    # Host plot (host total Mbps) - separate graph because host scale can dominate
+    try:
+        _plot_measured_bandwidth_generic(host_df,
+                                         'Participants', 'Architecture',
+                                         ['Measured_Host_Outgoing_Mbps', 'Measured_Host_Incoming_Mbps'],
+                                         ['Host Out', 'Host In'],
+                                         ANALYSIS_FOLDER,
+                                         'diagnostic_measured_bandwidth_host_mbps.svg',
+                                         'Measured Host Outgoing and Incoming Bandwidth',
+                                         'Measured Host Bandwidth (Mbps)')
+    except Exception as e:
+        print('Failed to create measured host bandwidth plot:', e)
 
 
 def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):

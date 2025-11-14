@@ -278,6 +278,7 @@ def detect_missing_frames(local_by_cname, participant_by_cname, start_ts=None, e
             missing = max(0, total_local - delivered)
             pct_missing = 100.0 * missing / total_local if total_local > 0 else None
             missing_summary.append({'cname': cname, 'receiver_folder': pinfo.get('client_folder'),
+                                     'local_folder': local_info.get('client_folder'),
                                      'total_local_frames': total_local, 'delivered': delivered,
                                      'missing': missing, 'pct_missing': pct_missing})
 
@@ -743,20 +744,31 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
     miss_df = pd.DataFrame(missing_records)
 
     rows = []
-    # Build a lookup for frames lost by (arch, participants, run_path, client_num)
+    # Build a lookup for frames lost per sender (arch, participants, run_path, sender_client_num)
     miss_lookup = {}
+    missing_partners = defaultdict(set)
     if not miss_df.empty:
-        # ensure client_num exists on missing records
-        if 'client_num' not in miss_df.columns:
-            miss_df['client_num'] = miss_df.get('receiver_folder', '').apply(lambda x: _extract_client_num_from_folder(x))
+        if 'sender_client_num' not in miss_df.columns:
+            miss_df['sender_client_num'] = miss_df.get('local_folder', '').apply(
+                lambda x: _extract_client_num_from_folder(x))
+        if 'receiver_client_num' not in miss_df.columns:
+            miss_df['receiver_client_num'] = miss_df.get('receiver_folder', '').apply(
+                lambda x: _extract_client_num_from_folder(x))
         for _, r in miss_df.iterrows():
-            key = (r.get('arch'), r.get('participants'), r.get('run_path'), r.get('client_num'))
-            # prefer raw missing count (integer) and capture analyzed_frames if present
-            miss_lookup[key] = {
-                'missing': int(r.get('missing') or 0),
-                # number of local frames that were actually analyzed (after any local filtering)
-                'analyzed_frames': int(r.get('total_local_frames') or 0)
-            }
+            sender = r.get('sender_client_num')
+            if sender is None:
+                continue
+            key = (r.get('arch'), r.get('participants'), r.get('run_path'), sender)
+            missing = int(r.get('missing') or 0)
+            analyzed = int(r.get('total_local_frames') or 0)
+            entry = miss_lookup.setdefault(key, {'missing': 0, 'analyzed_frames': 0})
+            entry['missing'] += missing
+            if analyzed and not entry['analyzed_frames']:
+                entry['analyzed_frames'] = analyzed
+            if missing > 0:
+                receiver = r.get('receiver_client_num')
+                if receiver is not None:
+                    missing_partners[key].add(receiver)
 
     # For every presence record (per run/client) create a diagnostics row
     if not pres_df.empty:
@@ -767,9 +779,12 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
             client = p.get('client_num')
             localc = int(p.get('local_count') or 0)
             partc = int(p.get('part_count') or 0)
-            mk = miss_lookup.get((arch, parts, runp, client), {'missing': 0, 'analyzed_frames': 0})
+            key = (arch, parts, runp, client)
+            mk = miss_lookup.get(key, {'missing': 0, 'analyzed_frames': 0})
             frames_lost = mk.get('missing', 0)
             analyzed = mk.get('analyzed_frames', 0)
+            partners = sorted(missing_partners.get(key, []))
+            partners_str = ','.join(str(int(p)) for p in partners) if partners else ''
             if localc == 0 and partc == 0:
                 status = 'broken'
             elif frames_lost > 0:
@@ -779,24 +794,29 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
             rows.append({'Architecture': arch, 'Participants': parts, 'RunPath': runp,
                          'Client': client, 'Local results': localc, 'Participant results': partc,
                          'Frames Lost': frames_lost, 'Analyzed Frames': analyzed,
+                         'Missing Participants': partners_str,
                          'Status': status})
     else:
         # No presence records: still write a row per missing record (or one OK row)
         if miss_lookup:
             for (arch, parts, runp, client), val in miss_lookup.items():
                 frames_lost = val.get('missing', 0)
+                partners = sorted(missing_partners.get((arch, parts, runp, client), []))
+                partners_str = ','.join(str(int(p)) for p in partners) if partners else ''
                 rows.append({'Architecture': arch, 'Participants': parts, 'RunPath': runp,
                              'Client': client, 'Local results': 0, 'Participant results': 0,
                              'Frames Lost': frames_lost,
                              'Analyzed Frames': int(val.get('analyzed_frames', 0)),
+                             'Missing Participants': partners_str,
                              'Status': ('missing frames' if frames_lost > 0 else 'OK')})
         else:
             rows.append({'Architecture': None, 'Participants': None, 'RunPath': None,
                          'Client': None, 'Local results': 0, 'Participant results': 0,
-                         'Frames Lost': 0, 'Analyzed Frames': 0, 'Status': 'OK'})
+                         'Frames Lost': 0, 'Analyzed Frames': 0, 'Missing Participants': '', 'Status': 'OK'})
 
     diag_df = pd.DataFrame(rows, columns=['Architecture', 'Participants', 'RunPath', 'Client',
-                                         'Local results', 'Participant results', 'Analyzed Frames', 'Frames Lost', 'Status'])
+                                         'Local results', 'Participant results', 'Analyzed Frames',
+                                         'Frames Lost', 'Missing Participants', 'Status'])
     diag_csv = os.path.join(analysis_folder, 'diagnostics_summary.csv')
     diag_df.to_csv(diag_csv, index=False, sep=';')
     print('Wrote diagnostics summary to', diag_csv)
@@ -875,8 +895,10 @@ def accumulate_run_results(metrics, arch, n, run_path,
     # missing frames summary appended (attach client_num inferred from receiver_folder)
     for m in metrics.get('missing_summary', []):
         row = dict(m)
+        sender_num = _extract_client_num_from_folder(m.get('local_folder'))
+        receiver_num = _extract_client_num_from_folder(m.get('receiver_folder'))
         row.update({'arch': arch, 'participants': n, 'run_path': run_path,
-                    'client_num': _extract_client_num_from_folder(m.get('receiver_folder'))})
+                    'sender_client_num': sender_num, 'receiver_client_num': receiver_num})
         missing_rows.append(row)
 
     # resolution/frame size + bitrates

@@ -582,63 +582,53 @@ def parse_measured_bandwidth(client_folders, start_ts=None, end_ts=None):
             cols_lc = [c.lower() for c in df.columns]
             rx_bps_col = None
             tx_bps_col = None
+            rx_bytes_col = None
+            tx_bytes_col = None
             for i, c in enumerate(cols_lc):
                 if 'rx_bps' in c or 'rxps' in c or 'rx_bytes/s' in c or 'rx_b/s' in c:
                     rx_bps_col = df.columns[i]
                 if 'tx_bps' in c or 'txps' in c or 'tx_bytes/s' in c or 'tx_b/s' in c:
                     tx_bps_col = df.columns[i]
+                if 'rx_bytes' in c:
+                    rx_bytes_col = df.columns[i]
+                if 'tx_bytes' in c:
+                    tx_bytes_col = df.columns[i]
 
-            rx_mean = None
-            tx_mean = None
-            try:
-                if rx_bps_col is not None:
-                    rx_mean = float(pd.to_numeric(df[rx_bps_col], errors='coerce').dropna().mean())
-                if tx_bps_col is not None:
-                    tx_mean = float(pd.to_numeric(df[tx_bps_col], errors='coerce').dropna().mean())
-            except Exception:
-                rx_mean = None
-                tx_mean = None
-
-            # Fallback: compute from cumulative rx_bytes/tx_bytes
-            if (rx_mean is None or tx_mean is None):
-                rx_bytes_col = None
-                tx_bytes_col = None
-                for i, c in enumerate(cols_lc):
-                    if 'rx_bytes' in c:
-                        rx_bytes_col = df.columns[i]
-                    if 'tx_bytes' in c:
-                        tx_bytes_col = df.columns[i]
-
+            tscol = find_timestamp_column(df)
+            duration_s = None
+            if tscol is not None:
                 try:
-                    tscol = find_timestamp_column(df)
-                    if tscol is not None:
-                        ts = pd.to_numeric(df[tscol], errors='coerce')
-                        ts_valid = ts.dropna()
-                        if not ts_valid.empty:
-                            tmin = float(ts_valid.iloc[0])
-                            tmax = float(ts_valid.iloc[-1])
-                            dur_s = max(0.001, (tmax - tmin) / 1000.0)
-                        else:
-                            dur_s = None
-                    else:
-                        dur_s = None
+                    ts = pd.to_numeric(df[tscol], errors='coerce').dropna()
+                    if len(ts) >= 2:
+                        interval_ms = float(ts.iloc[-1] - ts.iloc[0])
+                        if interval_ms > 0:
+                            duration_s = interval_ms / 1000.0
+                    if duration_s is not None:
+                        duration_s = max(duration_s, 0.001)
                 except Exception:
-                    dur_s = None
+                    duration_s = None
 
-                if dur_s and rx_bytes_col is not None:
-                    try:
-                        rx_vals = pd.to_numeric(df[rx_bytes_col], errors='coerce').dropna()
-                        if len(rx_vals) >= 2:
-                            rx_mean = float((rx_vals.iloc[-1] - rx_vals.iloc[0]) / dur_s)
-                    except Exception:
-                        pass
-                if dur_s and tx_bytes_col is not None:
-                    try:
-                        tx_vals = pd.to_numeric(df[tx_bytes_col], errors='coerce').dropna()
-                        if len(tx_vals) >= 2:
-                            tx_mean = float((tx_vals.iloc[-1] - tx_vals.iloc[0]) / dur_s)
-                    except Exception:
-                        pass
+            def _rate_from_bytes(col_name):
+                if col_name is None or duration_s is None:
+                    return None
+                vals = pd.to_numeric(df[col_name], errors='coerce').dropna()
+                if len(vals) < 2:
+                    return None
+                return float((vals.iloc[-1] - vals.iloc[0]) / duration_s) * 8.0
+
+            rx_mean = _rate_from_bytes(rx_bytes_col)
+            tx_mean = _rate_from_bytes(tx_bytes_col)
+
+            if rx_mean is None and rx_bps_col is not None:
+                try:
+                    rx_mean = float(pd.to_numeric(df[rx_bps_col], errors='coerce').dropna().mean()) * 8.0
+                except Exception:
+                    rx_mean = None
+            if tx_mean is None and tx_bps_col is not None:
+                try:
+                    tx_mean = float(pd.to_numeric(df[tx_bps_col], errors='coerce').dropna().mean()) * 8.0
+                except Exception:
+                    tx_mean = None
 
             # classify folder: treat explicit host folder separately
             base = os.path.basename(cfolder)

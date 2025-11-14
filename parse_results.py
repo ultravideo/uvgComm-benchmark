@@ -328,8 +328,14 @@ def analyze_run(run_path):
                     cpu_avg = None
     metrics['cpu_avg'] = cpu_avg
 
-    # discover client folders
-    client_folders = sorted([p for p in glob.glob(os.path.join(run_path, 'uvgcomm-*')) if os.path.isdir(p)])
+    # discover client folders (only client containers) and host folder(s) separately.
+    # Host containers never have local/participant CSVs, so avoid scanning them
+    # when collecting per-client traces. Keep host folders available for
+    # bandwidth parsing by combining them into `bandwidth_folders` below.
+    client_folders = sorted([p for p in glob.glob(os.path.join(run_path, 'uvgcomm-client*')) if os.path.isdir(p)])
+    host_folders = sorted([p for p in glob.glob(os.path.join(run_path, 'uvgcomm-host')) if os.path.isdir(p)])
+    # combined list used for measured bandwidth parsing (clients + host)
+    bandwidth_folders = client_folders + host_folders
 
     # apply timestamp filtering window from metadata if available
     start_ts = metadata.get('Start_Timestamp')
@@ -499,8 +505,9 @@ def analyze_run(run_path):
                                             start_ts=start_ts, end_ts=end_ts)
     metrics['missing_summary'] = missing_summary
 
-    # Parse measured bandwidth using helper (separate client vs host)
-    c_out_bps_meas, c_in_bps_meas, h_out_bps_meas, h_in_bps_meas = parse_measured_bandwidth(client_folders, start_ts, end_ts)
+    # Parse measured bandwidth using helper (separate client vs host). Pass
+    # both client and host folders so host metrics are still captured.
+    c_out_bps_meas, c_in_bps_meas, h_out_bps_meas, h_in_bps_meas = parse_measured_bandwidth(bandwidth_folders, start_ts, end_ts)
     metrics['measured_outgoing_bps_per_client'] = c_out_bps_meas
     metrics['measured_incoming_bps_per_client'] = c_in_bps_meas
     metrics['measured_host_outgoing_bps'] = h_out_bps_meas
@@ -817,7 +824,7 @@ def setup_analysis_folders(ROOT_FOLDER, scenario):
 def collect_presence_records_for_run(run_path, arch, n):
     """Return a list of presence record dicts for given run_path (same logic previously inlined)."""
     records = []
-    client_folders = sorted([p for p in glob.glob(os.path.join(run_path, 'uvgcomm-*')) if os.path.isdir(p)])
+    client_folders = sorted([p for p in glob.glob(os.path.join(run_path, 'uvgcomm-client*')) if os.path.isdir(p)])
     for idx, cf in enumerate(client_folders, start=1):
         client_num = _extract_client_num_from_folder(cf) or idx
         local_paths = glob.glob(os.path.join(cf, 'local_*.csv'))
@@ -1073,9 +1080,9 @@ def process_measured_bandwidth_rows(measured_rows, ANALYSIS_FOLDER):
         })
 
     out_df = pd.DataFrame(out_rows)
-    mb_csv = os.path.join(ANALYSIS_FOLDER, 'diagnostic_measured_bandwidth_per_client.csv')
+    mb_csv = os.path.join(ANALYSIS_FOLDER, 'measured_bandwidth_per_client.csv')
     out_df.to_csv(mb_csv, index=False, sep=';')
-    print('Wrote diagnostic measured bandwidth summary to', mb_csv)
+    print('Wrote measured bandwidth summary to', mb_csv)
 
     # Split dataframes for client-only and host-only plotting
     client_cols = ['Architecture', 'Participants', 'Measured_Client_Outgoing_Mbps_per_client', 'Measured_Client_Incoming_Mbps_per_client']
@@ -1091,7 +1098,7 @@ def process_measured_bandwidth_rows(measured_rows, ANALYSIS_FOLDER):
                                          ['Measured_Client_Outgoing_Mbps_per_client', 'Measured_Client_Incoming_Mbps_per_client'],
                                          ['Client Out', 'Client In'],
                                          ANALYSIS_FOLDER,
-                                         'diagnostic_measured_bandwidth_clients_mbps_per_client.svg',
+                                         'measured_bandwidth_clients_mbps_per_client.svg',
                                          'Measured Outgoing and Incoming Bandwidth (clients only)',
                                          'Measured Per-Client Bandwidth (Mbps)')
     except Exception as e:
@@ -1104,7 +1111,7 @@ def process_measured_bandwidth_rows(measured_rows, ANALYSIS_FOLDER):
                                          ['Measured_Host_Outgoing_Mbps', 'Measured_Host_Incoming_Mbps'],
                                          ['Host Out', 'Host In'],
                                          ANALYSIS_FOLDER,
-                                         'diagnostic_measured_bandwidth_host_mbps.svg',
+                                         'measured_bandwidth_host_mbps.svg',
                                          'Measured Host Outgoing and Incoming Bandwidth',
                                          'Measured Host Bandwidth (Mbps)')
     except Exception as e:

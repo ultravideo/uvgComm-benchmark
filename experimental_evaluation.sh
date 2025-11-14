@@ -429,7 +429,7 @@ create_host_script() {
 }
 
 create_host() {
-    local script_file="$1/script.txt"
+    local script_file="$1/${HOST_NAME}/script.txt"
     local architecture="$2"
     local clients="$3"
     local resolution="$4"
@@ -439,14 +439,15 @@ create_host() {
     local warmup_time="$8"
     local experiment_time="$9"
     local cooldown_time=${10}
+    mkdir -p "$(dirname "${script_file}")"
 
     create_host_script "${script_file}" $architecture $clients $resolution $download_bw $upload_bw $setup_time $warmup_time $experiment_time $cooldown_time
 
     echo "Starting host"
-    docker run -d --name $HOST_NAME --network $NETWORK_NAME --ip 172.28.0.2 \
-        -v ${CONFIG_FOLDER}/uvgComm_host.ini:$CONTAINER_CONFIG_FILE \
-        -v ${script_file}:${CONTAINER_HOST_SCRIPT_FILE} \
-        ${DOCKER_IMAGE}:latest --script $CONTAINER_HOST_SCRIPT_FILE
+    docker run -d --name "$HOST_NAME" --network "$NETWORK_NAME" --ip 172.28.0.2 \
+        -v "${CONFIG_FOLDER}/uvgComm_host.ini:${CONTAINER_CONFIG_FILE}" \
+        -v "${script_file}:${CONTAINER_HOST_SCRIPT_FILE}" \
+        "${DOCKER_IMAGE}:latest" --script "$CONTAINER_HOST_SCRIPT_FILE"
 }
 
 countdown_timer() {
@@ -519,7 +520,8 @@ record_container_logs() {
     for i in $(seq 1 $CLIENTS); do
         docker logs ${CLIENT_PREFIX}${i} &> ${output_location}/${CLIENT_PREFIX}${i}/docker.log
     done
-    docker logs $HOST_NAME &> ${output_location}/${HOST_NAME}.log
+    mkdir -p "${output_location}/${HOST_NAME}"
+    docker logs "$HOST_NAME" &> "${output_location}/${HOST_NAME}/${HOST_NAME}.log"
 }
 
 

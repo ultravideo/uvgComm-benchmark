@@ -407,12 +407,22 @@ create_host_script() {
     upload_bps=$(awk "BEGIN {printf \"%d\", ($upload_bw) * 1000000}")
     download_bps=$(awk "BEGIN {printf \"%d\", ($download_bw) * 1000000}")
 
-    echo "setting sip/upBandwidth $upload_bps" >> "$output_file"
-    echo "setting sip/downBandwidth $download_bps" >> "$output_file"
-    echo "setCall" >> "$output_file"
+    # Compute per-media bitrates. Template assumes download bandwidth reflects
+    # the conference target bitrate and audio is fixed at 24 kbps.
+    local conference_bps=$download_bps
+    local audio_bitrate=24000
+    local overhead_bps=$((conference_bps * 5 / 100))
+    local video_bitrate=$((conference_bps - audio_bitrate - overhead_bps))
+    if [ "$video_bitrate" -lt 0 ]; then
+        video_bitrate=0
+    fi
+
+    echo "setting audio/bitrate $audio_bitrate" >> "$output_file"
+    echo "setAudio" >> "$output_file"
 
     echo "setting video/FileResolutionWidth $width" >> "$output_file"
     echo "setting video/FileResolutionHeight $height" >> "$output_file"
+    echo "setting video/bitrate $video_bitrate" >> "$output_file"
     echo "setVideo" >> "$output_file"
 
     echo "wait $wait_after_settings" >> "$output_file"

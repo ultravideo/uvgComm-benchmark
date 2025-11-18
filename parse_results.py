@@ -1262,12 +1262,34 @@ def process_scenario(ROOT_FOLDER, scenario):
     latency_rows = []
     presence_records = []
 
-    # Build task list and collect presence records first (cheap).
-    tasks = []
+    # Build list of runs and collect presence records first (cheap). Parallelize collection
+    runs = []
     for arch, entries in arch_map.items():
         for n, run_path in sorted(entries, key=lambda x: (x[0], x[1])):
-            presence_records.extend(collect_presence_records_for_run(run_path, arch, n))
-            tasks.append((arch, n, run_path))
+            runs.append((arch, n, run_path))
+
+    total_runs = len(runs)
+    tasks = []
+    if total_runs:
+        # Use process-based parallelism for presence collection to utilize multiple CPU cores.
+        # This script prefers clarity: presence collection runs exclusively with processes.
+        max_workers = min((os.cpu_count() or 4), total_runs)
+        run_counter = 0
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as exc:
+            future_to_run = {exc.submit(collect_presence_records_for_run, run_path, arch, n): (arch, n, run_path)
+                             for (arch, n, run_path) in runs}
+            for fut in concurrent.futures.as_completed(future_to_run):
+                arch, n, run_path = future_to_run[fut]
+                # Let exceptions surface or be logged here for visibility.
+                try:
+                    records = fut.result()
+                except Exception as e:
+                    print(f"[presence] failed for {arch}-{n} {run_path}: {e}")
+                    records = []
+                run_counter += 1
+                presence_records.extend(records)
+                print(f"[presence {run_counter}/{total_runs}] collected {len(records)} record(s) for {arch}-{n} run {os.path.basename(run_path)}")
+                tasks.append((arch, n, run_path))
 
     # Analyze runs in parallel using threads to speed up I/O-bound work.
     if tasks:
@@ -1314,11 +1336,13 @@ def main():
     args = parser.parse_args()
 
     ROOT_FOLDER = args.run_folder
+    print(f"Starting parse_results for run folder: {ROOT_FOLDER}")
 
     # scenarios are subdirectories under the timestamp
     scenarios = [s for s in os.listdir(ROOT_FOLDER) if os.path.isdir(os.path.join(ROOT_FOLDER, s))]
     # exclude any analysis folder that might already exist to avoid double-processing
     scenarios = sorted([s for s in scenarios if s.lower() != 'analysis'])
+    print(f"Discovered {len(scenarios)} scenario(s): {scenarios}")
     if not scenarios:
         print('No scenarios found in', ROOT_FOLDER)
         return

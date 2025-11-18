@@ -831,8 +831,11 @@ def setup_analysis_folders(ROOT_FOLDER, scenario):
     return scenario_analysis
 
 
-def collect_presence_records_for_run(run_path, arch, n):
-    """Return a list of presence record dicts for given run_path (same logic previously inlined)."""
+def collect_presence_records_for_run(run_path, arch, participants):
+    """Return a list of presence record dicts for given run_path (same logic previously inlined).
+
+    `participants` is the number of participants for this run.
+    """
     records = []
     client_folders = sorted([p for p in glob.glob(os.path.join(run_path, 'uvgcomm-client*')) if os.path.isdir(p)])
     for idx, cf in enumerate(client_folders, start=1):
@@ -869,7 +872,7 @@ def collect_presence_records_for_run(run_path, arch, n):
             code = 'M'
         else:
             code = '-'
-        records.append({'arch': arch, 'participants': n, 'client_num': client_num,
+        records.append({'arch': arch, 'participants': participants, 'client_num': client_num,
                         'local_present': local_present, 'part_present': part_present,
                         'local_valid': local_valid, 'part_valid': part_valid,
                         'local_count': local_count, 'part_count': part_count,
@@ -877,20 +880,20 @@ def collect_presence_records_for_run(run_path, arch, n):
     return records
 
 
-def accumulate_run_results(metrics, arch, n, run_path,
+def accumulate_run_results(metrics, arch, participants, run_path,
                            cpu_results, psnr_stats, missing_rows, resolution_rows, latency_rows, measured_rows):
     """Accumulate per-run metrics into the provided containers (mutates lists/dicts).
 
     Mirrors the original inlined logic.
     """
-    cpu_results[arch].append((n, metrics.get('cpu_avg')))
+    cpu_results[arch].append((participants, metrics.get('cpu_avg')))
 
     # PSNR per run - we have avg_psnr and count. Keep mean and std as single-run values.
     psnr_val = metrics.get('avg_psnr')
     if psnr_val is not None:
-        if n not in psnr_stats[arch]:
-            psnr_stats[arch][n] = []
-        psnr_stats[arch][n].append(psnr_val)
+        if participants not in psnr_stats[arch]:
+            psnr_stats[arch][participants] = []
+        psnr_stats[arch][participants].append(psnr_val)
 
     # missing frames summary appended (attach client_num inferred from receiver_folder)
     for m in metrics.get('missing_summary', []):
@@ -902,7 +905,7 @@ def accumulate_run_results(metrics, arch, n, run_path,
         missing_rows.append(row)
 
     # resolution/frame size + bitrates
-    row_rs = {'arch': arch, 'participants': n, 'avg_width': metrics.get('avg_width'),
+    row_rs = {'arch': arch, 'participants': participants, 'avg_width': metrics.get('avg_width'),
               'avg_height': metrics.get('avg_height'), 'avg_frame_size': metrics.get('avg_frame_size'),
               'outgoing_bps': metrics.get('outgoing_bps'), 'incoming_bps': metrics.get('incoming_bps')}
     resolution_rows.append(row_rs)
@@ -910,7 +913,7 @@ def accumulate_run_results(metrics, arch, n, run_path,
     # Measured bandwidth collected from per-container monitoring (clients vs host)
     measured_row = {
         'arch': arch,
-        'participants': n,
+        'participants': participants,
         'measured_outgoing_bps_clients': metrics.get('measured_outgoing_bps_per_client'),
         'measured_incoming_bps_clients': metrics.get('measured_incoming_bps_per_client'),
         'measured_outgoing_bps_host': metrics.get('measured_host_outgoing_bps'),
@@ -919,7 +922,7 @@ def accumulate_run_results(metrics, arch, n, run_path,
     measured_rows.append(measured_row)
 
     # latency/encode/decode
-    latency_rows.append({'arch': arch, 'participants': n,
+    latency_rows.append({'arch': arch, 'participants': participants,
                          'avg_latency_ms': metrics.get('avg_latency_ms'),
                          'avg_encode_ms': metrics.get('avg_encode_ms'),
                          'avg_decode_ms': metrics.get('avg_decode_ms')})
@@ -1230,20 +1233,52 @@ def finalize_cpu_and_psnr(cpu_results, psnr_mean, psnr_std, ANALYSIS_FOLDER, sce
     averaged_cpu = {}
     for arch, rows in cpu_results.items():
         by_n = defaultdict(list)
-        for n, val in rows:
+        for participants, val in rows:
             if val is not None:
-                by_n[n].append(val)
+                by_n[participants].append(val)
         averaged = []
-        for n, vals in sorted(by_n.items()):
+        for participants, vals in sorted(by_n.items()):
             try:
-                averaged.append((n, float(np.mean(vals))))
+                averaged.append((participants, float(np.mean(vals))))
             except Exception:
-                averaged.append((n, None))
+                averaged.append((participants, None))
         averaged_cpu[arch] = averaged
     plot_cpu(averaged_cpu, ANALYSIS_FOLDER, scenario)
 
     if not psnr_mean.empty:
         plot_psnr(psnr_mean, psnr_std, ANALYSIS_FOLDER, scenario)
+
+
+def process_group(participants, entries):
+    """Process all runs for a given participant count `participants`.
+
+    Runs analyze_run sequentially for each (arch, run_path) in entries and
+    returns a list of tuples (arch, participants, run_path, pruned_metrics).
+
+    Pruned metrics contains only the scalar/serializable fields needed by
+    `accumulate_run_results` to avoid heavy DataFrame pickling between processes.
+    """
+    pruned_results = []
+    # keys to keep from analyze_run's metrics (avoid DataFrames)
+    keep_keys = ['metadata', 'cpu_avg', 'avg_psnr', 'psnr_count', 'avg_frame_size',
+                 'avg_width', 'avg_height', 'avg_encode_ms', 'outgoing_bps', 'incoming_bps',
+                 'avg_latency_ms', 'avg_decode_ms', 'avg_part_frame_size', 'missing_summary',
+                 'measured_outgoing_bps_per_client', 'measured_incoming_bps_per_client',
+                 'measured_host_outgoing_bps', 'measured_host_incoming_bps']
+    for arch, run_path in entries:
+        try:
+            metrics = analyze_run(run_path)
+        except Exception as e:
+            print(f"analyze_run failed in group participants={participants} for {run_path}: {e}")
+            pruned_results.append((arch, participants, run_path, None))
+            continue
+        if metrics is None:
+            pruned_results.append((arch, participants, run_path, None))
+            continue
+        pr = {k: metrics.get(k) for k in keep_keys if k in metrics}
+        # Keep the original missing_summary if present (it's a list of dicts and serializable)
+        pruned_results.append((arch, participants, run_path, pr))
+    return pruned_results
 
 
 def process_scenario(ROOT_FOLDER, scenario):
@@ -1265,8 +1300,8 @@ def process_scenario(ROOT_FOLDER, scenario):
     # Build list of runs and collect presence records first (cheap). Parallelize collection
     runs = []
     for arch, entries in arch_map.items():
-        for n, run_path in sorted(entries, key=lambda x: (x[0], x[1])):
-            runs.append((arch, n, run_path))
+        for participants, run_path in sorted(entries, key=lambda x: (x[0], x[1])):
+            runs.append((arch, participants, run_path))
 
     total_runs = len(runs)
     tasks = []
@@ -1276,36 +1311,45 @@ def process_scenario(ROOT_FOLDER, scenario):
         max_workers = min((os.cpu_count() or 4), total_runs)
         run_counter = 0
         with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as exc:
-            future_to_run = {exc.submit(collect_presence_records_for_run, run_path, arch, n): (arch, n, run_path)
-                             for (arch, n, run_path) in runs}
+            future_to_run = {exc.submit(collect_presence_records_for_run, run_path, arch, participants): (arch, participants, run_path)
+                             for (arch, participants, run_path) in runs}
             for fut in concurrent.futures.as_completed(future_to_run):
-                arch, n, run_path = future_to_run[fut]
+                arch, participants, run_path = future_to_run[fut]
                 # Let exceptions surface or be logged here for visibility.
                 try:
                     records = fut.result()
                 except Exception as e:
-                    print(f"[presence] failed for {arch}-{n} {run_path}: {e}")
+                    print(f"[presence] failed for {arch}-{participants} {run_path}: {e}")
                     records = []
                 run_counter += 1
                 presence_records.extend(records)
-                print(f"[presence {run_counter}/{total_runs}] collected {len(records)} record(s) for {arch}-{n} run {os.path.basename(run_path)}")
-                tasks.append((arch, n, run_path))
+                print(f"[presence {run_counter}/{total_runs}] collected {len(records)} record(s) for {arch}-{participants} run {os.path.basename(run_path)}")
+                tasks.append((arch, participants, run_path))
 
-    # Analyze runs in parallel using threads to speed up I/O-bound work.
+    # Analyze runs grouped by participant count. Parallelize across distinct participant counts
+    # to reduce low-level task overhead and better utilize CPU across groups.
     if tasks:
-        max_workers = min((os.cpu_count() or 4), len(tasks), 8)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as exc:
-            future_to_task = {exc.submit(analyze_run, t[2]): t for t in tasks}
-            for fut in concurrent.futures.as_completed(future_to_task):
-                arch, n, run_path = future_to_task[fut]
+        # Group runs by participant count
+        groups = defaultdict(list)
+        for arch, participants, run_path in tasks:
+            groups[participants].append((arch, run_path))
+
+        max_workers = min((os.cpu_count() or 4), len(groups))
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as exc:
+            future_to_participants = {exc.submit(process_group, participants, groups[participants]): participants for participants in groups}
+            for fut in concurrent.futures.as_completed(future_to_participants):
+                participants = future_to_participants[fut]
                 try:
-                    metrics = fut.result()
+                    group_results = fut.result()
                 except Exception as e:
-                    print(f"analyze_run failed for {run_path}: {e}")
+                    print(f"process_group failed for participants={participants}: {e}")
                     continue
-                # accumulate results into the various summary containers
-                accumulate_run_results(metrics, arch, n, run_path,
-                                       cpu_results, psnr_stats, missing_rows, resolution_rows, latency_rows, measured_rows)
+                # Merge per-run metrics returned from the group worker
+                for arch, participants, run_path, metrics in group_results:
+                    if metrics is None:
+                        continue
+                    accumulate_run_results(metrics, arch, participants, run_path,
+                                           cpu_results, psnr_stats, missing_rows, resolution_rows, latency_rows, measured_rows)
 
     # Prepare PSNR mean/std and write diagnostics
     psnr_mean, psnr_std = build_psnr_dfs(psnr_stats)

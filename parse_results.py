@@ -31,7 +31,7 @@ from collections import defaultdict
 matplotlib.use("Agg")
 
 # limit unmatched-frame debug prints per detect_missing_frames run
-_UNMATCHED_PRINT_LIMIT = int(os.environ.get('UVGCOMM_UNMATCHED_PRINT_LIMIT', '50'))
+_UNMATCHED_PRINT_LIMIT = int(os.environ.get('UVGCOMM_UNMATCHED_PRINT_LIMIT', '5'))
 _unmatched_print_count = 0
 
 
@@ -184,45 +184,98 @@ def _match_with_offset(local_sizes, part_sizes, lookahead, verbose=False):
     # declare global counter up-front so any use in this function is valid
     global _unmatched_print_count
     j = 0
-    for i, ls in enumerate(local_sizes):
+    first_matched = False
+    # One-time initial lookahead (in frames) used only to align the first local frames
+    INITIAL_LOOKAHEAD = 100
+
+    i = 0
+    n_local = len(local_sizes)
+    # iterate with explicit index so we can skip the second local frame when we match two at start
+    while i < n_local:
+        ls = local_sizes[i]
+        # If participant frames are exhausted, remaining local frames are unmatched.
         if j >= len(part_sizes):
-            # Participant frames exhausted: remaining local frames are unmatched.
-            # If verbose, emit prints for trailing unmatched frames (respecting the global print limit).
-            if verbose:
-                for rem_pos in range(i, len(local_sizes)):
-                    if _unmatched_print_count >= _UNMATCHED_PRINT_LIMIT:
-                        break
-                    try:
-                        window = []
-                    except Exception:
-                        window = None
-                    print(f"Unmatched local frame (trailing): pos={rem_pos} size={local_sizes[rem_pos]} lookahead_window={window}")
-                    _unmatched_print_count += 1
+            if verbose and _unmatched_print_count < _UNMATCHED_PRINT_LIMIT:
+                remaining = n_local - i
+                print(f"Unmatched trailing local frames: count={remaining} starting_pos={i}")
+                _unmatched_print_count += 1
             break
-        ps = part_sizes[j]
-        # allow participant frames to be up to 4 bytes larger than expected (but not smaller)
-        if (ps >= ls and ps <= ls + 4):
+
+        # First frames: require three consecutive frames (when available) to match using a
+        # strict rule: participant size must be either equal to local size or exactly one byte larger
+        # (ps == ls or ps == ls + 1). Participant frames smaller than local must NOT match.
+        if not first_matched:
+            matched = False
+            # determine how many consecutive local frames we can try to match (max 3)
+            remaining_local = n_local - i
+            need_n = min(3, remaining_local)
+            # compute max participant index to consider such that k + (need_n-1) is valid
+            max_k = min(j + INITIAL_LOOKAHEAD, len(part_sizes) - need_n)
+            candidates = []
+            for k in range(j, max_k + 1):
+                ok = True
+                for offset in range(need_n):
+                    ps = part_sizes[k + offset]
+                    ls_n = local_sizes[i + offset]
+                    # accept only ps == ls or ps == ls + 1
+                    if not (ps == ls_n or ps == ls_n + 1):
+                        ok = False
+                        break
+                if ok:
+                    candidates.append(k)
+
+            if candidates:
+                k = candidates[0]
+                delivered += need_n
+                j = k + need_n
+                i += need_n
+                first_matched = True
+                continue
+            else:
+                if verbose and _unmatched_print_count < _UNMATCHED_PRINT_LIMIT:
+                    print(f"Could not find initial {need_n}-frame alignment within lookahead starting at local_pos={i}")
+                    _unmatched_print_count += 1
+                i += 1
+                continue
+
+        # Subsequent frames must match the next participant frame exactly.
+        try:
+            ps = part_sizes[j]
+        except Exception:
+            if verbose and _unmatched_print_count < _UNMATCHED_PRINT_LIMIT:
+                print(f"Unmatched local frame (no participant at idx): pos={i} size={ls} participant_idx={j}")
+                _unmatched_print_count += 1
+            break
+
+        # require tight match for sequential frames: participant size must be equal or one byte larger
+        if ps == ls or ps == ls + 1:
             delivered += 1
             j += 1
+            i += 1
             continue
-        matched = False
-        for k in range(j+1, min(j+1+lookahead, len(part_sizes))):
-            ps2 = part_sizes[k]
-            if (ps2 >= ls and ps2 <= ls + 4):
-                delivered += 1
-                j = k + 1
-                matched = True
-                break
-        if not matched:
-            # Debug: report unmatched local frame (index and size) and the current participant lookahead window
-            if verbose:
-                if _unmatched_print_count < _UNMATCHED_PRINT_LIMIT:
-                    try:
-                        window = part_sizes[j:j+lookahead+1]
-                    except Exception:
-                        window = None
-                    print(f"Unmatched local frame: pos={i} size={ls} lookahead_window={window}")
+
+        # If current participant frame doesn't match, try the next participant frame (one-frame lookahead)
+        # This handles cases where a partial/short frame was logged before the full frame.
+        if (j + 1) < len(part_sizes):
+            ps_next = part_sizes[j + 1]
+            if ps_next == ls or ps_next == ls + 1:
+                # Skip the current participant entry and align to the next one
+                if verbose and _unmatched_print_count < _UNMATCHED_PRINT_LIMIT:
+                    print(f"Skipping participant frame idx={j} size={ps} and matching local pos={i} to participant idx={j+1} size={ps_next}")
                     _unmatched_print_count += 1
+                delivered += 1
+                j += 2
+                i += 1
+                continue
+
+        # No match found in current or next participant frame -> unmatched local frame
+        if verbose and _unmatched_print_count < _UNMATCHED_PRINT_LIMIT:
+            print(f"Unmatched sequential local frame: pos={i} size={ls} expected_part_size={ps} participant_idx={j}")
+            _unmatched_print_count += 1
+        # local frame considered missing; advance local index only
+        i += 1
+        continue
+
     return delivered
 
 
@@ -255,7 +308,6 @@ def detect_missing_frames(local_by_cname, participant_by_cname, start_ts=None, e
         local_sizes, size_col = extract_numeric_list(local_df, ['Size(Bytes)', 'Size'], dtype=int)
         # If no sizes, skip
         if not local_sizes:
-            print(f"Warning: Could not find size column in  results for cname: {cname}")
             continue
 
         if cname not in participant_by_cname:
@@ -266,9 +318,8 @@ def detect_missing_frames(local_by_cname, participant_by_cname, start_ts=None, e
             # find size column in participant csv results
             part_sizes, part_size_col = extract_numeric_list(p_df, ['Size(Bytes)', 'Size'], dtype=int)
 
-            # If no sizes, skip
+            # If no sizes
             if not part_sizes:
-                print(f"Warning: Could not find size column in participant results for cname: {cname}")
                 continue
 
             # Run matcher once (no intra/offset heuristics)
@@ -900,7 +951,7 @@ def accumulate_run_results(metrics, arch, participants, run_path,
         row = dict(m)
         sender_num = _extract_client_num_from_folder(m.get('local_folder'))
         receiver_num = _extract_client_num_from_folder(m.get('receiver_folder'))
-        row.update({'arch': arch, 'participants': n, 'run_path': run_path,
+        row.update({'arch': arch, 'participants': participants, 'run_path': run_path,
                     'sender_client_num': sender_num, 'receiver_client_num': receiver_num})
         missing_rows.append(row)
 

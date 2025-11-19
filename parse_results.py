@@ -783,6 +783,83 @@ def _extract_client_num_from_folder(folder_path):
         return None
 
 
+def _diagnostics_sort_key(r):
+    """Sort key for diagnostics rows.
+
+    Orders by architecture priority (P2P, SFU, Hybrid), numeric participants,
+    numeric run index (extracted from RunPath basename), and numeric client id.
+    """
+    arch = r.get('Architecture') or r.get('arch') or ''
+    arch_norm = str(arch).strip().lower()
+    arch_prio_map = {'p2p': 0, 'sfu': 1, 'hybrid': 2}
+    arch_idx = arch_prio_map.get(arch_norm, 99)
+
+    parts = r.get('Participants') if 'Participants' in r else r.get('participants')
+    try:
+        parts_i = int(parts) if parts is not None else 999999
+    except Exception:
+        parts_i = 999999
+
+    runp = r.get('RunPath') or r.get('run_path') or ''
+    run_base = os.path.basename(runp) if runp else ''
+    digits = ''.join([c for c in run_base if c.isdigit()])
+    try:
+        run_i = int(digits) if digits else (0 if run_base else 999999)
+    except Exception:
+        run_i = 999999
+
+    client = r.get('Client') if 'Client' in r else r.get('client')
+    try:
+        client_i = int(client) if client is not None else 999999
+    except Exception:
+        client_i = 999999
+
+    return (arch_idx, parts_i, run_i, client_i)
+
+
+def _client_crash_reason(run_path, client_num):
+    """Try to find a docker.log for the given client number and return a short
+    crash reason string if a crash / non-zero exit appears in the log.
+    Returns None if no evident crash is found.
+    """
+    try:
+        client_folders = sorted([p for p in glob.glob(os.path.join(run_path, 'uvgcomm-client*')) if os.path.isdir(p)])
+        for cf in client_folders:
+            num = _extract_client_num_from_folder(cf)
+            if num is None:
+                continue
+            if int(num) != int(client_num):
+                continue
+            log_path = os.path.join(cf, 'docker.log')
+            if not os.path.isfile(log_path):
+                continue
+            try:
+                with open(log_path, 'r', errors='ignore') as f:
+                    # read tail to keep memory use small for large logs
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    tail_size = min(32768, size)
+                    f.seek(max(0, size - tail_size))
+                    tail = f.read()
+            except Exception:
+                continue
+            tail_lc = tail.lower()
+            if 'segmentation fault' in tail_lc or 'core dumped' in tail_lc:
+                return 'segmentation fault'
+            # docker exit codes are often printed as 'exited with code <n>'
+            import re
+            m = re.search(r'exited with code\s*(\d+)', tail_lc)
+            if m:
+                code = int(m.group(1))
+                return f'exited code {code}'
+            # generic non-zero exit hints
+            if 'exited' in tail_lc and 'code' in tail_lc:
+                return 'exited'
+    except Exception:
+        pass
+    return None
+
+
 def write_diagnostics(presence_records, missing_records, analysis_folder):
     """Write a simple per-run diagnostics CSV with one row per run+client.
 
@@ -837,7 +914,18 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
             partners = sorted(missing_partners.get(key, []))
             partners_str = ','.join(str(int(p)) for p in partners) if partners else ''
             if localc == 0 and partc == 0:
-                status = 'broken'
+                # If both traces are missing, try to detect if the client container
+                # crashed (segfault / non-zero exit) and prefer a more informative
+                # status string for diagnostics.
+                crash = None
+                try:
+                    crash = _client_crash_reason(runp, client)
+                except Exception:
+                    crash = None
+                if crash:
+                    status = f'crashed ({crash})'
+                else:
+                    status = 'broken'
             elif frames_lost > 0:
                 status = 'missing frames'
             else:
@@ -864,6 +952,10 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
             rows.append({'Architecture': None, 'Participants': None, 'RunPath': None,
                          'Client': None, 'Local results': 0, 'Participant results': 0,
                          'Frames Lost': 0, 'Analyzed Frames': 0, 'Missing Participants': '', 'Status': 'OK'})
+
+    # Notify user that sorting is starting, then sort rows using a module-level helper.
+    print(f"Sorting diagnostics {len(rows)} rows...")
+    rows = sorted(rows, key=_diagnostics_sort_key)
 
     diag_df = pd.DataFrame(rows, columns=['Architecture', 'Participants', 'RunPath', 'Client',
                                          'Local results', 'Participant results', 'Analyzed Frames',

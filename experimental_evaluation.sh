@@ -33,6 +33,11 @@ RUN_FOLDER="./results/$RUN_ID"
 # Where to write the generated usernames list. 
 USERS_FILE="./configs/usernames.conf"
 
+# Host directory where core dumps will be stored. This can be overridden
+# by exporting CORE_DIR_HOST before running the script. Default is
+# /tmp/docker_cores which the user already created in the host.
+CORE_DIR_HOST=${CORE_DIR_HOST:-/tmp/docker_cores}
+
 # Default experiment parameters (can be overridden with env vars or CLI)
 # RUN_COUNT: how many times to repeat each scenario
 # CLIENTS_LIST: comma- or space-separated list of client counts to test
@@ -52,6 +57,13 @@ VISIBLE_PARTICIPANTS=${VISIBLE_PARTICIPANTS:-9}
 WAIT_AFTER_INVITE=10
 WAIT_AFTER_SETTINGS=5
 
+# Experiment length in seconds (default 60). Can be overridden with -e on CLI
+EXPERIMENT_TIME=${EXPERIMENT_TIME:-60}
+
+# Global warmup/cooldown times (seconds). Can be overridden via env vars.
+WARMUP_TIME=${WARMUP_TIME:-10}
+COOLDOWN_TIME=${COOLDOWN_TIME:-15}
+
 # ----------------------- functions ------------------------
 
 usage() {
@@ -64,18 +76,20 @@ Options:
     -a ARCHS       Comma separated architectures or "all" to include defaults (P2P_Mesh,SFU,Hybrid). Defaults to ${ARCHS}
     -s SCENARIOS   Comma separated scenarios to run, or "all" to include defaults (720p,4K,speaker,1080p,simlat,low_send_bw). Defaults to ${SCENARIOS}
     -v VISIBLE     Number of visible participants in gallery view (default: ${VISIBLE_PARTICIPANTS}).
+    -e SECONDS     Experiment duration in seconds (default: ${EXPERIMENT_TIME}).
     -h             Show this help
 EOF
 }
 
 parse_args() {
-    while getopts ":r:c:a:s:v:h" opt; do
+    while getopts ":r:c:a:s:v:e:h" opt; do
         case ${opt} in
             r ) RUN_COUNT="$OPTARG" ;;
             c ) CLIENTS_LIST="$OPTARG" ;;
             a ) ARCHS="$OPTARG" ;;
             s ) SCENARIOS="$OPTARG" ;;
             v ) VISIBLE_PARTICIPANTS="$OPTARG" ;;
+            e ) EXPERIMENT_TIME="$OPTARG" ;;
             h ) usage; exit 0 ;;
             \? ) echo "Invalid Option: -$OPTARG" 1>&2; usage; exit 1 ;;
             : ) echo "Invalid Option: -$OPTARG requires an argument" 1>&2; usage; exit 1 ;;
@@ -127,6 +141,9 @@ validate_params() {
     # visible participants must be positive integer
     local visible_re='^[0-9]+$'
 
+    # experiment time must be a positive integer (seconds)
+    local exp_re='^[0-9]+$'
+
     if ! [[ "$ARCHS" =~ $arch_re ]]; then
         echo "ERROR: Unknown architecture '$ARCHS' (allowed: P2P_Mesh,SFU,Hybrid)" >&2; exit 1
     fi
@@ -141,6 +158,10 @@ validate_params() {
 
     if ! [[ "$VISIBLE_PARTICIPANTS" =~ $visible_re ]]; then
         echo "ERROR: Invalid visible participants value '$VISIBLE_PARTICIPANTS' (must be a positive integer)" >&2; exit 1
+    fi
+
+    if ! [[ "$EXPERIMENT_TIME" =~ $exp_re ]]; then
+        echo "ERROR: Invalid experiment time '$EXPERIMENT_TIME' (must be a positive integer seconds)" >&2; exit 1
     fi
 
     # Populate arrays for later iteration (safe now that inputs are validated)
@@ -363,6 +384,9 @@ create_clients() {
             -v "${input_file}:${CONTAINER_INPUT_FILE}:ro" \
             -v "${config_file}:${CONTAINER_CONFIG_FILE}" \
             -v "${client_output}:${CONTAINER_STATS_FOLDER}" \
+            -v "${CORE_DIR_HOST}:/cores" \
+            --ulimit core=-1 \
+            -e CORE_DUMP_DIR=/cores \
             ${DOCKER_IMAGE}:latest \
             --stats=${CONTAINER_STATS_FOLDER} \
             --siplog=${CONTAINER_STATS_FOLDER}/siplog.txt
@@ -482,6 +506,9 @@ create_host() {
     docker run -d --name "$HOST_NAME" --network "$NETWORK_NAME" --ip 172.28.0.2 \
         -v "${CONFIG_FOLDER}/uvgComm_host.ini:${CONTAINER_CONFIG_FILE}" \
         -v "${script_file}:${CONTAINER_HOST_SCRIPT_FILE}" \
+        -v "${CORE_DIR_HOST}:/cores" \
+        --ulimit core=-1 \
+        -e CORE_DUMP_DIR=/cores \
         "${DOCKER_IMAGE}:latest" --script "$CONTAINER_HOST_SCRIPT_FILE"
 }
 
@@ -686,9 +713,9 @@ run_scenario() {
         # setup time scales with number of clients and configured waits (in seconds)
         # Each client: WAIT_AFTER_INVITE seconds after call, plus one initial settings wait
         local setup_time_ms=$(( CLIENTS * WAIT_AFTER_INVITE * 1000 + WAIT_AFTER_SETTINGS * 1000 ))
-        local warmup_time_ms=10000                      # 10 seconds
-        local experiment_time_ms=60000                  # 1 minute
-        local cooldown_time_ms=15000                    # 10 seconds
+        local warmup_time_ms=$(( WARMUP_TIME * 1000 ))
+        local experiment_time_ms=$(( EXPERIMENT_TIME * 1000 ))
+        local cooldown_time_ms=$(( COOLDOWN_TIME * 1000 ))
 
         local experiment_start_ms=$((current_time_ms + setup_time_ms + warmup_time_ms))
         local experiment_end_ms=$((experiment_start_ms + experiment_time_ms))
@@ -767,14 +794,44 @@ CLIENTS_LIST=$(echo "$CLIENTS_LIST" | tr ' ' ',')
 # populate ARCHS_ARRAY, SCENARIOS_ARRAY and CLIENTS_ARRAY on success.
 validate_params
 
-prepare_tests # prepares test files and creates network
-
 # Print the selected docker image (one-line): Repository:Tag ID CreatedAt (first match)
 echo "Docker image: $(docker images --format '{{.Repository}}:{{.Tag}} {{.ID}} {{.CreatedAt}}' 2>/dev/null | grep -E "^${DOCKER_IMAGE}:" | head -n1 || echo "${DOCKER_IMAGE}: not found")"
 
 echo "Running with RUN_COUNT=${RUN_COUNT}, CLIENTS=${CLIENTS_LIST}, ARCHS=${ARCHS}, SCENARIOS=${SCENARIOS}"
 
-# (arrays normalized and validated earlier)
+total_ms=0
+num_scenarios=${#SCENARIOS_ARRAY[@]}
+num_arch=${#ARCHS_ARRAY[@]}
+
+for clients in ${CLIENTS_LIST//,/ } ; do
+    per_run_ms=$(( clients * WAIT_AFTER_INVITE * 1000 + WAIT_AFTER_SETTINGS * 1000 + WARMUP_TIME * 1000 + EXPERIMENT_TIME * 1000 + COOLDOWN_TIME * 1000 ))
+    total_ms=$(( total_ms + per_run_ms * RUN_COUNT * num_scenarios * num_arch ))
+done
+
+total_seconds=$(( total_ms / 1000 ))
+hours=$(( total_seconds / 3600 ))
+minutes=$(( (total_seconds % 3600) / 60 ))
+seconds=$(( total_seconds % 60 ))
+printf -v total_hms "%d hours %d minutes %d seconds" "$hours" "$minutes" "$seconds"
+echo "Estimated total run time (at least): ${total_hms}"
+
+# Ask for confirmation before preparing tests so the user can abort after
+# seeing parameters and estimated runtime. If no TTY is available, proceed.
+if [ -t 0 ]; then
+    while true; do
+        read -r -p "Proceed with the evaluation? (y/n): " yn
+        case "$yn" in
+            [Yy]* ) break ;;
+            [Nn]* ) echo "Aborted by user."; exit 0 ;;
+            * ) echo "Please answer y or n." ;;
+        esac
+    done
+else
+    echo "No TTY detected; proceeding without interactive confirmation."
+fi
+
+prepare_tests # prepares test files and creates network
+ulimit -c unlimited # in case experiment crashes
 
 # Iterate scenarios, client counts and architectures
 for scenario in "${SCENARIOS_ARRAY[@]}"; do

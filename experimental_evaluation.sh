@@ -54,8 +54,8 @@ VISIBLE_PARTICIPANTS=${VISIBLE_PARTICIPANTS:-9}
 # Per-benchmark wait values (seconds). Edit these two values to tune timing.
 # - WAIT_AFTER_INVITE: seconds to wait after each client is called
 # - WAIT_AFTER_SETTINGS: seconds to wait after initial settings before calling clients
-WAIT_AFTER_INVITE=10
-WAIT_AFTER_SETTINGS=5
+WAIT_AFTER_INVITE=15
+WAIT_AFTER_SETTINGS=10
 
 # Experiment length in seconds (default 60). Can be overridden with -e on CLI
 EXPERIMENT_TIME=${EXPERIMENT_TIME:-60}
@@ -387,6 +387,7 @@ create_clients() {
             -v "${CORE_DIR_HOST}:/cores" \
             --ulimit core=-1 \
             -e CORE_DUMP_DIR=/cores \
+            -e KV_HEADLESS_FORCE_OFFSCREEN=1 \
             ${DOCKER_IMAGE}:latest \
             --stats=${CONTAINER_STATS_FOLDER} \
             --siplog=${CONTAINER_STATS_FOLDER}/siplog.txt

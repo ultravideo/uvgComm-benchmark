@@ -455,6 +455,10 @@ def analyze_run(run_path):
     widths = []
     heights = []
     encode_times = []
+    # per-client max encode time (ms)
+    max_encode_by_client = {}
+    # per-client max decode time (ms)
+    max_decode_by_client = {}
     out_total_bytes = 0
     out_min_ts = None
     out_max_ts = None
@@ -484,6 +488,18 @@ def analyze_run(run_path):
         encvals, _ = extract_numeric_list(df, ['EncodeTime(ms)', 'EncodeTime', 'EncodeTimeMs', 'EncodeTime (ms)'], dtype=float)
         if encvals:
             encode_times.extend(encvals)
+            # record per-client max encode time
+            try:
+                cfolder = info.get('client_folder')
+                cnum = _extract_client_num_from_folder(cfolder)
+                if cnum is None:
+                    # fallback: use folder basename index
+                    cnum = None
+                cur = max(encvals) if encvals else None
+                if cur is not None:
+                    max_encode_by_client[cnum] = max(cur, float(max_encode_by_client.get(cnum, float('-inf')))) if cnum in max_encode_by_client else cur
+            except Exception:
+                pass
     metrics['avg_frame_size'] = float(np.mean(sizes)) if sizes else None
     metrics['avg_width'] = float(np.mean(widths)) if widths else None
     metrics['avg_height'] = float(np.mean(heights)) if heights else None
@@ -508,6 +524,17 @@ def analyze_run(run_path):
             dvals, _ = extract_numeric_list(df, ['DecodeTime(ms)', 'DecodeTime', 'DecodeTimeMs'], dtype=float)
             if dvals:
                 decode_times.extend(dvals)
+                # record per-client max decode time
+                try:
+                    cfolder = info.get('client_folder')
+                    cnum = _extract_client_num_from_folder(cfolder)
+                    if cnum is None:
+                        cnum = None
+                    curd = max(dvals) if dvals else None
+                    if curd is not None:
+                        max_decode_by_client[cnum] = max(curd, float(max_decode_by_client.get(cnum, float('-inf')))) if cnum in max_decode_by_client else curd
+                except Exception:
+                    pass
 
             pvals, _ = extract_numeric_list(df, ['Size(Bytes)', 'Size'], dtype=int)
             if pvals:
@@ -552,6 +579,9 @@ def analyze_run(run_path):
     metrics['avg_latency_ms'] = float(np.mean(latencies)) if latencies else None
     metrics['avg_decode_ms'] = float(np.mean(decode_times)) if decode_times else None
     metrics['avg_part_frame_size'] = float(np.mean(participant_sizes)) if participant_sizes else None
+    # attach per-client maxima for encode/decode (keys may be None if folder name lacks digits)
+    metrics['max_encode_by_client'] = max_encode_by_client
+    metrics['max_decode_by_client'] = max_decode_by_client
 
     # Missing frame detection delegated to helper function for clarity
     # Pass the metadata start/end timestamps so matching only considers local
@@ -937,6 +967,7 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
                          'Client': client, 'Local results': localc, 'Participant results': partc,
                          'Frames Lost': frames_lost, 'Analyzed Frames': analyzed,
                          'Missing Participants': partners_str,
+                         'Max Encode (ms)': p.get('max_encode_ms'), 'Max Decode (ms)': p.get('max_decode_ms'),
                          'Status': status})
     else:
         # No presence records: still write a row per missing record (or one OK row)
@@ -950,11 +981,13 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
                              'Frames Lost': frames_lost,
                              'Analyzed Frames': int(val.get('analyzed_frames', 0)),
                              'Missing Participants': partners_str,
+                             'Max Encode (ms)': None, 'Max Decode (ms)': None,
                              'Status': ('missing frames' if frames_lost > 0 else 'OK')})
         else:
             rows.append({'Architecture': None, 'Participants': None, 'RunPath': None,
                          'Client': None, 'Local results': 0, 'Participant results': 0,
-                         'Frames Lost': 0, 'Analyzed Frames': 0, 'Missing Participants': '', 'Status': 'OK'})
+                         'Frames Lost': 0, 'Analyzed Frames': 0, 'Missing Participants': '',
+                         'Max Encode (ms)': None, 'Max Decode (ms)': None, 'Status': 'OK'})
 
     # Notify user that sorting is starting, then sort rows using a module-level helper.
     print(f"Sorting diagnostics {len(rows)} rows...")
@@ -962,7 +995,7 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
 
     diag_df = pd.DataFrame(rows, columns=['Architecture', 'Participants', 'RunPath', 'Client',
                                          'Local results', 'Participant results', 'Analyzed Frames',
-                                         'Frames Lost', 'Missing Participants', 'Status'])
+                                         'Frames Lost', 'Missing Participants', 'Max Encode (ms)', 'Max Decode (ms)', 'Status'])
     diag_csv = os.path.join(analysis_folder, 'diagnostics_summary.csv')
     diag_df.to_csv(diag_csv, index=False, sep=';')
     print('Wrote diagnostics summary to', diag_csv)
@@ -1027,7 +1060,8 @@ def collect_presence_records_for_run(run_path, arch, participants):
 
 
 def accumulate_run_results(metrics, arch, participants, run_path,
-                           cpu_results, psnr_stats, missing_rows, resolution_rows, latency_rows, measured_rows):
+                           cpu_results, psnr_stats, missing_rows, resolution_rows, latency_rows, measured_rows,
+                           client_max_rows):
     """Accumulate per-run metrics into the provided containers (mutates lists/dicts).
 
     Mirrors the original inlined logic.
@@ -1072,6 +1106,17 @@ def accumulate_run_results(metrics, arch, participants, run_path,
                          'avg_latency_ms': metrics.get('avg_latency_ms'),
                          'avg_encode_ms': metrics.get('avg_encode_ms'),
                          'avg_decode_ms': metrics.get('avg_decode_ms')})
+    # collect per-client max encode/decode reported by analyze_run (may use None keys)
+    try:
+        me = metrics.get('max_encode_by_client', {}) or {}
+        md = metrics.get('max_decode_by_client', {}) or {}
+        # union of client keys
+        keys = set(list(me.keys()) + list(md.keys()))
+        for k in keys:
+            client_max_rows.append({'arch': arch, 'participants': participants, 'run_path': run_path,
+                                     'client_num': k, 'max_encode_ms': me.get(k), 'max_decode_ms': md.get(k)})
+    except Exception:
+        pass
 
 
 def build_psnr_dfs(psnr_stats):
@@ -1410,7 +1455,8 @@ def process_group(participants, entries):
                  'avg_width', 'avg_height', 'avg_encode_ms', 'outgoing_bps', 'incoming_bps',
                  'avg_latency_ms', 'avg_decode_ms', 'avg_part_frame_size', 'missing_summary',
                  'measured_outgoing_bps_per_client', 'measured_incoming_bps_per_client',
-                 'measured_host_outgoing_bps', 'measured_host_incoming_bps']
+                 'measured_host_outgoing_bps', 'measured_host_incoming_bps',
+                 'max_encode_by_client', 'max_decode_by_client']
     for arch, run_path in entries:
         try:
             metrics = analyze_run(run_path)
@@ -1441,6 +1487,7 @@ def process_scenario(ROOT_FOLDER, scenario):
     resolution_rows = []
     measured_rows = []
     latency_rows = []
+    client_max_rows = []
     presence_records = []
 
     # Build list of runs and collect presence records first (cheap). Parallelize collection
@@ -1495,10 +1542,33 @@ def process_scenario(ROOT_FOLDER, scenario):
                     if metrics is None:
                         continue
                     accumulate_run_results(metrics, arch, participants, run_path,
-                                           cpu_results, psnr_stats, missing_rows, resolution_rows, latency_rows, measured_rows)
+                                           cpu_results, psnr_stats, missing_rows, resolution_rows, latency_rows, measured_rows,
+                                           client_max_rows)
 
     # Prepare PSNR mean/std and write diagnostics
     psnr_mean, psnr_std = build_psnr_dfs(psnr_stats)
+    # Merge per-client max encode/decode info collected during accumulation into presence records
+    try:
+        for cm in client_max_rows:
+            # find matching presence record
+            matched = None
+            for p in presence_records:
+                if p.get('arch') == cm.get('arch') and p.get('run_path') == cm.get('run_path') and (p.get('client_num') == cm.get('client_num')):
+                    matched = p
+                    break
+            if matched is not None:
+                matched['max_encode_ms'] = cm.get('max_encode_ms')
+                matched['max_decode_ms'] = cm.get('max_decode_ms')
+            else:
+                # append a minimal presence record if none exists
+                presence_records.append({'arch': cm.get('arch'), 'participants': cm.get('participants'),
+                                         'client_num': cm.get('client_num'), 'local_present': False, 'part_present': False,
+                                         'local_valid': False, 'part_valid': False, 'local_count': 0, 'part_count': 0,
+                                         'code': 'M', 'run_path': cm.get('run_path'),
+                                         'max_encode_ms': cm.get('max_encode_ms'), 'max_decode_ms': cm.get('max_decode_ms')})
+    except Exception:
+        pass
+
     try:
         write_diagnostics(presence_records=presence_records, missing_records=missing_rows, analysis_folder=ANALYSIS_FOLDER)
     except Exception as e:

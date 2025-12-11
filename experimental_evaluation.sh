@@ -362,6 +362,15 @@ generate_client_configs() {
             echo "ERROR: '${template}' (copied to ${out}) does not contain the key 'visibleParticipants'. Exiting." >&2
             exit 1
         fi
+
+        # media IP
+        client_ip="172.28.0.$((2 + i))"
+
+        if grep -qE '^\[sip\]' "${out}"; then
+            sed -i "/^\[sip\]/a localAddress=${client_ip}" "${out}"
+        else
+            printf "\n[sip]\nlocalAddress=%s\n" "${client_ip}" >> "${out}"
+        fi
     done
 
     echo "Generated per-client configs up to ${MAX_CLIENTS} in ${CONFIG_FOLDER}"

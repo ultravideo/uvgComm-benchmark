@@ -191,7 +191,8 @@ def _match_with_offset(local_sizes, part_sizes, lookahead, verbose=False):
     n_part = len(part_sizes)
 
     # One-time initial lookahead (in frames) used only to align the first local frames
-    INITIAL_LOOKAHEAD = 100
+    # double the previous lookahead as requested
+    INITIAL_LOOKAHEAD = 200
 
     # --- Phase 1: initial alignment search
     # Try to find a starting participant index `k` such that we can match
@@ -200,6 +201,8 @@ def _match_with_offset(local_sizes, part_sizes, lookahead, verbose=False):
     need_n = min(3, n_local)
     max_k = min(0 + INITIAL_LOOKAHEAD, n_part - 1)
     found_k = None
+    # capture participant index after consuming initial consecutive matches
+    found_p_idx = None
     # allow up to this many skipped participant entries between matched local frames
     MAX_PART_SKIP = 2
     for k in range(0, max_k + 1):
@@ -224,6 +227,9 @@ def _match_with_offset(local_sizes, part_sizes, lookahead, verbose=False):
                 break
         if ok:
             found_k = k
+            # p_idx has been advanced while matching the initial consecutive frames;
+            # keep it so sequential phase resumes from the correct participant index
+            found_p_idx = p_idx
             break
 
     if found_k is None:
@@ -235,7 +241,11 @@ def _match_with_offset(local_sizes, part_sizes, lookahead, verbose=False):
     # consume the initial matched run and enter sequential phase
     delivered += need_n
     i = need_n
-    j = found_k + need_n
+    # start sequential participant index at the advanced participant position
+    if found_p_idx is not None:
+        j = found_p_idx
+    else:
+        j = found_k + need_n
 
     # --- Phase 2: sequential per-frame matching
     while i < n_local:
@@ -318,6 +328,16 @@ def detect_missing_frames(local_by_cname, participant_by_cname, start_ts=None, e
             continue
         for pinfo in participant_by_cname[cname]:
             p_df = pinfo['df']
+            # Ensure participant traces are trimmed at the run start timestamp
+            if start_ts is not None and p_df is not None:
+                try:
+                    tscol = find_timestamp_column(p_df)
+                    if tscol is not None:
+                        df_ts = pd.to_numeric(p_df[tscol], errors='coerce')
+                        p_df = p_df[df_ts >= start_ts]
+                except Exception:
+                    # keep original p_df on any failure
+                    pass
             # find size column in participant csv results
             part_sizes, part_size_col = extract_numeric_list(p_df, ['Size(Bytes)', 'Size'], dtype=int)
 

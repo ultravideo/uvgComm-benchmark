@@ -265,7 +265,6 @@ def _match_with_offset(local_sizes, part_sizes, lookahead, verbose=False):
             i += 1
             j += 1
             continue
-
         # participant lookahead: check the next 1..2 participant entries
         lookahead_matched = False
         for k in (1, 2):
@@ -280,6 +279,7 @@ def _match_with_offset(local_sizes, part_sizes, lookahead, verbose=False):
                     j += (k + 1)
                     lookahead_matched = True
                     break
+
         if lookahead_matched:
             continue
 
@@ -983,10 +983,14 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
                 status = 'missing frames'
             else:
                 status = 'OK'
-            rows.append({'Architecture': arch, 'Participants': parts, 'RunPath': runp,
-                         'Client': client, 'Local results': localc, 'Participant results': partc,
-                         'Frames Lost': frames_lost, 'Analyzed Frames': analyzed,
-                         'Missing Participants': partners_str,
+            # run number extraction from RunPath basename (digits if present)
+            run_base = os.path.basename(runp) if runp else ''
+            run_digits = ''.join([c for c in run_base if c.isdigit()])
+            run_number = int(run_digits) if run_digits else None
+            local_yesno = 'yes' if localc else 'no'
+            rows.append({'RunPath': runp, 'Architecture': arch, 'Participants': parts, 'Run': run_number,
+                         'Client': client, 'Local results': local_yesno, 'Participant results': partc,
+                         'Analyzed Frames': analyzed, 'Frames Lost': frames_lost, 'Missing Participants': partners_str,
                          'Max Encode (ms)': p.get('max_encode_ms'), 'Max Decode (ms)': p.get('max_decode_ms'),
                          'Status': status})
     else:
@@ -996,26 +1000,30 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
                 frames_lost = val.get('missing', 0)
                 partners = sorted(missing_partners.get((arch, parts, runp, client), []))
                 partners_str = ','.join(str(int(p)) for p in partners) if partners else ''
-                rows.append({'Architecture': arch, 'Participants': parts, 'RunPath': runp,
-                             'Client': client, 'Local results': 0, 'Participant results': 0,
-                             'Frames Lost': frames_lost,
+                # run number extraction from RunPath basename (digits if present)
+                run_base = os.path.basename(runp) if runp else ''
+                run_digits = ''.join([c for c in run_base if c.isdigit()])
+                run_number = int(run_digits) if run_digits else None
+                rows.append({'RunPath': runp, 'Architecture': arch, 'Participants': parts, 'Run': run_number,
+                             'Client': client, 'Local results': 'no', 'Participant results': 0,
                              'Analyzed Frames': int(val.get('analyzed_frames', 0)),
-                             'Missing Participants': partners_str,
+                             'Frames Lost': frames_lost, 'Missing Participants': partners_str,
                              'Max Encode (ms)': None, 'Max Decode (ms)': None,
                              'Status': ('missing frames' if frames_lost > 0 else 'OK')})
         else:
-            rows.append({'Architecture': None, 'Participants': None, 'RunPath': None,
+            rows.append({'RunPath': None, 'Architecture': None, 'Participants': None, 'Run': None,
                          'Client': None, 'Local results': 0, 'Participant results': 0,
-                         'Frames Lost': 0, 'Analyzed Frames': 0, 'Missing Participants': '',
+                         'Analyzed Frames': 0, 'Frames Lost': 0, 'Missing Participants': '', 
                          'Max Encode (ms)': None, 'Max Decode (ms)': None, 'Status': 'OK'})
 
     # Notify user that sorting is starting, then sort rows using a module-level helper.
     print(f"Sorting diagnostics {len(rows)} rows...")
     rows = sorted(rows, key=_diagnostics_sort_key)
 
-    diag_df = pd.DataFrame(rows, columns=['Architecture', 'Participants', 'RunPath', 'Client',
-                                         'Local results', 'Participant results', 'Analyzed Frames',
-                                         'Frames Lost', 'Missing Participants', 'Max Encode (ms)', 'Max Decode (ms)', 'Status'])
+    cols = ['RunPath', 'Architecture', 'Participants', 'Run', 'Client',
+            'Local results', 'Participant results', 'Analyzed Frames', 'Frames Lost', 'Missing Participants',
+             'Max Encode (ms)', 'Max Decode (ms)', 'Status']
+    diag_df = pd.DataFrame(rows, columns=cols)
     diag_csv = os.path.join(analysis_folder, 'diagnostics_summary.csv')
     diag_df.to_csv(diag_csv, index=False, sep=';')
     print('Wrote diagnostics summary to', diag_csv)

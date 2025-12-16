@@ -914,10 +914,10 @@ def _client_crash_reason(run_path, client_num):
 
 
 def write_diagnostics(presence_records, missing_records, analysis_folder):
-    """Write a simple per-run diagnostics CSV with one row per run+client.
+    """Write per-run diagnostics CSVs with one row per run+client.
 
-    Columns (in order):
-      Architecture, Participants, RunPath, Client, LocalCSVCount, ParticipantCSVCount, FramesLost, Status
+    Writes one CSV per architecture under `analysis_folder` and omits the
+    Architecture column from those outputs.
 
     Status is one of: OK, missing frames, broken
     """
@@ -1022,11 +1022,21 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
 
     cols = ['RunPath', 'Architecture', 'Participants', 'Run', 'Client',
             'Local results', 'Participant results', 'Analyzed Frames', 'Frames Lost', 'Missing Participants',
-             'Max Encode (ms)', 'Max Decode (ms)', 'Status']
+            'Max Encode (ms)', 'Max Decode (ms)', 'Status']
     diag_df = pd.DataFrame(rows, columns=cols)
-    diag_csv = os.path.join(analysis_folder, 'diagnostics_summary.csv')
-    diag_df.to_csv(diag_csv, index=False, sep=';')
-    print('Wrote diagnostics summary to', diag_csv)
+
+    # Split into one CSV per architecture and drop the Architecture column.
+    if diag_df.empty:
+        return
+
+    diag_df['Architecture'] = diag_df['Architecture'].fillna('unknown')
+    for arch, g in diag_df.groupby('Architecture', dropna=False):
+        out_cols = [c for c in cols if c != 'Architecture']
+        out_df = g[out_cols].copy()
+        out_df = out_df.sort_values(by=['Participants', 'Run', 'Client'], kind='mergesort')
+        diag_csv = os.path.join(analysis_folder, f'diagnostics_summary_{arch}.csv')
+        out_df.to_csv(diag_csv, index=False, sep=';')
+        print('Wrote diagnostics summary to', diag_csv)
 
 
 def setup_analysis_folders(ROOT_FOLDER, scenario):

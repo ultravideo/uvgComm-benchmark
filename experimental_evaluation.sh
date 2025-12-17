@@ -371,6 +371,20 @@ generate_client_configs() {
         else
             printf "\n[sip]\nlocalAddress=%s\n" "${client_ip}" >> "${out}"
         fi
+
+        # Set upload bandwidth to i * 5 Mbps (5, 10, 15, ...)
+        local upload_bps=$(( i * 5000000 ))
+        if grep -qE '^upBandwidth=' "${out}"; then
+            sed -i "s/^upBandwidth=.*/upBandwidth=${upload_bps}/" "${out}"
+        else
+            if grep -qE '^\[sip\]' "${out}"; then
+                sed -i "/^\[sip\]/a upBandwidth=${upload_bps}" "${out}"
+            else
+                printf "\n[sip]\nupBandwidth=%s\n" "${upload_bps}" >> "${out}"
+            fi
+        fi
+
+        echo "Assigned upBandwidth=${upload_bps} to ${out}"
     done
 
     echo "Generated per-client configs up to ${MAX_CLIENTS} in ${CONFIG_FOLDER}"

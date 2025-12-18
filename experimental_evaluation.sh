@@ -45,11 +45,14 @@ CORE_DIR_HOST=${CORE_DIR_HOST:-/tmp/docker_cores}
 RUN_COUNT=${RUN_COUNT:-1}
 CLIENTS_LIST=${CLIENTS_LIST:-"2,3,4,5,6"}
 ARCHS=${ARCHS:-"P2P_Mesh,SFU,Hybrid"}
-SCENARIOS=${SCENARIOS:-"720p"}
+RESOLUTIONS=${RESOLUTIONS:-"1280x720"}
 
 # Number of visible participants shown in gallery view. Template contains value 9.
 # Can be overridden with -v on the CLI or via env var. Default is 9.
 VISIBLE_PARTICIPANTS=${VISIBLE_PARTICIPANTS:-9}
+
+# View mode selection: comma-separated or single value. Defaults to 'gallery'
+VIEW_MODE=${VIEW_MODE:-gallery}
 
 # Per-benchmark wait values (seconds). Edit these two values to tune timing.
 # - WAIT_AFTER_INVITE: seconds to wait after each client is called
@@ -64,32 +67,51 @@ EXPERIMENT_TIME=${EXPERIMENT_TIME:-60}
 WARMUP_TIME=${WARMUP_TIME:-10}
 COOLDOWN_TIME=${COOLDOWN_TIME:-15}
 
+# Latency simulation settings
+# `-l` accepts one or more of: none,local,global (comma-separated). Default: none
+LATENCY_MODES=${LATENCY_MODES:-none}
+
+# Send bandwidth mode (affects per-client `upBandwidth` in generated configs)
+# Allowed values:
+#  - all1000 : every client gets 1000 Mbps (default)
+#  - all1   : every client gets 1 Mbps
+#  - inc1   : each client gets i * 1 Mbps
+#  - inc5   : each client gets i * 5 Mbps
+#  - inc10  : each client gets i * 10 Mbps
+SEND_BW_MODE=${SEND_BW_MODE:-all1000}
+
 # ----------------------- functions ------------------------
 
 usage() {
         cat <<EOF
-Usage: $0 [-r RUNS] [-c CLIENTS] [-a ARCHS] [-s SCENARIOS] [-h]
+Usage: $0 [-r RUNS] [-c CLIENTS] [-a ARCHS] [-s RESOLUTIONS] [-w VIEW] [-h]
 
 Options:
     -r RUNS        Number of runs per scenario. Example: -r 3
     -c CLIENTS     Comma-separated client counts, e.g. "2,3,4". Defaults to ${CLIENTS_LIST}
     -a ARCHS       Comma separated architectures or "all" to include defaults (P2P_Mesh,SFU,Hybrid). Defaults to ${ARCHS}
-    -s SCENARIOS   Comma separated scenarios to run, or "all" to include defaults (720p,4K,speaker,1080p,simlat,low_send_bw). Defaults to ${SCENARIOS}
+    -s RESOLUTIONS  Comma separated resolutions to run, or "all" to include defaults (1280x720,3840x2160,1920x1080). Defaults to ${RESOLUTIONS}
+    -w VIEW        View mode to use (gallery|speaker) or comma-separated list. Defaults to ${VIEW_MODE}
     -v VISIBLE     Number of visible participants in gallery view (default: ${VISIBLE_PARTICIPANTS}).
-    -e SECONDS     Experiment duration in seconds (default: ${EXPERIMENT_TIME}).
+    -e SECONDS     Evaluation period in seconds (default: ${EXPERIMENT_TIME}).
+    -l             Enable simulated per-client latency (uses built-in defaults).
+    -b MODE        Send bandwidth mode (all1000|all1|inc1|inc5|inc10). Defaults to ${SEND_BW_MODE}
     -h             Show this help
 EOF
 }
 
 parse_args() {
-    while getopts ":r:c:a:s:v:e:h" opt; do
+    while getopts ":r:c:a:s:w:v:e:l:b:h" opt; do
         case ${opt} in
             r ) RUN_COUNT="$OPTARG" ;;
             c ) CLIENTS_LIST="$OPTARG" ;;
             a ) ARCHS="$OPTARG" ;;
-            s ) SCENARIOS="$OPTARG" ;;
+            s ) RESOLUTIONS="$OPTARG" ;;
+            w ) VIEW_MODE="$OPTARG" ;;
             v ) VISIBLE_PARTICIPANTS="$OPTARG" ;;
             e ) EXPERIMENT_TIME="$OPTARG" ;;
+            l ) LATENCY_MODES="$OPTARG" ;;
+            b ) SEND_BW_MODE="$OPTARG" ;;
             h ) usage; exit 0 ;;
             \? ) echo "Invalid Option: -$OPTARG" 1>&2; usage; exit 1 ;;
             : ) echo "Invalid Option: -$OPTARG requires an argument" 1>&2; usage; exit 1 ;;
@@ -104,9 +126,9 @@ parse_args() {
         ARCHS="P2P_Mesh,SFU,Hybrid"
     fi
 
-    # If user asked for 'all' scenarios, expand to defaults (include new scenarios)
-    if [ "$SCENARIOS" = "all" ]; then
-        SCENARIOS="720p,4K,speaker,1080p,simlat,low_send_bw"
+    # If user asked for 'all' resolutions, expand to defaults
+    if [ "$RESOLUTIONS" = "all" ]; then
+        RESOLUTIONS="1280x720,3840x2160,1920x1080"
     fi
 
     # Convert CLIENTS_LIST to array for iteration
@@ -135,7 +157,7 @@ validate_params() {
     # Strict validation on the raw, normalized strings. Use regex to ensure
     # every token is exactly one of the allowed canonical values.
     local arch_re='^(P2P_Mesh|SFU|Hybrid)(,(P2P_Mesh|SFU|Hybrid))*$'
-    local scen_re='^(720p|4K|speaker|1080p|simlat|low_send_bw)(,(720p|4K|speaker|1080p|simlat|low_send_bw))*$'
+    local res_re='^(1280x720|3840x2160|1920x1080)(,(1280x720|3840x2160|1920x1080))*$'
     local clients_re='^[0-9]+(,[0-9]+)*$'
 
     # visible participants must be positive integer
@@ -148,8 +170,26 @@ validate_params() {
         echo "ERROR: Unknown architecture '$ARCHS' (allowed: P2P_Mesh,SFU,Hybrid)" >&2; exit 1
     fi
 
-    if ! [[ "$SCENARIOS" =~ $scen_re ]]; then
-        echo "ERROR: Unknown scenario '$SCENARIOS' (allowed: 720p,4K,speaker,1080p,simlat,low_send_bw)" >&2; exit 1
+    if ! [[ "$RESOLUTIONS" =~ $res_re ]]; then
+        echo "ERROR: Unknown resolution '$RESOLUTIONS' (allowed: 1280x720,3840x2160,1920x1080)" >&2; exit 1
+    fi
+
+    # validate latency mode(s)
+    local lat_re='^(none|local|global)(,(none|local|global))*$'
+    if ! [[ "$LATENCY_MODES" =~ $lat_re ]]; then
+        echo "ERROR: Unknown latency mode '$LATENCY_MODES' (allowed: none,local,global or comma-separated list)" >&2; exit 1
+    fi
+
+    # validate view mode(s)
+    local view_re='^(gallery|speaker)(,(gallery|speaker))*$'
+    if ! [[ "$VIEW_MODE" =~ $view_re ]]; then
+        echo "ERROR: Unknown view mode '$VIEW_MODE' (allowed: gallery,speaker or comma-separated list)" >&2; exit 1
+    fi
+
+    # validate send bandwidth mode (single value only)
+    local bw_re='^(all1000|all1|inc1|inc5|inc10)$'
+    if ! [[ "$SEND_BW_MODE" =~ $bw_re ]]; then
+        echo "ERROR: Unknown send bandwidth mode '$SEND_BW_MODE' (allowed: all1000,all1,inc1,inc5,inc10)" >&2; exit 1
     fi
 
     if ! [[ "$CLIENTS_LIST" =~ $clients_re ]]; then
@@ -166,7 +206,8 @@ validate_params() {
 
     # Populate arrays for later iteration (safe now that inputs are validated)
     IFS=',' read -r -a ARCHS_ARRAY <<< "$ARCHS"
-    IFS=',' read -r -a SCENARIOS_ARRAY <<< "$SCENARIOS"
+    IFS=',' read -r -a RESOLUTIONS_ARRAY <<< "$RESOLUTIONS"
+    IFS=',' read -r -a VIEW_MODES_ARRAY <<< "$VIEW_MODE"
     IFS=',' read -r -a CLIENTS_ARRAY <<< "$CLIENTS_LIST"
 }
 
@@ -245,6 +286,15 @@ prepare_tests() {
     # Generate per-client configs from template. 
     generate_client_configs || true
 
+    # Generate latency files for requested modes (one-time per run folder)
+    IFS=',' read -r -a _modes <<< "${LATENCY_MODES}"
+    for _mode in "${_modes[@]}"; do
+        # only generate files for actual latency modes
+        if [ "${_mode}" != "none" ]; then
+            generate_latencies "$RUN_FOLDER" "$MAX_CLIENTS" "${_mode}" || true
+        fi
+    done
+
     echo "Preparation complete. Input files ready: $INPUT_FILE_720 and $INPUT_FILE_4K"
 }
 
@@ -289,8 +339,6 @@ write_metadata() {
     echo "Metadata written successfully."
 }
 
-
-
 generate_usernames() {
     # Generates the usernames.conf file dynamically so the user doesn't need to
     # maintain it manually. The format is:
@@ -314,7 +362,6 @@ generate_usernames() {
     echo "Generated ${users_file} with ${num_clients} clients"
 }
 
-
 generate_client_configs() {
     # Generate per-client configs from template configs/uvgComm_client.ini.
     # Idempotent: skip files that already exist.
@@ -328,10 +375,8 @@ generate_client_configs() {
 
     for i in $(seq 1 "${MAX_CLIENTS}"); do
         local out="${CONFIG_FOLDER}/uvgComm${i}.ini"
-        # Skip if already present
-        [ -f "${out}" ] && continue
 
-        # Copy template, then replace or append Username, ServerAddress and Name
+        # Always overwrite existing client config to reflect current settings
         cp "${template}" "${out}"
 
         # Replace Username=, ServerAddress=, Name= and visibleParticipants= if present, else error out.
@@ -372,8 +417,25 @@ generate_client_configs() {
             printf "\n[sip]\nlocalAddress=%s\n" "${client_ip}" >> "${out}"
         fi
 
-        # Set upload bandwidth to i * 5 Mbps (5, 10, 15, ...)
-        local upload_bps=$(( i * 5000000 ))
+        # Compute upload bandwidth according to selected SEND_BW_MODE
+        local upload_bps=0
+        case "${SEND_BW_MODE}" in
+            all1000)
+                upload_bps=$((1000 * 1000000))
+                ;;
+            inc1)
+                upload_bps=$(( i * 1000000 ))
+                ;;
+            inc5)
+                upload_bps=$(( i * 5000000 ))
+                ;;
+            inc10)
+                upload_bps=$(( i * 10000000 ))
+                ;;
+            *)
+                upload_bps=$(( i * 5000000 ))
+                ;;
+        esac
         if grep -qE '^upBandwidth=' "${out}"; then
             sed -i "s/^upBandwidth=.*/upBandwidth=${upload_bps}/" "${out}"
         else
@@ -390,11 +452,11 @@ generate_client_configs() {
     echo "Generated per-client configs up to ${MAX_CLIENTS} in ${CONFIG_FOLDER}"
 }
 
-
 create_clients() {
     local num_clients="$1"
     local input_file="$2"
     local output_folder="$3"
+    local LATENCY_MODE="${4:-}"
 
     for i in $(seq 1 "$num_clients"); do
         CONTAINER_NAME="${CLIENT_PREFIX}${i}"
@@ -404,6 +466,7 @@ create_clients() {
         mkdir -p "$client_output"
         echo "Starting client $i"
         docker run -d --name $CONTAINER_NAME --network $NETWORK_NAME --ip 172.28.0.$((2+i)) \
+            --cap-add=NET_ADMIN \
             -v "${input_file}:${CONTAINER_INPUT_FILE}:ro" \
             -v "${config_file}:${CONTAINER_CONFIG_FILE}" \
             -v "${client_output}:${CONTAINER_STATS_FOLDER}" \
@@ -414,9 +477,26 @@ create_clients() {
             ${DOCKER_IMAGE}:latest \
             --stats=${CONTAINER_STATS_FOLDER} \
             --siplog=${CONTAINER_STATS_FOLDER}/siplog.txt
+
+            # apply in-container latency if requested (LATENCY_MODE must be local/global)
+            if [ -n "${LATENCY_MODE}" ] && [ "${LATENCY_MODE}" != "none" ]; then
+            local lat_ms
+            local LATENCY_FILE="${RUN_FOLDER}/latencies_${LATENCY_MODE}.txt"
+            if [ -f "$LATENCY_FILE" ]; then
+                lat_ms=$(sed -n "$((i+1))p" "$LATENCY_FILE" 2>/dev/null || echo "")
+            else
+                lat_ms=""
+            fi
+            if [ -n "$lat_ms" ] && [ "$lat_ms" -gt 0 ] 2>/dev/null; then
+                # detect primary interface inside container
+                net_if=$(docker exec "$CONTAINER_NAME" sh -c 'ls /sys/class/net | grep -v lo | head -n1' 2>/dev/null || echo "")
+                if [ -n "$net_if" ]; then
+                    docker exec "$CONTAINER_NAME" tc qdisc replace dev "$net_if" root netem delay "${lat_ms}ms" 2>/dev/null || true
+                fi
+            fi
+        fi
     done
 }
-
 
 create_host_script() {
     local output_file=$1
@@ -528,12 +608,31 @@ create_host() {
 
     echo "Starting host"
     docker run -d --name "$HOST_NAME" --network "$NETWORK_NAME" --ip 172.28.0.2 \
+        --cap-add=NET_ADMIN \
         -v "${CONFIG_FOLDER}/uvgComm_host.ini:${CONTAINER_CONFIG_FILE}" \
         -v "${script_file}:${CONTAINER_HOST_SCRIPT_FILE}" \
         -v "${CORE_DIR_HOST}:/cores" \
         --ulimit core=-1 \
         -e CORE_DUMP_DIR=/cores \
         "${DOCKER_IMAGE}:latest" --script "$CONTAINER_HOST_SCRIPT_FILE"
+
+    # apply in-container host/SFU latency if requested
+    local LATENCY_MODE_PARAM="${11:-}"
+    if [ -n "${LATENCY_MODE_PARAM}" ] && [ "${LATENCY_MODE_PARAM}" != "none" ]; then
+        local LATENCY_FILE="${RUN_FOLDER}/latencies_${LATENCY_MODE_PARAM}.txt"
+        if [ -f "$LATENCY_FILE" ]; then
+            host_lat=$(sed -n '1p' "$LATENCY_FILE" 2>/dev/null || echo "")
+        else
+            host_lat=""
+        fi
+        if [ -n "$host_lat" ] && [ "$host_lat" -gt 0 ] 2>/dev/null; then
+            # detect primary interface inside host container
+            host_if=$(docker exec "$HOST_NAME" sh -c 'ls /sys/class/net | grep -v lo | head -n1' 2>/dev/null || echo "")
+            if [ -n "$host_if" ]; then
+                docker exec "$HOST_NAME" tc qdisc replace dev "$host_if" root netem delay "${host_lat}ms" 2>/dev/null || true
+            fi
+        fi
+    fi
 }
 
 countdown_timer() {
@@ -657,8 +756,14 @@ start_bandwidth_monitor() {
                 sleep 0.3
             done
 
-            rx=$(docker exec "$c" cat /sys/class/net/eth0/statistics/rx_bytes 2>/dev/null || echo 0)
-            tx=$(docker exec "$c" cat /sys/class/net/eth0/statistics/tx_bytes 2>/dev/null || echo 0)
+            # detect the primary interface inside the container (non-loopback)
+            net_if=$(docker exec "$c" sh -c 'ls /sys/class/net | grep -v lo | head -n1' 2>/dev/null || echo "")
+            if [ -z "$net_if" ]; then
+                net_if="eth0"
+            fi
+
+            rx=$(docker exec "$c" cat /sys/class/net/${net_if}/statistics/rx_bytes 2>/dev/null || echo 0)
+            tx=$(docker exec "$c" cat /sys/class/net/${net_if}/statistics/tx_bytes 2>/dev/null || echo 0)
             prev_rx[$idx]=$rx
             prev_tx[$idx]=$tx
         done
@@ -696,6 +801,68 @@ start_bandwidth_monitor() {
     echo "Started bandwidth monitor (pid=$BW_MONITOR_PID) -> ${output_location}"
 }
 
+generate_latencies() {
+    # Usage: generate_latencies <out_dir> <num_clients> <scenario>
+
+    local out_dir="$1"
+    local num_clients=${2:-$CLIENTS}
+    local scenario_raw="$3"
+
+    # If no output directory provided, print usage hint and return
+    if [ -z "$out_dir" ]; then
+        echo "LATENCY_MODES set but no output dir provided. Call with: generate_latencies <out_dir> <num_clients> <scenario>"
+        return 0
+    fi
+
+    # Determine scenario kind: local vs global. Default to global for 'simlat'.
+    local kind="global"
+    if [ -n "$scenario_raw" ]; then
+        case "$scenario_raw" in
+            *local* ) kind="local" ;;
+            simlat ) kind="global" ;;
+            *global* ) kind="global" ;;
+            * ) kind="local" ;;
+        esac
+    fi
+
+    # Set ranges according to chosen kind (no jitter).
+    local client_min client_max sfu_lat
+    if [ "$kind" = "local" ]; then
+        client_min=20
+        client_max=40
+        sfu_lat=50
+    else
+        client_min=50
+        client_max=400
+        sfu_lat=40
+    fi
+
+    mkdir -p "${out_dir}"
+    local out="${out_dir}/latencies_${kind}.txt"
+
+    # Write SFU/host latency as first line
+    echo "${sfu_lat}" > "$out"
+
+    # Generate deterministic, evenly spaced client latencies across range
+    if [ "$num_clients" -le 1 ] 2>/dev/null; then
+        # single client -> midpoint
+        val=$(( (client_min + client_max) / 2 ))
+        echo "$val" >> "$out"
+    else
+        local span=$(( client_max - client_min ))
+        for ii in $(seq 1 "$num_clients"); do
+            # integer arithmetic: value = min + round((ii-1)*(span)/(num_clients-1))
+            local step_num=$(( (ii-1) * span ))
+            local step_den=$(( num_clients - 1 ))
+            local add=$(( step_num / step_den ))
+            local val=$(( client_min + add ))
+            echo "$val" >> "$out"
+        done
+    fi
+
+    echo "Generated latency file: $out (scenario=${kind}, clients=${num_clients}, sfu=${sfu_lat}ms)"
+}
+
 stop_bandwidth_monitor() {
     if [ -n "$BW_MONITOR_PID" ]; then
         # Create stopfile so background loop ends cleanly
@@ -710,20 +877,27 @@ stop_bandwidth_monitor() {
 }
 
 run_scenario() {
-    local SCENARIO="$1"
+    # New signature: run_scenario <RESOLUTION> <ARCHITECTURE> <CLIENTS> <DOWNLOAD_BW> <UPLOAD_BW> <LATENCY> <VIEW_MODE> <INPUT_FILE> <RUN_COUNT> <LATENCY_MODE_PARAM>
+    local RESOLUTION="$1"
     local ARCHITECTURE="$2"
     # set CLIENTS as a global variable so other helper functions (cleanup, record_container_logs)
     # see the number of clients.
     CLIENTS="$3"
-    local RESOLUTION="$4"
-    local DOWNLOAD_BW="$5"
-    local UPLOAD_BW="$6"
-    local LATENCY="$7"
-    local VIEW_MODE="$8"
-    local INPUT_FILE="$9"
-    local RUN_COUNT="${10}"
+    local DOWNLOAD_BW="$4"
+    local UPLOAD_BW="$5"
+    local LATENCY="$6"
+    local VIEW_MODE="$7"
+    local INPUT_FILE="$8"
+    local RUN_COUNT="${9}"
+    local LATENCY_MODE_PARAM="${10:-}"
 
-    local base_output_folder="${RUN_FOLDER}/${SCENARIO}/${ARCHITECTURE}-${CLIENTS}"
+    # Build a result folder name that encodes key parameters to make runs
+    # self-describing and unique: resolution, latency mode, upload bw and view mode
+    local LATENCY_MODE_PARAM="${LATENCY_MODE_PARAM:-none}"
+    # sanitize upload bandwidth (replace dot with 'p' for filenames)
+    local up_sanitized=$(echo "$UPLOAD_BW" | tr '.' 'p')
+    local scen_tag="${RESOLUTION}_lat-${LATENCY_MODE_PARAM}_up-${up_sanitized}Mbps_view-${VIEW_MODE}"
+    local base_output_folder="${RUN_FOLDER}/${scen_tag}/${ARCHITECTURE}-${CLIENTS}"
 
     for run_index in $(seq 1 $RUN_COUNT); do
 
@@ -745,19 +919,21 @@ run_scenario() {
         local experiment_end_ms=$((experiment_start_ms + experiment_time_ms))
 
         echo "---------------------------------------------------------"
-        echo "Running scenario: $SCENARIO"
+        echo "Running scenario: $scen_tag"
         echo "Run ${run_index}/${RUN_COUNT}"
         echo "Architecture: $ARCHITECTURE, Clients: $CLIENTS"
         echo "Resolution: $RESOLUTION, DL: ${DOWNLOAD_BW} Mbps, UL: ${UPLOAD_BW} Mbps"
         echo "Latency: $LATENCY, View: $VIEW_MODE"
         echo "---------------------------------------------------------"
 
-        write_metadata "$SCENARIO" "$ARCHITECTURE" "$CLIENTS" "$RESOLUTION" \
-                   "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY" "$VIEW_MODE" \
-                   "$run_output_folder" "$experiment_start_ms" "$experiment_end_ms" "$run_index"
+        write_metadata "$scen_tag" "$ARCHITECTURE" "$CLIENTS" "$RESOLUTION" \
+               "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY" "$VIEW_MODE" \
+               "$run_output_folder" "$experiment_start_ms" "$experiment_end_ms" "$run_index"
 
-    create_clients "$CLIENTS" "$INPUT_FILE" $run_output_folder
-    create_host $run_output_folder $ARCHITECTURE $CLIENTS "$RESOLUTION" "$DOWNLOAD_BW" "$UPLOAD_BW" $setup_time_ms $warmup_time_ms $experiment_time_ms $cooldown_time_ms
+        # Create host first so it is ready when clients call in sequence.
+        create_host $run_output_folder $ARCHITECTURE $CLIENTS "$RESOLUTION" "$DOWNLOAD_BW" "$UPLOAD_BW" $setup_time_ms $warmup_time_ms $experiment_time_ms $cooldown_time_ms "$LATENCY_MODE_PARAM"
+        create_clients "$CLIENTS" "$INPUT_FILE" $run_output_folder "$LATENCY_MODE_PARAM"
+
         # Start bandwidth monitor (polling interval 1s) - writes per-container CSVs
         start_bandwidth_monitor "$run_output_folder" 1
 
@@ -771,19 +947,19 @@ run_scenario() {
 }
 
 run_architectures() {
-    local SCENARIO="$1"
+    # New signature: run_architectures <RESOLUTION> <CLIENTS> <DOWNLOAD_BW> <UPLOAD_BW> <LATENCY> <VIEW_MODE> <INPUT_FILE> <RUN_COUNT>
+    local RESOLUTION="$1"
     local CLIENTS="$2"
-    local RESOLUTION="$3"
-    local DOWNLOAD_BW="$4"
-    local UPLOAD_BW="$5"
-    local LATENCY="$6"
-    local VIEW_MODE="$7"
-    local INPUT_FILE="$8"
-    local RUN_COUNT="$9"
+    local DOWNLOAD_BW="$3"
+    local UPLOAD_BW="$4"
+    local LATENCY="$5"
+    local VIEW_MODE="$6"
+    local INPUT_FILE="$7"
+    local RUN_COUNT="$8"
 
-    run_scenario "$SCENARIO" "P2P_Mesh" "$CLIENTS" "$RESOLUTION" "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY" "$VIEW_MODE" "$INPUT_FILE" "$RUN_COUNT"
-    run_scenario "$SCENARIO" "SFU"      "$CLIENTS" "$RESOLUTION" "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY" "$VIEW_MODE" "$INPUT_FILE" "$RUN_COUNT"
-    run_scenario "$SCENARIO" "Hybrid"   "$CLIENTS" "$RESOLUTION" "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY" "$VIEW_MODE" "$INPUT_FILE" "$RUN_COUNT"
+    run_scenario "$RESOLUTION" "P2P_Mesh" "$CLIENTS" "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY" "$VIEW_MODE" "$INPUT_FILE" "$RUN_COUNT"
+    run_scenario "$RESOLUTION" "SFU"      "$CLIENTS" "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY" "$VIEW_MODE" "$INPUT_FILE" "$RUN_COUNT"
+    run_scenario "$RESOLUTION" "Hybrid"   "$CLIENTS" "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY" "$VIEW_MODE" "$INPUT_FILE" "$RUN_COUNT"
 }
 
 
@@ -793,10 +969,14 @@ cleanup() {
     if [ -n "${BW_MONITOR_PID-}" ]; then
         stop_bandwidth_monitor || true
     fi
-    for i in $(seq 1 $CLIENTS); do
-        docker rm -f "${CLIENT_PREFIX}${i}" 2>/dev/null || true
-    done
-    docker rm -f $HOST_NAME 2>/dev/null || true
+    # Remove any client containers matching prefix (handles leftover clients beyond current CLIENTS)
+    if command -v docker >/dev/null 2>&1; then
+        for cname in $(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E "^${CLIENT_PREFIX}[0-9]+$" 2>/dev/null || true); do
+            docker rm -f "$cname" 2>/dev/null || true
+        done
+        # Also remove host container if present
+        docker rm -f "$HOST_NAME" 2>/dev/null || true
+    fi
 }
 
 
@@ -808,28 +988,30 @@ trap cleanup EXIT # remove containers if this script crashes
 # Parse CLI args (if any) to override defaults/env
 parse_args "$@"
 
-# Normalize ARCHS/SCENARIOS/CLIENTS_LIST (spaces -> commas) so validation
+# Normalize ARCHS/RESOLUTIONS/CLIENTS_LIST (spaces -> commas) so validation
 # can treat comma-separated lists consistently, then validate strictly.
 ARCHS=$(echo "$ARCHS" | tr ' ' ',')
-SCENARIOS=$(echo "$SCENARIOS" | tr ' ' ',')
+RESOLUTIONS=$(echo "$RESOLUTIONS" | tr ' ' ',')
 CLIENTS_LIST=$(echo "$CLIENTS_LIST" | tr ' ' ',')
 
 # Run strict validation now (will exit on error). validate_params will also
-# populate ARCHS_ARRAY, SCENARIOS_ARRAY and CLIENTS_ARRAY on success.
+# populate ARCHS_ARRAY, RESOLUTIONS_ARRAY and CLIENTS_ARRAY on success.
 validate_params
 
 # Print the selected docker image (one-line): Repository:Tag ID CreatedAt (first match)
 echo "Docker image: $(docker images --format '{{.Repository}}:{{.Tag}} {{.ID}} {{.CreatedAt}}' 2>/dev/null | grep -E "^${DOCKER_IMAGE}:" | head -n1 || echo "${DOCKER_IMAGE}: not found")"
 
-echo "Running with RUN_COUNT=${RUN_COUNT}, CLIENTS=${CLIENTS_LIST}, ARCHS=${ARCHS}, SCENARIOS=${SCENARIOS}"
+echo "Running with RUN_COUNT=${RUN_COUNT}, CLIENTS=${CLIENTS_LIST}, ARCHS=${ARCHS}, RESOLUTIONS=${RESOLUTIONS}, LATENCY_MODES=${LATENCY_MODES}, VIEW_MODE=${VIEW_MODE}"
 
 total_ms=0
-num_scenarios=${#SCENARIOS_ARRAY[@]}
+num_resolutions=${#RESOLUTIONS_ARRAY[@]}
 num_arch=${#ARCHS_ARRAY[@]}
+num_latency_modes=${#LATENCY_MODES[@]}
+num_views=${#VIEW_MODES_ARRAY[@]}
 
 for clients in ${CLIENTS_LIST//,/ } ; do
     per_run_ms=$(( clients * WAIT_AFTER_INVITE * 1000 + WAIT_AFTER_SETTINGS * 1000 + WARMUP_TIME * 1000 + EXPERIMENT_TIME * 1000 + COOLDOWN_TIME * 1000 ))
-    total_ms=$(( total_ms + per_run_ms * RUN_COUNT * num_scenarios * num_arch ))
+    total_ms=$(( total_ms + per_run_ms * RUN_COUNT * num_resolutions * num_arch * num_latency_modes * num_views ))
 done
 
 total_seconds=$(( total_ms / 1000 ))
@@ -843,10 +1025,10 @@ echo "Estimated total run time (at least): ${total_hms}"
 # seeing parameters and estimated runtime. If no TTY is available, proceed.
 if [ -t 0 ]; then
     while true; do
-        read -r -p "Proceed with the evaluation? (y/n): " yn
+        read -r -p "Proceed with the evaluation? (y/N): " yn
         case "$yn" in
             [Yy]* ) break ;;
-            [Nn]* ) echo "Aborted by user."; exit 0 ;;
+            ""|[Nn]* ) echo "Aborted by user."; exit 0 ;;
             * ) echo "Please answer y or n." ;;
         esac
     done
@@ -857,37 +1039,40 @@ fi
 prepare_tests # prepares test files and creates network
 ulimit -c unlimited # in case experiment crashes
 
-# Iterate scenarios, client counts and architectures
-for scenario in "${SCENARIOS_ARRAY[@]}"; do
-    for clients in ${CLIENTS_LIST//,/ } ; do
-        for arch in "${ARCHS_ARRAY[@]}"; do
-                case "$scenario" in
-                    720p)
-                        run_scenario "720p" "$arch" "$clients" "1280x720" 1.0 1.0 false "gallery" "$INPUT_FILE_720" "$RUN_COUNT"
-                        ;;
-                    4K)
-                        run_scenario "4K" "$arch" "$clients" "3840x2160" 6.0 6.0 false "gallery" "$INPUT_FILE_4K" "$RUN_COUNT"
-                        ;;
-                    speaker)
-                        # Speaker mode: same resolution as 720p but speaker view
-                        run_scenario "speaker" "$arch" "$clients" "1280x720" 1.0 1.0 false "speaker" "$INPUT_FILE_720" "$RUN_COUNT"
-                        ;;
-                    1080p)
-                        # 1080p placeholder: use 4K input file until a dedicated 1080p file is available
-                        run_scenario "1080p" "$arch" "$clients" "1920x1080" 3.0 3.0 false "gallery" "$INPUT_FILE_4K" "$RUN_COUNT"
-                        ;;
-                    simlat)
-                        # Simulated latencies: enable latency flag (true)
-                        run_scenario "simlat" "$arch" "$clients" "1280x720" 1.0 1.0 true "gallery" "$INPUT_FILE_720" "$RUN_COUNT"
-                        ;;
-                    low_send_bw)
-                        # Low send bandwidth: send (upload) is 50% of conference bandwidth
-                        run_scenario "low_send_bw" "$arch" "$clients" "1280x720" 1.0 0.5 false "gallery" "$INPUT_FILE_720" "$RUN_COUNT"
-                        ;;
-                    *)
-                        echo "Skipping unknown scenario: $scenario"
-                        ;;
-                esac
+# Iterate latency modes (if any), resolutions, client counts and architectures
+if [ -n "${LATENCY_MODES}" ]; then
+    IFS=',' read -r -a LATENCY_RUNS <<< "${LATENCY_MODES}"
+else
+    LATENCY_RUNS=("none")
+fi
+
+for LATENCY_MODE in "${LATENCY_RUNS[@]}"; do
+    for RES in "${RESOLUTIONS_ARRAY[@]}"; do
+        # Mapping: 3840x2160 -> 6.0 Mbps, 1920x1080 -> 3.0 Mbps, 1280x720 -> 1.0 Mbps
+        case "$RES" in
+            "3840x2160") DOWNLOAD_BW="6.0" ;;
+            "1920x1080") DOWNLOAD_BW="3.0" ;;
+            "1280x720") DOWNLOAD_BW="1.0" ;;
+            *) DOWNLOAD_BW="1.0" ;;
+        esac
+        # upload bandwidth fixed while upload system is under development
+        UPLOAD_BW="1.0"
+        for VIEW in "${VIEW_MODES_ARRAY[@]}"; do
+            for clients in ${CLIENTS_LIST//,/ } ; do
+                for arch in "${ARCHS_ARRAY[@]}"; do
+                    # Compose scenario name from parameters
+                    scen_name="${RES}_lat-${LATENCY_MODE}_up-${UPLOAD_BW}Mbps_view-${VIEW}"
+
+                    # Choose input file: use 4K file for large resolutions as before
+                    if [ "${RES}" = "3840x2160" ] || [ "${RES}" = "1920x1080" ]; then
+                        input_file="${INPUT_FILE_4K}"
+                    else
+                        input_file="${INPUT_FILE_720}"
+                    fi
+
+                    run_scenario "$RES" "$arch" "$clients" "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY_MODE" "$VIEW" "$input_file" "$RUN_COUNT" "$LATENCY_MODE"
+                done
+            done
         done
     done
 done

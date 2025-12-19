@@ -80,6 +80,7 @@ LATENCY_MODES=${LATENCY_MODES:-none}
 #  - inc10  : each client gets i * 10 Mbps
 SEND_BW_MODE=${SEND_BW_MODE:-all1000}
 
+
 # ----------------------- functions ------------------------
 
 usage() {
@@ -304,7 +305,7 @@ write_metadata() {
     local clients="$3"
     local resolution="$4"
     local download_bw="$5"
-    local upload_bw="$6"
+    local upload_mode="$6"
     local latency="$7"
     local view_mode="$8"
     local output_folder="$9"
@@ -327,7 +328,7 @@ write_metadata() {
         echo "Clients: $clients"
         echo "Resolution: $resolution"
         echo "Download_BW: ${download_bw} Mbps"
-        echo "Upload_BW: ${upload_bw} Mbps"
+        echo "Upload_BW_Mode: ${upload_mode}"
         echo "Simulated_latencies: $latency"
         echo "View_Mode: $view_mode"
         echo "Visible_Participants: ${VISIBLE_PARTICIPANTS}"
@@ -491,7 +492,10 @@ create_clients() {
                 # detect primary interface inside container
                 net_if=$(docker exec "$CONTAINER_NAME" sh -c 'ls /sys/class/net | grep -v lo | head -n1' 2>/dev/null || echo "")
                 if [ -n "$net_if" ]; then
-                    docker exec "$CONTAINER_NAME" tc qdisc replace dev "$net_if" root netem delay "${lat_ms}ms" 2>/dev/null || true
+                    # Increase tx queue length to reduce packet drops when netem adds delay
+                    docker exec "$CONTAINER_NAME" ip link set dev "$net_if" txqueuelen 1000 2>/dev/null || true
+                    # Use a larger qdisc limit so many simultaneous streams don't overflow the netem queue
+                    docker exec "$CONTAINER_NAME" tc qdisc replace dev "$net_if" root netem delay "${lat_ms}ms" limit 10000 2>/dev/null || true
                 fi
             fi
         fi
@@ -504,11 +508,10 @@ create_host_script() {
     local clients=$3
     local resolution=$4
     local download_bw=$5
-    local upload_bw=$6
-    local setup_duration_ms=$7
-    local warmup_duration_ms=$8
-    local experiment_duration_ms=$9
-    local cooldown_duration_ms=${10}
+    local setup_duration_ms=$6
+    local warmup_duration_ms=$7
+    local experiment_duration_ms=$8
+    local cooldown_duration_ms=${9}
 
     # Use globally-configured wait times (default set at top of file)
     local wait_after_invite=${WAIT_AFTER_INVITE}
@@ -527,12 +530,10 @@ create_host_script() {
         local height="0"
     fi
 
-    # Convert provided bandwidth values (given as Mbps, possibly floats like 1.0)
+    # Convert provided download bandwidth value (given as Mbps, possibly floats like 1.0)
     # to integer bits-per-second expected by the host. Use 1 Mbps = 1,000,000 bps.
-    local upload_bps
     local download_bps
     # Use awk for floating point multiplication and integer formatting
-    upload_bps=$(awk "BEGIN {printf \"%d\", ($upload_bw) * 1000000}")
     download_bps=$(awk "BEGIN {printf \"%d\", ($download_bw) * 1000000}")
 
     # Compute per-media bitrates. Template assumes download bandwidth reflects
@@ -597,27 +598,40 @@ create_host() {
     local clients="$3"
     local resolution="$4"
     local download_bw="$5"
-    local upload_bw="$6"
-    local setup_time="$7"
-    local warmup_time="$8"
-    local experiment_time="$9"
-    local cooldown_time=${10}
+    local setup_time="$6"
+    local warmup_time="$7"
+    local experiment_time="$8"
+    local cooldown_time=${9}
     mkdir -p "$(dirname "${script_file}")"
 
-    create_host_script "${script_file}" $architecture $clients $resolution $download_bw $upload_bw $setup_time $warmup_time $experiment_time $cooldown_time
+    create_host_script "${script_file}" $architecture $clients $resolution $download_bw $setup_time $warmup_time $experiment_time $cooldown_time
+
+    local SFU_CPUSET="0"
+    local SFU_CPUS=""
+    local SFU_NOFILE=65536
 
     echo "Starting host"
     docker run -d --name "$HOST_NAME" --network "$NETWORK_NAME" --ip 172.28.0.2 \
         --cap-add=NET_ADMIN \
+        --cpuset-cpus="${SFU_CPUSET}" \
+        $( [ -n "${SFU_CPUS}" ] && printf '--cpus="%s" \\' "${SFU_CPUS}" || true ) \
         -v "${CONFIG_FOLDER}/uvgComm_host.ini:${CONTAINER_CONFIG_FILE}" \
         -v "${script_file}:${CONTAINER_HOST_SCRIPT_FILE}" \
         -v "${CORE_DIR_HOST}:/cores" \
         --ulimit core=-1 \
+        --ulimit nofile=${SFU_NOFILE}:${SFU_NOFILE} \
         -e CORE_DUMP_DIR=/cores \
         "${DOCKER_IMAGE}:latest" --script "$CONTAINER_HOST_SCRIPT_FILE"
 
+    # Non-fatal attempt: try to set net.core sysctls inside the container.
+    # Some Docker setups (rootless) prevent passing --sysctl at docker create
+    # time and will fail. Try applying them post-start, ignore failures.
+    docker exec "$HOST_NAME" sh -c 'sysctl -w net.core.rmem_max=16777216' 2>/dev/null || true
+    docker exec "$HOST_NAME" sh -c 'sysctl -w net.core.wmem_max=16777216' 2>/dev/null || true
+    docker exec "$HOST_NAME" sh -c 'sysctl -w net.core.netdev_max_backlog=250000' 2>/dev/null || true
+
     # apply in-container host/SFU latency if requested
-    local LATENCY_MODE_PARAM="${11:-}"
+    local LATENCY_MODE_PARAM="${10:-}"
     if [ -n "${LATENCY_MODE_PARAM}" ] && [ "${LATENCY_MODE_PARAM}" != "none" ]; then
         local LATENCY_FILE="${RUN_FOLDER}/latencies_${LATENCY_MODE_PARAM}.txt"
         if [ -f "$LATENCY_FILE" ]; then
@@ -629,7 +643,10 @@ create_host() {
             # detect primary interface inside host container
             host_if=$(docker exec "$HOST_NAME" sh -c 'ls /sys/class/net | grep -v lo | head -n1' 2>/dev/null || echo "")
             if [ -n "$host_if" ]; then
-                docker exec "$HOST_NAME" tc qdisc replace dev "$host_if" root netem delay "${host_lat}ms" 2>/dev/null || true
+                # Increase tx queue length on the host side of the container
+                docker exec "$HOST_NAME" ip link set dev "$host_if" txqueuelen 1000 2>/dev/null || true
+                # Use larger qdisc limit to avoid buffer overflows with many participant streams
+                docker exec "$HOST_NAME" tc qdisc replace dev "$host_if" root netem delay "${host_lat}ms" limit 10000 2>/dev/null || true
             fi
         fi
     fi
@@ -877,26 +894,23 @@ stop_bandwidth_monitor() {
 }
 
 run_scenario() {
-    # New signature: run_scenario <RESOLUTION> <ARCHITECTURE> <CLIENTS> <DOWNLOAD_BW> <UPLOAD_BW> <LATENCY> <VIEW_MODE> <INPUT_FILE> <RUN_COUNT> <LATENCY_MODE_PARAM>
+    # New signature: run_scenario <RESOLUTION> <ARCHITECTURE> <CLIENTS> <DOWNLOAD_BW> <UPLOAD_MODE> <LATENCY_MODE> <VIEW_MODE> <INPUT_FILE> <RUN_COUNT>
     local RESOLUTION="$1"
     local ARCHITECTURE="$2"
     # set CLIENTS as a global variable so other helper functions (cleanup, record_container_logs)
     # see the number of clients.
     CLIENTS="$3"
     local DOWNLOAD_BW="$4"
-    local UPLOAD_BW="$5"
-    local LATENCY="$6"
+    local UPLOAD_MODE="$5"
+    local LATENCY_MODE_PARAM="$6"
     local VIEW_MODE="$7"
     local INPUT_FILE="$8"
     local RUN_COUNT="${9}"
-    local LATENCY_MODE_PARAM="${10:-}"
 
     # Build a result folder name that encodes key parameters to make runs
-    # self-describing and unique: resolution, latency mode, upload bw and view mode
+    # self-describing and unique: resolution and latency mode (upload/view are global for the run)
     local LATENCY_MODE_PARAM="${LATENCY_MODE_PARAM:-none}"
-    # sanitize upload bandwidth (replace dot with 'p' for filenames)
-    local up_sanitized=$(echo "$UPLOAD_BW" | tr '.' 'p')
-    local scen_tag="${RESOLUTION}_lat-${LATENCY_MODE_PARAM}_up-${up_sanitized}Mbps_view-${VIEW_MODE}"
+    local scen_tag="${RESOLUTION}_lat-${LATENCY_MODE_PARAM}"
     local base_output_folder="${RUN_FOLDER}/${scen_tag}/${ARCHITECTURE}-${CLIENTS}"
 
     for run_index in $(seq 1 $RUN_COUNT); do
@@ -922,16 +936,16 @@ run_scenario() {
         echo "Running scenario: $scen_tag"
         echo "Run ${run_index}/${RUN_COUNT}"
         echo "Architecture: $ARCHITECTURE, Clients: $CLIENTS"
-        echo "Resolution: $RESOLUTION, DL: ${DOWNLOAD_BW} Mbps, UL: ${UPLOAD_BW} Mbps"
-        echo "Latency: $LATENCY, View: $VIEW_MODE"
+        echo "Resolution: $RESOLUTION, DL: ${DOWNLOAD_BW} Mbps, UL_mode: ${UPLOAD_MODE}"
+        echo "Latency mode: $LATENCY_MODE_PARAM, View: $VIEW_MODE"
         echo "---------------------------------------------------------"
 
-        write_metadata "$scen_tag" "$ARCHITECTURE" "$CLIENTS" "$RESOLUTION" \
-               "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY" "$VIEW_MODE" \
-               "$run_output_folder" "$experiment_start_ms" "$experiment_end_ms" "$run_index"
+         write_metadata "$scen_tag" "$ARCHITECTURE" "$CLIENTS" "$RESOLUTION" \
+             "$DOWNLOAD_BW" "$UPLOAD_MODE" "$LATENCY_MODE_PARAM" "$VIEW_MODE" \
+             "$run_output_folder" "$experiment_start_ms" "$experiment_end_ms" "$run_index"
 
         # Create host first so it is ready when clients call in sequence.
-        create_host $run_output_folder $ARCHITECTURE $CLIENTS "$RESOLUTION" "$DOWNLOAD_BW" "$UPLOAD_BW" $setup_time_ms $warmup_time_ms $experiment_time_ms $cooldown_time_ms "$LATENCY_MODE_PARAM"
+        create_host $run_output_folder $ARCHITECTURE $CLIENTS "$RESOLUTION" "$DOWNLOAD_BW" $setup_time_ms $warmup_time_ms $experiment_time_ms $cooldown_time_ms "$LATENCY_MODE_PARAM"
         create_clients "$CLIENTS" "$INPUT_FILE" $run_output_folder "$LATENCY_MODE_PARAM"
 
         # Start bandwidth monitor (polling interval 1s) - writes per-container CSVs
@@ -945,23 +959,6 @@ run_scenario() {
         cleanup
     done
 }
-
-run_architectures() {
-    # New signature: run_architectures <RESOLUTION> <CLIENTS> <DOWNLOAD_BW> <UPLOAD_BW> <LATENCY> <VIEW_MODE> <INPUT_FILE> <RUN_COUNT>
-    local RESOLUTION="$1"
-    local CLIENTS="$2"
-    local DOWNLOAD_BW="$3"
-    local UPLOAD_BW="$4"
-    local LATENCY="$5"
-    local VIEW_MODE="$6"
-    local INPUT_FILE="$7"
-    local RUN_COUNT="$8"
-
-    run_scenario "$RESOLUTION" "P2P_Mesh" "$CLIENTS" "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY" "$VIEW_MODE" "$INPUT_FILE" "$RUN_COUNT"
-    run_scenario "$RESOLUTION" "SFU"      "$CLIENTS" "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY" "$VIEW_MODE" "$INPUT_FILE" "$RUN_COUNT"
-    run_scenario "$RESOLUTION" "Hybrid"   "$CLIENTS" "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY" "$VIEW_MODE" "$INPUT_FILE" "$RUN_COUNT"
-}
-
 
 cleanup() {
     echo "Stopping and removing containers if they exist"
@@ -1061,7 +1058,7 @@ for LATENCY_MODE in "${LATENCY_RUNS[@]}"; do
             for clients in ${CLIENTS_LIST//,/ } ; do
                 for arch in "${ARCHS_ARRAY[@]}"; do
                     # Compose scenario name from parameters
-                    scen_name="${RES}_lat-${LATENCY_MODE}_up-${UPLOAD_BW}Mbps_view-${VIEW}"
+                    scen_name="${RES}_lat-${LATENCY_MODE}"
 
                     # Choose input file: use 4K file for large resolutions as before
                     if [ "${RES}" = "3840x2160" ] || [ "${RES}" = "1920x1080" ]; then
@@ -1070,7 +1067,7 @@ for LATENCY_MODE in "${LATENCY_RUNS[@]}"; do
                         input_file="${INPUT_FILE_720}"
                     fi
 
-                    run_scenario "$RES" "$arch" "$clients" "$DOWNLOAD_BW" "$UPLOAD_BW" "$LATENCY_MODE" "$VIEW" "$input_file" "$RUN_COUNT" "$LATENCY_MODE"
+                    run_scenario "$RES" "$arch" "$clients" "$DOWNLOAD_BW" "$SEND_BW_MODE" "$LATENCY_MODE" "$VIEW" "$input_file" "$RUN_COUNT"
                 done
             done
         done

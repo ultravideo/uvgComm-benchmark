@@ -364,11 +364,13 @@ generate_usernames() {
 generate_client_configs() {
     # Generate per-client configs from template configs/uvgComm_client.ini.
     # Idempotent: overwrite files so per-scenario settings apply.
-    # Usage: generate_client_configs [send_bw_mode] [view_mode]
+    # Usage: generate_client_configs [send_bw_mode] [view_mode] [num_clients]
     # If send_bw_mode is not provided, fall back to global SEND_BW_MODE.
     # If view_mode is not provided, fall back to global VIEW_MODE.
+    # If num_clients is not provided, fall back to global MAX_CLIENTS.
     local send_bw_mode="${1:-${SEND_BW_MODE}}"
     local view_mode="${2:-${VIEW_MODE}}"
+    local num_clients="${3:-${MAX_CLIENTS}}"
     local template="${CONFIG_FOLDER}/uvgComm_client.ini"
     mkdir -p "${CONFIG_FOLDER}"
 
@@ -384,7 +386,7 @@ generate_client_configs() {
         conference_mode_value="Speaker"
     fi
 
-    for i in $(seq 1 "${MAX_CLIENTS}"); do
+    for i in $(seq 1 "${num_clients}"); do
         local out="${CONFIG_FOLDER}/uvgComm${i}.ini"
 
         # Always overwrite existing client config to reflect current settings
@@ -480,7 +482,7 @@ generate_client_configs() {
         echo "Assigned upBandwidth=${upload_bps} to ${out}"
     done
 
-    echo "Generated per-client configs up to ${MAX_CLIENTS} in ${CONFIG_FOLDER}"
+    echo "Generated per-client configs up to ${num_clients} in ${CONFIG_FOLDER}"
 }
 
 create_clients() {
@@ -982,7 +984,7 @@ run_scenario() {
         # Create host first so it is ready when clients call in sequence.
         create_host "$run_output_folder" "$ARCHITECTURE" "$CLIENTS" "$RESOLUTION" "$DOWNLOAD_BW" "$setup_time_ms" "$warmup_time_ms" "$experiment_time_ms" "$cooldown_time_ms" "$LATENCY_MODE_PARAM"
 
-        generate_client_configs "${UPLOAD_MODE}" "${VIEW}" || true
+        generate_client_configs "${UPLOAD_MODE}" "${VIEW_MODE}" "${CLIENTS}" || true
         create_clients "$CLIENTS" "$INPUT_FILE" "$run_output_folder" "$LATENCY_MODE_PARAM"
 
         # Start bandwidth monitor (polling interval 1s) - writes per-container CSVs

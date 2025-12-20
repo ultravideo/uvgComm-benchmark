@@ -312,7 +312,6 @@ write_metadata() {
     local end="${11}"
     local run="${12}"
 
-    local cpu_log="${output_folder}/cpu_usage.csv"
 
     local metadata_file="${output_folder}/metadata.txt"
 
@@ -539,10 +538,9 @@ create_host_script() {
     local clients=$3
     local resolution=$4
     local download_bw=$5
-    local setup_duration_ms=$6
-    local warmup_duration_ms=$7
-    local experiment_duration_ms=$8
-    local cooldown_duration_ms=${9}
+    local warmup_duration_ms=$6
+    local experiment_duration_ms=$7
+    local cooldown_duration_ms=$8
 
     # Use globally-configured wait times (default set at top of file)
     local wait_after_invite=${WAIT_AFTER_INVITE}
@@ -1055,10 +1053,11 @@ for clients in ${CLIENTS_LIST//,/ } ; do
 done
 
 total_seconds=$(( total_ms / 1000 ))
-hours=$(( total_seconds / 3600 ))
+days=$(( total_seconds / 86400 ))
+hours=$(( (total_seconds % 86400) / 3600 ))
 minutes=$(( (total_seconds % 3600) / 60 ))
 seconds=$(( total_seconds % 60 ))
-printf -v total_hms "%d hours %d minutes %d seconds" "$hours" "$minutes" "$seconds"
+printf -v total_hms "%d days %d hours %d minutes %d seconds" "$days" "$hours" "$minutes" "$seconds"
 echo "Estimated total run time (at least): ${total_hms}"
 
 # Ask for confirmation before preparing tests so the user can abort after
@@ -1095,14 +1094,10 @@ for LATENCY_MODE in "${LATENCY_RUNS[@]}"; do
             "1280x720") DOWNLOAD_BW="1.0" ;;
             *) DOWNLOAD_BW="1.0" ;;
         esac
-        # upload bandwidth fixed while upload system is under development
-        UPLOAD_BW="1.0"
         for VIEW in "${VIEW_MODES_ARRAY[@]}"; do
             for clients in ${CLIENTS_LIST//,/ } ; do
                 for arch in "${ARCHS_ARRAY[@]}"; do
                     for BW_MODE in "${SEND_BW_ARRAY[@]}"; do
-                        # Compose scenario name from parameters
-                        scen_name="${RES}_lat-${LATENCY_MODE}_bw-${BW_MODE}"
 
                         # Choose input file: use 4K file for large resolutions as before
                         if [ "${RES}" = "3840x2160" ] || [ "${RES}" = "1920x1080" ]; then

@@ -96,7 +96,7 @@ Options:
     -v VISIBLE     Number of visible participants in gallery view (default: ${VISIBLE_PARTICIPANTS}).
     -e SECONDS     Evaluation period in seconds (default: ${EXPERIMENT_TIME}).
     -l             Enable simulated per-client latency (uses built-in defaults).
-    -b MODE        Send bandwidth mode (all1000|all1|inc1|inc5|inc10). Defaults to ${SEND_BW_MODE}
+    -b MODE        Send bandwidth mode (all1000|all1|inc1|inc5|inc10) or comma-separated list. Defaults to ${SEND_BW_MODE}
     -h             Show this help
 EOF
 }
@@ -187,10 +187,10 @@ validate_params() {
         echo "ERROR: Unknown view mode '$VIEW_MODE' (allowed: gallery,speaker or comma-separated list)" >&2; exit 1
     fi
 
-    # validate send bandwidth mode (single value only)
-    local bw_re='^(all1000|all1|inc1|inc5|inc10)$'
+    # validate send bandwidth mode(s) (comma-separated values allowed)
+    local bw_re='^(all1000|all1|inc1|inc5|inc10)(,(all1000|all1|inc1|inc5|inc10))*$'
     if ! [[ "$SEND_BW_MODE" =~ $bw_re ]]; then
-        echo "ERROR: Unknown send bandwidth mode '$SEND_BW_MODE' (allowed: all1000,all1,inc1,inc5,inc10)" >&2; exit 1
+        echo "ERROR: Unknown send bandwidth mode '$SEND_BW_MODE' (allowed: all1000,all1,inc1,inc5,inc10 or comma-separated list)" >&2; exit 1
     fi
 
     if ! [[ "$CLIENTS_LIST" =~ $clients_re ]]; then
@@ -210,6 +210,7 @@ validate_params() {
     IFS=',' read -r -a RESOLUTIONS_ARRAY <<< "$RESOLUTIONS"
     IFS=',' read -r -a VIEW_MODES_ARRAY <<< "$VIEW_MODE"
     IFS=',' read -r -a CLIENTS_ARRAY <<< "$CLIENTS_LIST"
+    IFS=',' read -r -a SEND_BW_ARRAY <<< "$SEND_BW_MODE"
 }
 
 prepare_tests() {
@@ -284,8 +285,6 @@ prepare_tests() {
     # a reasonable upper bound; the file will be written in configs/.
     generate_usernames "$MAX_CLIENTS"
 
-    # Generate per-client configs from template. 
-    generate_client_configs || true
 
     # Generate latency files for requested modes (one-time per run folder)
     IFS=',' read -r -a _modes <<< "${LATENCY_MODES}"
@@ -365,13 +364,25 @@ generate_usernames() {
 
 generate_client_configs() {
     # Generate per-client configs from template configs/uvgComm_client.ini.
-    # Idempotent: skip files that already exist.
+    # Idempotent: overwrite files so per-scenario settings apply.
+    # Usage: generate_client_configs [send_bw_mode] [view_mode]
+    # If send_bw_mode is not provided, fall back to global SEND_BW_MODE.
+    # If view_mode is not provided, fall back to global VIEW_MODE.
+    local send_bw_mode="${1:-${SEND_BW_MODE}}"
+    local view_mode="${2:-${VIEW_MODE}}"
     local template="${CONFIG_FOLDER}/uvgComm_client.ini"
     mkdir -p "${CONFIG_FOLDER}"
 
     if [ ! -f "${template}" ]; then
         echo "ERROR: Client template '${template}' not found. Please create it." >&2
         exit 1
+    fi
+
+    # Determine conferenceMode value and per-client speakerMode:
+    # conferenceMode: 'Speaker' or 'Gallery'
+    local conference_mode_value="Gallery"
+    if [[ "${view_mode}" == *speaker* ]]; then
+        conference_mode_value="Speaker"
     fi
 
     for i in $(seq 1 "${MAX_CLIENTS}"); do
@@ -409,6 +420,26 @@ generate_client_configs() {
             exit 1
         fi
 
+        # conferenceMode is a top-level key in the template; overwrite it like visibleParticipants
+        if grep -qE '^conferenceMode=' "${out}"; then
+            sed -i "s/^conferenceMode=.*/conferenceMode=${conference_mode_value}/" "${out}"
+        else
+            echo "ERROR: '${template}' (copied to ${out}) does not contain the key 'conferenceMode'. Exiting." >&2
+            exit 1
+        fi
+
+        # speakerMode indicates the current speaker and must be true only for the first client
+        if grep -qE '^speakerMode=' "${out}"; then
+            if [ "${i}" -eq 1 ] 2>/dev/null; then
+                sed -i "s/^speakerMode=.*/speakerMode=true/" "${out}"
+            else
+                sed -i "s/^speakerMode=.*/speakerMode=false/" "${out}"
+            fi
+        else
+            echo "ERROR: '${template}' (copied to ${out}) does not contain the key 'speakerMode'. Exiting." >&2
+            exit 1
+        fi
+
         # media IP
         client_ip="172.28.0.$((2 + i))"
 
@@ -418,9 +449,9 @@ generate_client_configs() {
             printf "\n[sip]\nlocalAddress=%s\n" "${client_ip}" >> "${out}"
         fi
 
-        # Compute upload bandwidth according to selected SEND_BW_MODE
+        # Compute upload bandwidth according to selected send_bw_mode
         local upload_bps=0
-        case "${SEND_BW_MODE}" in
+        case "${send_bw_mode}" in
             all1000)
                 upload_bps=$((1000 * 1000000))
                 ;;
@@ -466,7 +497,7 @@ create_clients() {
 
         mkdir -p "$client_output"
         echo "Starting client $i"
-        docker run -d --name $CONTAINER_NAME --network $NETWORK_NAME --ip 172.28.0.$((2+i)) \
+        docker run -d --name "${CONTAINER_NAME}" --network "${NETWORK_NAME}" --ip "172.28.0.$((2+i))" \
             --cap-add=NET_ADMIN \
             -v "${input_file}:${CONTAINER_INPUT_FILE}:ro" \
             -v "${config_file}:${CONTAINER_CONFIG_FILE}" \
@@ -475,7 +506,7 @@ create_clients() {
             --ulimit core=-1 \
             -e CORE_DUMP_DIR=/cores \
             -e KV_HEADLESS_FORCE_OFFSCREEN=1 \
-            ${DOCKER_IMAGE}:latest \
+            "${DOCKER_IMAGE}:latest" \
             --stats=${CONTAINER_STATS_FOLDER} \
             --siplog=${CONTAINER_STATS_FOLDER}/siplog.txt
 
@@ -604,14 +635,14 @@ create_host() {
     local cooldown_time=${9}
     mkdir -p "$(dirname "${script_file}")"
 
-    create_host_script "${script_file}" $architecture $clients $resolution $download_bw $setup_time $warmup_time $experiment_time $cooldown_time
+    create_host_script "${script_file}" "${architecture}" "${clients}" "${resolution}" "${download_bw}" "${setup_time}" "${warmup_time}" "${experiment_time}" "${cooldown_time}"
 
     local SFU_CPUSET="0"
     local SFU_CPUS=""
     local SFU_NOFILE=65536
 
     echo "Starting host"
-    docker run -d --name "$HOST_NAME" --network "$NETWORK_NAME" --ip 172.28.0.2 \
+    docker run -d --name "$HOST_NAME" --network "$NETWORK_NAME" --ip "172.28.0.2" \
         --cap-add=NET_ADMIN \
         --cpuset-cpus="${SFU_CPUSET}" \
         $( [ -n "${SFU_CPUS}" ] && printf '--cpus="%s" \\' "${SFU_CPUS}" || true ) \
@@ -671,7 +702,8 @@ countdown_timer() {
     local last_phase=""
 
     while true; do
-        local now_ms=$(($(date +%s%N)/1000000))
+        local now_ms
+        now_ms=$(($(date +%s%N)/1000000))
         local elapsed_ms=$((now_ms - start_time_ms))
 
         # Stop when total duration exceeded
@@ -681,11 +713,11 @@ countdown_timer() {
 
         # Determine phase
         local phase=""
-        if [ $elapsed_ms -lt $setup_time_ms ]; then
+        if [ "$elapsed_ms" -lt "$setup_time_ms" ]; then
             phase="Setup ${setup_time_ms} ms"
-        elif [ $elapsed_ms -lt $((setup_time_ms + warmup_time_ms)) ]; then
+        elif [ "$elapsed_ms" -lt $((setup_time_ms + warmup_time_ms)) ]; then
             phase="Warmup ${warmup_time_ms} ms"
-        elif [ $elapsed_ms -lt $((setup_time_ms + warmup_time_ms + experiment_time_ms)) ]; then
+        elif [ "$elapsed_ms" -lt $((setup_time_ms + warmup_time_ms + experiment_time_ms)) ]; then
             phase="Experiment ${experiment_time_ms} ms"
         else
             phase="Cooldown ${cooldown_time_ms} ms"
@@ -698,7 +730,8 @@ countdown_timer() {
         fi
 
         # CPU measurement
-        local CPU=$(mpstat 1 1 | awk '/Average/ {print 100-$12}' | tr ',' '.')
+        local CPU
+        CPU=$(mpstat 1 1 | awk '/Average/ {print 100-$12}' | tr ',' '.')
 
         # Log to file
         echo "$now_ms;$CPU" >> "$CPU_LOG"
@@ -710,7 +743,9 @@ countdown_timer() {
         # Sleep until the next millisecond boundary (approx 1s intervals)
         local next_ms=$((start_time_ms + ((elapsed_ms/1000)+1)*1000))
         local sleep_ms=$((next_ms - $(($(date +%s%N)/1000000))))
-        [ $sleep_ms -gt 0 ] && sleep $(awk "BEGIN {print $sleep_ms/1000}")
+        if [ "$sleep_ms" -gt 0 ]; then
+            sleep "$(awk "BEGIN {print $sleep_ms/1000}")"
+        fi
 
     done
     echo "Countdown finished"
@@ -719,8 +754,8 @@ countdown_timer() {
 record_container_logs() {
     local output_location=$1
     echo "Recording logs"
-    for i in $(seq 1 $CLIENTS); do
-        docker logs ${CLIENT_PREFIX}${i} &> ${output_location}/${CLIENT_PREFIX}${i}/docker.log
+    for i in $(seq 1 "$CLIENTS"); do
+        docker logs "${CLIENT_PREFIX}${i}" &> "${output_location}/${CLIENT_PREFIX}${i}/docker.log"
     done
     mkdir -p "${output_location}/${HOST_NAME}"
     docker logs "$HOST_NAME" &> "${output_location}/${HOST_NAME}/${HOST_NAME}.log"
@@ -749,7 +784,7 @@ start_bandwidth_monitor() {
     (
         # containers list (clients then host)
         containers=()
-        for i in $(seq 1 $CLIENTS); do
+        for i in $(seq 1 "$CLIENTS"); do
             containers+=("${CLIENT_PREFIX}${i}")
         done
         containers+=("${HOST_NAME}")
@@ -765,7 +800,7 @@ start_bandwidth_monitor() {
 
             # Wait briefly for container to appear/finish starting
             attempts=0
-            while [ $attempts -lt 10 ]; do
+                    while [ "$attempts" -lt 10 ]; do
                 if docker ps -q -f name="^/${c}$" >/dev/null 2>&1 && [ -n "$(docker ps -q -f name="^/${c}$")" ]; then
                     break
                 fi
@@ -808,7 +843,7 @@ start_bandwidth_monitor() {
                 prev_rx[$idx]=$rx
                 prev_tx[$idx]=$tx
             done
-            sleep $interval
+            sleep "$interval"
         done
 
         echo "Bandwidth monitor loop exiting" >> "$BW_MONITOR_LOG"
@@ -910,16 +945,18 @@ run_scenario() {
     # Build a result folder name that encodes key parameters to make runs
     # self-describing and unique: resolution and latency mode (upload/view are global for the run)
     local LATENCY_MODE_PARAM="${LATENCY_MODE_PARAM:-none}"
-    local scen_tag="${RESOLUTION}_lat-${LATENCY_MODE_PARAM}"
+    # Include upload and view modes in scenario tag so output paths are unique
+    local scen_tag="${RESOLUTION}_lat-${LATENCY_MODE_PARAM}_ul-${UPLOAD_MODE}_view-${VIEW_MODE}"
     local base_output_folder="${RUN_FOLDER}/${scen_tag}/${ARCHITECTURE}-${CLIENTS}"
 
-    for run_index in $(seq 1 $RUN_COUNT); do
+    for run_index in $(seq 1 "$RUN_COUNT"); do
 
         local run_output_folder="${base_output_folder}/run_${run_index}"
-        mkdir -p  ${run_output_folder}
+        mkdir -p "${run_output_folder}"
 
         # Current time
-        local current_time_ms=$(date +%s%3N)
+        local current_time_ms
+        current_time_ms=$(date +%s%3N)
 
         # Setup + warmup + experiment
         # setup time scales with number of clients and configured waits (in seconds)
@@ -945,17 +982,19 @@ run_scenario() {
              "$run_output_folder" "$experiment_start_ms" "$experiment_end_ms" "$run_index"
 
         # Create host first so it is ready when clients call in sequence.
-        create_host $run_output_folder $ARCHITECTURE $CLIENTS "$RESOLUTION" "$DOWNLOAD_BW" $setup_time_ms $warmup_time_ms $experiment_time_ms $cooldown_time_ms "$LATENCY_MODE_PARAM"
-        create_clients "$CLIENTS" "$INPUT_FILE" $run_output_folder "$LATENCY_MODE_PARAM"
+        create_host "$run_output_folder" "$ARCHITECTURE" "$CLIENTS" "$RESOLUTION" "$DOWNLOAD_BW" "$setup_time_ms" "$warmup_time_ms" "$experiment_time_ms" "$cooldown_time_ms" "$LATENCY_MODE_PARAM"
+
+        generate_client_configs "${UPLOAD_MODE}" "${VIEW}" || true
+        create_clients "$CLIENTS" "$INPUT_FILE" "$run_output_folder" "$LATENCY_MODE_PARAM"
 
         # Start bandwidth monitor (polling interval 1s) - writes per-container CSVs
         start_bandwidth_monitor "$run_output_folder" 1
 
-        countdown_timer $run_output_folder $current_time_ms $setup_time_ms $warmup_time_ms $experiment_time_ms $cooldown_time_ms
+        countdown_timer "$run_output_folder" "$current_time_ms" "$setup_time_ms" "$warmup_time_ms" "$experiment_time_ms" "$cooldown_time_ms"
 
         # Stop bandwidth monitor and collect logs
         stop_bandwidth_monitor
-        record_container_logs $run_output_folder
+        record_container_logs "$run_output_folder"
         cleanup
     done
 }
@@ -985,11 +1024,12 @@ trap cleanup EXIT # remove containers if this script crashes
 # Parse CLI args (if any) to override defaults/env
 parse_args "$@"
 
-# Normalize ARCHS/RESOLUTIONS/CLIENTS_LIST (spaces -> commas) so validation
+    # Normalize ARCHS/RESOLUTIONS/CLIENTS_LIST (spaces -> commas) so validation
 # can treat comma-separated lists consistently, then validate strictly.
 ARCHS=$(echo "$ARCHS" | tr ' ' ',')
 RESOLUTIONS=$(echo "$RESOLUTIONS" | tr ' ' ',')
 CLIENTS_LIST=$(echo "$CLIENTS_LIST" | tr ' ' ',')
+SEND_BW_MODE=$(echo "$SEND_BW_MODE" | tr ' ' ',')
 
 # Run strict validation now (will exit on error). validate_params will also
 # populate ARCHS_ARRAY, RESOLUTIONS_ARRAY and CLIENTS_ARRAY on success.
@@ -1003,12 +1043,15 @@ echo "Running with RUN_COUNT=${RUN_COUNT}, CLIENTS=${CLIENTS_LIST}, ARCHS=${ARCH
 total_ms=0
 num_resolutions=${#RESOLUTIONS_ARRAY[@]}
 num_arch=${#ARCHS_ARRAY[@]}
-num_latency_modes=${#LATENCY_MODES[@]}
+# compute number of latency and bandwidth modes correctly from comma lists
+IFS=',' read -r -a LATENCY_ARRAY <<< "${LATENCY_MODES}"
+num_latency_modes=${#LATENCY_ARRAY[@]}
 num_views=${#VIEW_MODES_ARRAY[@]}
+num_bw_modes=${#SEND_BW_ARRAY[@]}
 
 for clients in ${CLIENTS_LIST//,/ } ; do
     per_run_ms=$(( clients * WAIT_AFTER_INVITE * 1000 + WAIT_AFTER_SETTINGS * 1000 + WARMUP_TIME * 1000 + EXPERIMENT_TIME * 1000 + COOLDOWN_TIME * 1000 ))
-    total_ms=$(( total_ms + per_run_ms * RUN_COUNT * num_resolutions * num_arch * num_latency_modes * num_views ))
+    total_ms=$(( total_ms + per_run_ms * RUN_COUNT * num_resolutions * num_arch * num_latency_modes * num_views * num_bw_modes ))
 done
 
 total_seconds=$(( total_ms / 1000 ))
@@ -1057,17 +1100,19 @@ for LATENCY_MODE in "${LATENCY_RUNS[@]}"; do
         for VIEW in "${VIEW_MODES_ARRAY[@]}"; do
             for clients in ${CLIENTS_LIST//,/ } ; do
                 for arch in "${ARCHS_ARRAY[@]}"; do
-                    # Compose scenario name from parameters
-                    scen_name="${RES}_lat-${LATENCY_MODE}"
+                    for BW_MODE in "${SEND_BW_ARRAY[@]}"; do
+                        # Compose scenario name from parameters
+                        scen_name="${RES}_lat-${LATENCY_MODE}_bw-${BW_MODE}"
 
-                    # Choose input file: use 4K file for large resolutions as before
-                    if [ "${RES}" = "3840x2160" ] || [ "${RES}" = "1920x1080" ]; then
-                        input_file="${INPUT_FILE_4K}"
-                    else
-                        input_file="${INPUT_FILE_720}"
-                    fi
+                        # Choose input file: use 4K file for large resolutions as before
+                        if [ "${RES}" = "3840x2160" ] || [ "${RES}" = "1920x1080" ]; then
+                            input_file="${INPUT_FILE_4K}"
+                        else
+                            input_file="${INPUT_FILE_720}"
+                        fi
 
-                    run_scenario "$RES" "$arch" "$clients" "$DOWNLOAD_BW" "$SEND_BW_MODE" "$LATENCY_MODE" "$VIEW" "$input_file" "$RUN_COUNT"
+                        run_scenario "$RES" "$arch" "$clients" "$DOWNLOAD_BW" "$BW_MODE" "$LATENCY_MODE" "$VIEW" "$input_file" "$RUN_COUNT"
+                    done
                 done
             done
         done

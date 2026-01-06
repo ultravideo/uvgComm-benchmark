@@ -118,6 +118,13 @@ format_duration_hms() {
     printf "%d days %d hours %d minutes %d seconds" "$days" "$hours" "$minutes" "$seconds"
 }
 
+# Small extra time added to the countdown to avoid cleaning up a run while the
+# host script is still finishing. Scales slightly with client count.
+timer_margin_ms() {
+    local clients="$1"
+    echo $((3000 + clients * 1000))
+}
+
 parse_args() {
     while getopts ":r:c:a:s:w:v:e:l:b:h" opt; do
         case ${opt} in
@@ -723,9 +730,10 @@ countdown_timer() {
     local warmup_time_ms=$4
     local experiment_time_ms=$5
     local cooldown_time_ms=$6
+    local margin_ms=${7:-0}
 
     # Total duration in ms
-    local total_duration_ms=$((setup_time_ms + warmup_time_ms + experiment_time_ms + cooldown_time_ms))
+    local total_duration_ms=$((setup_time_ms + warmup_time_ms + experiment_time_ms + cooldown_time_ms + margin_ms))
 
     CPU_LOG="${output_location}/cpu_usage.csv"
     echo "timestamp_ms;cpu_percent" > "$CPU_LOG"
@@ -998,6 +1006,7 @@ run_scenario() {
         local warmup_time_ms=$(( WARMUP_TIME * 1000 ))
         local experiment_time_ms=$(( EXPERIMENT_TIME * 1000 ))
         local cooldown_time_ms=$(( COOLDOWN_TIME * 1000 ))
+        local margin_ms=$(timer_margin_ms "$CLIENTS")
 
         local experiment_start_ms=$((current_time_ms + setup_time_ms + warmup_time_ms))
         local experiment_end_ms=$((experiment_start_ms + experiment_time_ms))
@@ -1023,7 +1032,7 @@ run_scenario() {
         # Start bandwidth monitor (polling interval 1s) - writes per-container CSVs
         start_bandwidth_monitor "$run_output_folder" 1
 
-        countdown_timer "$run_output_folder" "$current_time_ms" "$setup_time_ms" "$warmup_time_ms" "$experiment_time_ms" "$cooldown_time_ms"
+        countdown_timer "$run_output_folder" "$current_time_ms" "$setup_time_ms" "$warmup_time_ms" "$experiment_time_ms" "$cooldown_time_ms" "$margin_ms"
 
         # Stop bandwidth monitor and collect logs
         stop_bandwidth_monitor
@@ -1089,7 +1098,7 @@ num_views=${#VIEW_MODES_ARRAY[@]}
 num_bw_modes=${#SEND_BW_ARRAY[@]}
 
 for clients in ${CLIENTS_LIST//,/ } ; do
-    per_run_ms=$(( clients * WAIT_AFTER_INVITE * 1000 + WAIT_AFTER_SETTINGS * 1000 + WARMUP_TIME * 1000 + EXPERIMENT_TIME * 1000 + COOLDOWN_TIME * 1000 ))
+    per_run_ms=$(( clients * WAIT_AFTER_INVITE * 1000 + WAIT_AFTER_SETTINGS * 1000 + WARMUP_TIME * 1000 + EXPERIMENT_TIME * 1000 + COOLDOWN_TIME * 1000 + $(timer_margin_ms "$clients") ))
     total_ms=$(( total_ms + per_run_ms * RUN_COUNT * num_resolutions * num_arch * num_latency_modes * num_views * num_bw_modes ))
 done
 

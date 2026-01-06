@@ -101,6 +101,23 @@ Options:
 EOF
 }
 
+format_duration_hms() {
+    # Usage: format_duration_hms <total_seconds>
+    # Outputs: "X days Y hours Z minutes W seconds"
+    local total_seconds="$1"
+    # guard against empty/non-numeric input
+    if ! [[ "${total_seconds}" =~ ^[0-9]+$ ]]; then
+        echo "0 days 0 hours 0 minutes 0 seconds"
+        return 0
+    fi
+
+    local days=$(( total_seconds / 86400 ))
+    local hours=$(( (total_seconds % 86400) / 3600 ))
+    local minutes=$(( (total_seconds % 3600) / 60 ))
+    local seconds=$(( total_seconds % 60 ))
+    printf "%d days %d hours %d minutes %d seconds" "$days" "$hours" "$minutes" "$seconds"
+}
+
 parse_args() {
     while getopts ":r:c:a:s:w:v:e:l:b:h" opt; do
         case ${opt} in
@@ -336,6 +353,20 @@ write_metadata() {
     } > "$metadata_file"
 
     echo "Metadata written successfully."
+}
+
+write_run_parameters() {
+    # Minimal, quick-glance run parameters file (CLI + a couple of basics)
+    local out_file="${RUN_FOLDER}/run_params.txt"
+    mkdir -p "${RUN_FOLDER}"
+
+    {
+        echo "cmd: ${ORIGINAL_CMDLINE-}"
+        echo "opts: RUN_COUNT=${RUN_COUNT} CLIENTS_LIST=${CLIENTS_LIST} ARCHS=${ARCHS} RESOLUTIONS=${RESOLUTIONS} VIEW_MODE=${VIEW_MODE} VISIBLE_PARTICIPANTS=${VISIBLE_PARTICIPANTS} EXPERIMENT_TIME=${EXPERIMENT_TIME} LATENCY_MODES=${LATENCY_MODES} SEND_BW_MODE=${SEND_BW_MODE}"
+        echo "inputs: 720=${INPUT_FILE_720} 4k=${INPUT_FILE_4K}"
+        echo "estimated_total: ${total_hms:-unknown}"
+        echo "start_ms: ${GLOBAL_START_MS-}"
+    } > "${out_file}"
 }
 
 generate_usernames() {
@@ -604,7 +635,7 @@ create_host_script() {
         echo "wait $wait_after_invite" >> "$output_file"
     done < "$USERS_FILE"
 
-    # Wait remaining warmup period
+    # Warmup period (after all clients have been invited)
     # Convert milliseconds to seconds (round down)
     local warmup_s=$((warmup_duration_ms / 1000))
     echo "wait $warmup_s" >> "$output_file"
@@ -629,13 +660,16 @@ create_host() {
     local clients="$3"
     local resolution="$4"
     local download_bw="$5"
-    local setup_time="$6"
-    local warmup_time="$7"
-    local experiment_time="$8"
-    local cooldown_time=${9}
+    local warmup_time_ms="$6"
+    local experiment_time_ms="$7"
+    local cooldown_time_ms="$8"
+    local latency_mode_param="${9:-}"
     mkdir -p "$(dirname "${script_file}")"
 
-    create_host_script "${script_file}" "${architecture}" "${clients}" "${resolution}" "${download_bw}" "${setup_time}" "${warmup_time}" "${experiment_time}" "${cooldown_time}"
+    # Note: create_host_script already accounts for the setup phase via
+    # WAIT_AFTER_SETTINGS and WAIT_AFTER_INVITE waits. We only pass the actual
+    # warmup/experiment/cooldown durations here.
+    create_host_script "${script_file}" "${architecture}" "${clients}" "${resolution}" "${download_bw}" "${warmup_time_ms}" "${experiment_time_ms}" "${cooldown_time_ms}"
 
     local SFU_CPUSET="0"
     local SFU_CPUS=""
@@ -662,9 +696,8 @@ create_host() {
     docker exec "$HOST_NAME" sh -c 'sysctl -w net.core.netdev_max_backlog=250000' 2>/dev/null || true
 
     # apply in-container host/SFU latency if requested
-    local LATENCY_MODE_PARAM="${10:-}"
-    if [ -n "${LATENCY_MODE_PARAM}" ] && [ "${LATENCY_MODE_PARAM}" != "none" ]; then
-        local LATENCY_FILE="${RUN_FOLDER}/latencies_${LATENCY_MODE_PARAM}.txt"
+    if [ -n "${latency_mode_param}" ] && [ "${latency_mode_param}" != "none" ]; then
+        local LATENCY_FILE="${RUN_FOLDER}/latencies_${latency_mode_param}.txt"
         if [ -f "$LATENCY_FILE" ]; then
             host_lat=$(sed -n '1p' "$LATENCY_FILE" 2>/dev/null || echo "")
         else
@@ -982,7 +1015,7 @@ run_scenario() {
              "$run_output_folder" "$experiment_start_ms" "$experiment_end_ms" "$run_index"
 
         # Create host first so it is ready when clients call in sequence.
-        create_host "$run_output_folder" "$ARCHITECTURE" "$CLIENTS" "$RESOLUTION" "$DOWNLOAD_BW" "$setup_time_ms" "$warmup_time_ms" "$experiment_time_ms" "$cooldown_time_ms" "$LATENCY_MODE_PARAM"
+        create_host "$run_output_folder" "$ARCHITECTURE" "$CLIENTS" "$RESOLUTION" "$DOWNLOAD_BW" "$warmup_time_ms" "$experiment_time_ms" "$cooldown_time_ms" "$LATENCY_MODE_PARAM"
 
         generate_client_configs "${UPLOAD_MODE}" "${VIEW_MODE}" "${CLIENTS}" || true
         create_clients "$CLIENTS" "$INPUT_FILE" "$run_output_folder" "$LATENCY_MODE_PARAM"
@@ -1021,6 +1054,12 @@ cleanup() {
 cleanup # make sure the containers don't exist
 trap cleanup EXIT # remove containers if this script crashes
 
+# Capture the original CLI invocation (best-effort, shell-escaped)
+ORIGINAL_CMDLINE="$0"
+for _arg in "$@"; do
+    ORIGINAL_CMDLINE+=" $(printf '%q' "${_arg}")"
+done
+
 # Parse CLI args (if any) to override defaults/env
 parse_args "$@"
 
@@ -1055,11 +1094,7 @@ for clients in ${CLIENTS_LIST//,/ } ; do
 done
 
 total_seconds=$(( total_ms / 1000 ))
-days=$(( total_seconds / 86400 ))
-hours=$(( (total_seconds % 86400) / 3600 ))
-minutes=$(( (total_seconds % 3600) / 60 ))
-seconds=$(( total_seconds % 60 ))
-printf -v total_hms "%d days %d hours %d minutes %d seconds" "$days" "$hours" "$minutes" "$seconds"
+total_hms=$(format_duration_hms "$total_seconds")
 echo "Estimated total run time (at least): ${total_hms}"
 
 # Ask for confirmation before preparing tests so the user can abort after
@@ -1078,6 +1113,10 @@ else
 fi
 
 prepare_tests # prepares test files and creates network
+
+# Record start timestamp for the overall run and write the minimal params file
+GLOBAL_START_MS=$(date +%s%3N)
+write_run_parameters
 ulimit -c unlimited # in case experiment crashes
 
 # Iterate latency modes (if any), resolutions, client counts and architectures
@@ -1117,4 +1156,20 @@ for LATENCY_MODE in "${LATENCY_RUNS[@]}"; do
 done
 
 # Cleanup will be triggered automatically by trap
+END_MS=$(date +%s%3N)
+if [ -n "${GLOBAL_START_MS-}" ]; then
+    elapsed_ms=$((END_MS - GLOBAL_START_MS))
+    elapsed_s=$((elapsed_ms / 1000))
+    actual_hms=$(format_duration_hms "$elapsed_s")
+
+    params_file="${RUN_FOLDER}/run_params.txt"
+    if [ -f "${params_file}" ]; then
+        {
+            echo "end_ms: ${END_MS}"
+            echo "actual_total: ${actual_hms}"
+            echo "actual_total_ms: ${elapsed_ms}"
+        } >> "${params_file}"
+    fi
+fi
+
 echo "Experiment finished"

@@ -1053,6 +1053,14 @@ run_scenario() {
         stop_bandwidth_monitor
         record_container_logs "$run_output_folder"
         cleanup
+
+        # Update and print global progress (one line per completed run)
+        COMPLETED_RUNS=$((COMPLETED_RUNS + 1))
+        now_ms=$(date +%s%3N)
+        elapsed_s=$(( (now_ms - GLOBAL_START_MS) / 1000 ))
+        elapsed_hms=$(format_duration_hms "$elapsed_s")
+        echo "Progress: ${COMPLETED_RUNS}/${TOTAL_RUNS} — Elapsed: ${elapsed_hms} — Estimated total: ${total_hms}"
+
     done
 }
 
@@ -1142,6 +1150,10 @@ prepare_tests # prepares test files and creates network
 GLOBAL_START_MS=$(date +%s%3N)
 write_run_parameters
 ulimit -c unlimited # in case experiment crashes
+
+# Compute total number of scenario runs for progress reporting
+TOTAL_RUNS=$(( num_latency_modes * num_resolutions * num_views * ${#CLIENTS_ARRAY[@]} * num_arch * num_bw_modes * RUN_COUNT ))
+COMPLETED_RUNS=0
 
 # Iterate latency modes (if any), resolutions, client counts and architectures
 if [ -n "${LATENCY_MODES}" ]; then

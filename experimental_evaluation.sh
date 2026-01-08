@@ -833,6 +833,7 @@ start_bandwidth_monitor() {
         # Initialize CSVs and read initial counters
         prev_rx=()
         prev_tx=()
+        net_ifs=()
         for idx in "${!containers[@]}"; do
             c=${containers[$idx]}
             mkdir -p "${output_location}/${c}"
@@ -855,6 +856,9 @@ start_bandwidth_monitor() {
                 net_if="eth0"
             fi
 
+            # store detected interface per-container for later polling
+            net_ifs[$idx]="$net_if"
+
             rx=$(docker exec "$c" cat /sys/class/net/${net_if}/statistics/rx_bytes 2>/dev/null || echo 0)
             tx=$(docker exec "$c" cat /sys/class/net/${net_if}/statistics/tx_bytes 2>/dev/null || echo 0)
             prev_rx[$idx]=$rx
@@ -866,18 +870,29 @@ start_bandwidth_monitor() {
             now_ms=$(date +%s%3N)
             for idx in "${!containers[@]}"; do
                 c=${containers[$idx]}
-                rx=$(docker exec "$c" cat /sys/class/net/eth0/statistics/rx_bytes 2>/dev/null || echo 0)
-                tx=$(docker exec "$c" cat /sys/class/net/eth0/statistics/tx_bytes 2>/dev/null || echo 0)
+                net_if=${net_ifs[$idx]:-eth0}
+                rx=$(docker exec "$c" cat /sys/class/net/${net_if}/statistics/rx_bytes 2>/dev/null || true)
+                tx=$(docker exec "$c" cat /sys/class/net/${net_if}/statistics/tx_bytes 2>/dev/null || true)
+
+                # If container failed/stopped, exit the monitor
+                if [[ ! "$rx" =~ ^[0-9]+$ ]] || [[ ! "$tx" =~ ^[0-9]+$ ]]; then
+                    echo "ERROR: Container $c failed at ${now_ms}. Exiting bandwidth monitor." | tee -a "$BW_MONITOR_LOG" >&2
+                    break 2
+                fi
 
                 prx=${prev_rx[$idx]:-0}
                 ptx=${prev_tx[$idx]:-0}
-
                 drx=$((rx - prx))
                 dtx=$((tx - ptx))
 
                 # bytes per second (approx). If interval >1, this is averaged.
-                rx_bps=$(( drx / (interval>0?interval:1) )) || rx_bps=0
-                tx_bps=$(( dtx / (interval>0?interval:1) )) || tx_bps=0
+                interval_s=${interval:-1}
+                if [[ ! "$interval_s" =~ ^[0-9]+$ ]] || [ "$interval_s" -le 0 ]; then
+                    interval_s=1;
+                fi
+
+                rx_bps=$(( drx / interval_s ))
+                tx_bps=$(( dtx / interval_s ))
 
                 echo "${now_ms};${rx};${tx};${rx_bps};${tx_bps}" >> "${output_location}/${c}/bandwidth.csv"
 

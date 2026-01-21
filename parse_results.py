@@ -26,6 +26,7 @@ import matplotlib
 import numpy as np
 import concurrent.futures
 from collections import defaultdict
+from itertools import groupby
 
 # Use non-interactive backend for matplotlib
 matplotlib.use("Agg")
@@ -367,6 +368,16 @@ def analyze_run(run_path):
     metrics = {}
     metadata = parse_metadata(os.path.join(run_path, 'metadata.txt'))
     metrics['metadata'] = metadata
+    # Determine visible participants limit from metadata (if present).
+    visible_limit = None
+    for vk in ('Visible_Participants', 'VisibleParticipants', 'Visible', 'VisibleCount'):
+        if vk in metadata:
+            try:
+                visible_limit = int(metadata[vk])
+            except Exception:
+                visible_limit = None
+            break
+    metrics['visible_participants'] = visible_limit
 
     # CPU usage
     cpu_file = os.path.join(run_path, 'cpu_usage.csv')
@@ -409,6 +420,17 @@ def analyze_run(run_path):
     # bandwidth parsing by combining them into `bandwidth_folders` below.
     client_folders = sorted([p for p in glob.glob(os.path.join(run_path, 'uvgcomm-client*')) if os.path.isdir(p)])
     host_folders = sorted([p for p in glob.glob(os.path.join(run_path, 'uvgcomm-host')) if os.path.isdir(p)])
+    # If a visible participants limit is present, filter client folders so only
+    # clients with numeric id <= visible_limit contribute to per-client metrics.
+    if metrics.get('visible_participants') is not None:
+        vl = metrics['visible_participants']
+        def _keep_client(folder):
+            try:
+                num = _extract_client_num_from_folder(folder)
+                return (num is None) or (num <= vl)
+            except Exception:
+                return True
+        client_folders = [c for c in client_folders if _keep_client(c)]
     # combined list used for measured bandwidth parsing (clients + host)
     bandwidth_folders = client_folders + host_folders
 
@@ -1055,6 +1077,28 @@ def collect_presence_records_for_run(run_path, arch, participants):
     """
     records = []
     client_folders = sorted([p for p in glob.glob(os.path.join(run_path, 'uvgcomm-client*')) if os.path.isdir(p)])
+    # Respect visible participants limit from run metadata if present so
+    # diagnostics/presence records match analysis filtering.
+    try:
+        meta = parse_metadata(os.path.join(run_path, 'metadata.txt'))
+        visible_limit = None
+        for vk in ('Visible_Participants', 'VisibleParticipants', 'Visible', 'VisibleCount'):
+            if vk in meta:
+                try:
+                    visible_limit = int(meta[vk])
+                except Exception:
+                    visible_limit = None
+                break
+        if visible_limit is not None:
+            def _keep(folder):
+                try:
+                    num = _extract_client_num_from_folder(folder)
+                    return (num is None) or (num <= visible_limit)
+                except Exception:
+                    return True
+            client_folders = [c for c in client_folders if _keep(c)]
+    except Exception:
+        pass
     for idx, cf in enumerate(client_folders, start=1):
         client_num = _extract_client_num_from_folder(cf) or idx
         local_paths = glob.glob(os.path.join(cf, 'local_*.csv'))
@@ -1104,26 +1148,29 @@ def accumulate_run_results(metrics, arch, participants, run_path,
 
     Mirrors the original inlined logic.
     """
-    cpu_results[arch].append((participants, metrics.get('cpu_avg')))
+    # Use visible participants limit when present so aggregated rows/plots
+    # reflect only the visible senders. Fall back to the provided participants value.
+    parts_eff = metrics.get('visible_participants', participants)
+    cpu_results[arch].append((parts_eff, metrics.get('cpu_avg')))
 
     # PSNR per run - we have avg_psnr and count. Keep mean and std as single-run values.
     psnr_val = metrics.get('avg_psnr')
     if psnr_val is not None:
-        if participants not in psnr_stats[arch]:
-            psnr_stats[arch][participants] = []
-        psnr_stats[arch][participants].append(psnr_val)
+        if parts_eff not in psnr_stats[arch]:
+            psnr_stats[arch][parts_eff] = []
+        psnr_stats[arch][parts_eff].append(psnr_val)
 
     # missing frames summary appended (attach client_num inferred from receiver_folder)
     for m in metrics.get('missing_summary', []):
         row = dict(m)
         sender_num = _extract_client_num_from_folder(m.get('local_folder'))
         receiver_num = _extract_client_num_from_folder(m.get('receiver_folder'))
-        row.update({'arch': arch, 'participants': participants, 'run_path': run_path,
-                    'sender_client_num': sender_num, 'receiver_client_num': receiver_num})
+        row.update({'arch': arch, 'participants': parts_eff, 'run_path': run_path,
+                'sender_client_num': sender_num, 'receiver_client_num': receiver_num})
         missing_rows.append(row)
 
     # resolution/frame size + bitrates
-    row_rs = {'arch': arch, 'participants': participants, 'avg_width': metrics.get('avg_width'),
+    row_rs = {'arch': arch, 'participants': parts_eff, 'avg_width': metrics.get('avg_width'),
               'avg_height': metrics.get('avg_height'), 'avg_frame_size': metrics.get('avg_frame_size'),
               'outgoing_bps': metrics.get('outgoing_bps'), 'incoming_bps': metrics.get('incoming_bps')}
     resolution_rows.append(row_rs)
@@ -1131,7 +1178,7 @@ def accumulate_run_results(metrics, arch, participants, run_path,
     # Measured bandwidth collected from per-container monitoring (clients vs host)
     measured_row = {
         'arch': arch,
-        'participants': participants,
+        'participants': parts_eff,
         'measured_outgoing_bps_clients': metrics.get('measured_outgoing_bps_per_client'),
         'measured_incoming_bps_clients': metrics.get('measured_incoming_bps_per_client'),
         'measured_outgoing_bps_host': metrics.get('measured_host_outgoing_bps'),
@@ -1140,7 +1187,7 @@ def accumulate_run_results(metrics, arch, participants, run_path,
     measured_rows.append(measured_row)
 
     # latency/encode/decode
-    latency_rows.append({'arch': arch, 'participants': participants,
+    latency_rows.append({'arch': arch, 'participants': parts_eff,
                          'avg_latency_ms': metrics.get('avg_latency_ms'),
                          'avg_encode_ms': metrics.get('avg_encode_ms'),
                          'avg_decode_ms': metrics.get('avg_decode_ms')})
@@ -1151,7 +1198,7 @@ def accumulate_run_results(metrics, arch, participants, run_path,
         # union of client keys
         keys = set(list(me.keys()) + list(md.keys()))
         for k in keys:
-            client_max_rows.append({'arch': arch, 'participants': participants, 'run_path': run_path,
+            client_max_rows.append({'arch': arch, 'participants': parts_eff, 'run_path': run_path,
                                      'client_num': k, 'max_encode_ms': me.get(k), 'max_decode_ms': md.get(k)})
     except Exception:
         pass
@@ -1453,6 +1500,78 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
             fig.savefig(bar_out)
             plt.close(fig)
             print('Wrote placeholder latency breakdown plot to', bar_out)
+
+        # --- Simple line graph: mean_total per architecture vs participants ---
+        try:
+            if agg_rows:
+                # Build mean/std DataFrames similar to PSNR plotting helper
+                participants_idx = sorted({int(r['participants']) for r in agg_rows})
+                mean_df = pd.DataFrame(index=participants_idx)
+                std_df = pd.DataFrame(index=participants_idx)
+                arch_keys = sorted({r['arch'] for r in agg_rows})
+                for arch in arch_keys:
+                    vals_map = {int(r['participants']): float(r['mean_total']) for r in agg_rows if r['arch'] == arch}
+                    means = []
+                    stds = []
+                    for n in participants_idx:
+                        v = vals_map.get(n)
+                        if v is None:
+                            means.append(np.nan)
+                            stds.append(np.nan)
+                        else:
+                            means.append(v)
+                            stds.append(0.0)
+                    mean_df[arch] = means
+                    std_df[arch] = stds
+
+                # Plot with shading for std (mirrors plot_psnr style)
+                fig, ax = plt.subplots(figsize=(8,4))
+                markers = ['o', 's', '^', 'D', 'v', 'P', 'X', '*']
+                cmap = get_color_map(mean_df.columns)
+                for i, col in enumerate(mean_df.columns):
+                    y = mean_df[col]
+                    ax.plot(mean_df.index, y, marker=markers[i % len(markers)], label=col, color=cmap.get(col))
+                    if col in std_df.columns:
+                        std = std_df[col].fillna(0)
+                        try:
+                            ax.fill_between(mean_df.index, (y - std), (y + std), alpha=0.15, color=cmap.get(col))
+                        except Exception:
+                            pass
+                ax.set_xlabel('Number of Participants')
+                ax.set_ylabel('Mean Total Latency (ms)')
+                ax.set_title('Mean Total Latency - aggregated runs')
+                ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
+                try:
+                    xt = [int(x) for x in mean_df.index]
+                    ax.set_xticks(xt)
+                except Exception:
+                    pass
+                # enforce y-axis starting at zero; compute automatic upper bound from mean+std
+                try:
+                    combined = (mean_df.fillna(0) + std_df.fillna(0)).values
+                    max_val = float(np.nanmax(combined)) if combined.size else None
+                except Exception:
+                    max_val = None
+                if max_val is not None and max_val > 0:
+                    ax.set_ylim(0, max(max_val * 1.05, 1.0))
+                else:
+                    ax.set_ylim(0, 1)
+                ax.legend(prop={'size': 10})
+                plt.tight_layout()
+                line_out = os.path.join(ANALYSIS_FOLDER, 'latency_totals_line.svg')
+                fig.savefig(line_out)
+                plt.close(fig)
+                print('Wrote latency totals line plot to', line_out)
+            else:
+                fig, ax = plt.subplots(figsize=(6,3))
+                ax.text(0.5, 0.5, 'No latency totals available to plot', ha='center', va='center')
+                ax.axis('off')
+                line_out = os.path.join(ANALYSIS_FOLDER, 'latency_totals_line.svg')
+                fig.savefig(line_out)
+                plt.close(fig)
+                print('Wrote placeholder latency totals line plot to', line_out)
+        except Exception as e:
+            print('Failed to create latency totals line plot:', e)
     except Exception as e:
         print('Failed to create latency breakdown plot:', e)
 

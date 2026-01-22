@@ -478,8 +478,9 @@ def analyze_run(run_path):
     metrics['local_by_cname'] = local_by_cname
     metrics['participant_by_cname'] = participant_by_cname
 
-    # PSNR: assume PSNR_Y column exists; if not, emit an error message
+    # PSNR: collect per-client PSNR and overall average
     psnr_values = []
+    psnr_per_client = []
     for cname, info in local_by_cname.items():
         df = info['df']
         if df is None:
@@ -488,9 +489,15 @@ def analyze_run(run_path):
             print(f"ERROR: missing PSNR_Y column for local trace {info.get('path')}")
             continue
         vals = pd.to_numeric(df['PSNR_Y'], errors='coerce').dropna().tolist()
-        psnr_values.extend(vals)
+        if vals:
+            mean_psnr = float(np.mean(vals))
+            client_folder = info.get('client_folder')
+            client_num = _extract_client_num_from_folder(client_folder)
+            psnr_per_client.append({'client_folder': client_folder, 'client_num': client_num, 'mean_psnr': mean_psnr})
+            psnr_values.extend(vals)
     metrics['avg_psnr'] = float(np.mean(psnr_values)) if psnr_values else None
     metrics['psnr_count'] = len(psnr_values)
+    metrics['psnr_per_client'] = psnr_per_client
 
     # Frame sizes and resolution stats from local frames
     sizes = []
@@ -554,7 +561,11 @@ def analyze_run(run_path):
     in_total_bytes = 0
     in_min_ts = None
     in_max_ts = None
+    # per-sender latency means (collect mean latency for each sender cname)
+    latency_per_sender = []
     for cname, plist in participant_by_cname.items():
+        # collect latency values across all receivers for this sender
+        sender_lvals = []
         for info in plist:
             df = info['df']
             if df is None:
@@ -562,6 +573,10 @@ def analyze_run(run_path):
             lvals, _ = extract_numeric_list(df, ['Latency(ms)', 'Latency', 'latency'], dtype=float)
             if lvals:
                 latencies.extend(lvals)
+                try:
+                    sender_lvals.extend([float(x) for x in lvals])
+                except Exception:
+                    pass
 
             dvals, _ = extract_numeric_list(df, ['DecodeTime(ms)', 'DecodeTime', 'DecodeTimeMs'], dtype=float)
             if dvals:
@@ -588,6 +603,19 @@ def analyze_run(run_path):
                 in_min_ts = mn_ts if in_min_ts is None else min(in_min_ts, mn_ts)
             if mx_ts is not None:
                 in_max_ts = mx_ts if in_max_ts is None else max(in_max_ts, mx_ts)
+
+        # compute mean latency for this sender (across all receivers)
+        if sender_lvals:
+            try:
+                mean_sender_lat = float(np.mean(sender_lvals))
+            except Exception:
+                mean_sender_lat = None
+            sender_folder = None
+            if cname in local_by_cname:
+                sender_folder = local_by_cname.get(cname, {}).get('client_folder')
+            sender_num = _extract_client_num_from_folder(sender_folder)
+            if mean_sender_lat is not None:
+                latency_per_sender.append({'client_folder': sender_folder, 'client_num': sender_num, 'mean_latency_ms': mean_sender_lat})
 
     # compute outgoing/incoming average bitrates (bps) using collected bytes and timestamp ranges
     # Prefer using the run metadata window (Start_Timestamp..End_timestamp) to avoid including
@@ -634,11 +662,14 @@ def analyze_run(run_path):
 
     # Parse measured bandwidth using helper (separate client vs host). Pass
     # both client and host folders so host metrics are still captured.
-    c_out_bps_meas, c_in_bps_meas, h_out_bps_meas, h_in_bps_meas = parse_measured_bandwidth(bandwidth_folders, start_ts, end_ts)
+    c_out_bps_meas, c_in_bps_meas, h_out_bps_meas, h_in_bps_meas, per_client_bandwidth = parse_measured_bandwidth(bandwidth_folders, start_ts, end_ts)
     metrics['measured_outgoing_bps_per_client'] = c_out_bps_meas
     metrics['measured_incoming_bps_per_client'] = c_in_bps_meas
     metrics['measured_host_outgoing_bps'] = h_out_bps_meas
     metrics['measured_host_incoming_bps'] = h_in_bps_meas
+    metrics['measured_outgoing_bps_per_client_list'] = per_client_bandwidth
+    # attach per-sender latency means for speaker vs listeners analysis
+    metrics['latency_per_sender'] = latency_per_sender
 
     return metrics
 
@@ -694,6 +725,7 @@ def parse_measured_bandwidth(client_folders, start_ts=None, end_ts=None):
     measured_in_clients = []
     measured_out_host = []
     measured_in_host = []
+    per_client_bandwidth = []
     try:
         for cfolder in client_folders:
             bw_path = os.path.join(cfolder, 'bandwidth.csv')
@@ -770,6 +802,12 @@ def parse_measured_bandwidth(client_folders, start_ts=None, end_ts=None):
                     measured_in_clients.append(rx_mean)
                 if tx_mean is not None:
                     measured_out_clients.append(tx_mean)
+                # record per-client measured values for later first-vs-others analysis
+                try:
+                    client_num = _extract_client_num_from_folder(cfolder)
+                except Exception:
+                    client_num = None
+                per_client_bandwidth.append({'client_folder': cfolder, 'client_num': client_num, 'tx_bps': tx_mean, 'rx_bps': rx_mean})
     except Exception:
         pass
 
@@ -777,7 +815,7 @@ def parse_measured_bandwidth(client_folders, start_ts=None, end_ts=None):
     c_in_mean = float(np.mean(measured_in_clients)) if measured_in_clients else None
     h_out_mean = float(np.mean(measured_out_host)) if measured_out_host else None
     h_in_mean = float(np.mean(measured_in_host)) if measured_in_host else None
-    return c_out_mean, c_in_mean, h_out_mean, h_in_mean
+    return c_out_mean, c_in_mean, h_out_mean, h_in_mean, per_client_bandwidth
 
 
 def plot_psnr(mean_df, std_df, analysis_folder, scenario):
@@ -807,6 +845,136 @@ def plot_psnr(mean_df, std_df, analysis_folder, scenario):
     plt.savefig(out)
     plt.close()
     print('Saved PSNR plot:', out)
+
+
+def plot_psnr_speaker_vs_listeners(psnr_speaker_stats, psnr_listeners_stats, analysis_folder, scenario):
+    """Plot mean PSNR for speaker client vs average of other visible clients."""
+    try:
+        mean_speaker, std_speaker = build_psnr_dfs(psnr_speaker_stats)
+        mean_listeners, std_listeners = build_psnr_dfs(psnr_listeners_stats)
+        plt.figure(figsize=(6,4))
+        markers = ['o', 's', '^', 'D', 'v', 'P', 'X']
+        all_archs = sorted(set(list(mean_speaker.columns) + list(mean_listeners.columns)))
+        cmap = get_color_map(all_archs)
+        for i, arch in enumerate(all_archs):
+            color = cmap.get(arch)
+            mk = markers[i % len(markers)]
+            # first: solid line, filled marker
+            if arch in mean_speaker.columns:
+                plt.plot(mean_speaker.index, mean_speaker[arch], marker=mk, markersize=8, linewidth=2.0, markeredgewidth=1.4, linestyle='-', label=f'{arch} (speaker)', color=color)
+                if arch in std_speaker.columns:
+                    plt.fill_between(mean_speaker.index, mean_speaker[arch] - std_speaker[arch], mean_speaker[arch] + std_speaker[arch], alpha=0.16, color=color)
+            # others: dashed line, open marker
+            if arch in mean_listeners.columns:
+                plt.plot(mean_listeners.index, mean_listeners[arch], marker=mk, markersize=8, linewidth=2.0, markeredgewidth=1.4, markerfacecolor='none', linestyle='--', label=f'{arch} (listeners)', color=color)
+                if arch in std_listeners.columns:
+                    plt.fill_between(mean_listeners.index, mean_listeners[arch] - std_listeners[arch], mean_listeners[arch] + std_listeners[arch], alpha=0.10, color=color)
+        plt.xlabel('Number of Participants')
+        plt.ylabel('PSNR (Y)')
+        plt.title(f'PSNR: Speaker vs Listeners - {scenario}')
+        plt.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
+        plt.ylim(0, 50)
+        plt.legend(prop={'size': 9})
+        # force x-axis to whole numbers (participants)
+        try:
+            idx = sorted(set(list(mean_speaker.index) + list(mean_listeners.index)))
+            xt = [int(x) for x in idx]
+            plt.xticks(xt)
+        except Exception:
+            pass
+        plt.tight_layout()
+        out = os.path.join(analysis_folder, 'psnr_speaker_vs_listeners.svg')
+        plt.savefig(out)
+        plt.close()
+        print('Saved PSNR speaker-vs-listeners plot:', out)
+    except Exception as e:
+        print('Failed to create PSNR speaker-vs-listeners plot:', e)
+
+def plot_measured_bandwidth_speaker_vs_listeners(measured_speaker_stats, measured_listeners_stats, analysis_folder, scenario):
+    """Plot measured outgoing bandwidth (Mbps) for speaker client vs avg of others."""
+    try:
+        # build participants idx
+        idx = sorted({n for arch in measured_speaker_stats for n in measured_speaker_stats[arch]} | {n for arch in measured_listeners_stats for n in measured_listeners_stats[arch]})
+        if not idx:
+            return
+        fig, ax = plt.subplots(figsize=(8,4))
+        markers = ['o', 's', '^', 'D', 'v', 'P', 'X']
+        cmap = get_color_map(sorted(set(list(measured_speaker_stats.keys()) + list(measured_listeners_stats.keys()))))
+        for i, arch in enumerate(sorted(set(list(measured_speaker_stats.keys()) + list(measured_listeners_stats.keys())))):
+            speaker_means = []
+            listeners_means = []
+            for n in idx:
+                fvals = measured_speaker_stats.get(arch, {}).get(n, [])
+                rvals = measured_listeners_stats.get(arch, {}).get(n, [])
+                speaker_means.append(float(np.mean(fvals))/1e6 if fvals else np.nan)
+                listeners_means.append(float(np.mean(rvals))/1e6 if rvals else np.nan)
+            x = idx
+            color = cmap.get(arch)
+            mk = markers[i % len(markers)]
+            # speaker: solid, filled marker
+            ax.plot(x, speaker_means, marker=mk, markersize=7, linewidth=2.0, markeredgewidth=1.2, linestyle='-', label=f'{arch} (speaker)', color=color)
+            # listeners: dashed, open marker
+            ax.plot(x, listeners_means, marker=mk, markersize=7, linewidth=2.0, markeredgewidth=1.2, markerfacecolor='none', linestyle='--', label=f'{arch} (listeners)', color=color)
+        ax.set_xlabel('Participants')
+        ax.set_ylabel('Measured Outgoing Bandwidth (Mbps)')
+        ax.set_title(f'Measured Bandwidth: Speaker vs Listeners - {scenario}')
+        ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
+        try:
+            ax.set_xticks(idx)
+        except Exception:
+            pass
+        ax.legend(fontsize=8)
+        plt.tight_layout()
+        out = os.path.join(analysis_folder, 'measured_bandwidth_speaker_vs_listeners.svg')
+        fig.savefig(out)
+        plt.close(fig)
+        print('Saved measured bandwidth speaker-vs-listeners plot:', out)
+    except Exception as e:
+        print('Failed to create measured bandwidth speaker-vs-listeners plot:', e)
+
+
+def plot_latency_speaker_vs_listeners(latency_speaker_stats, latency_listeners_stats, analysis_folder, scenario):
+    """Plot mean latency (ms) for speaker client vs average of other visible clients."""
+    try:
+        # reuse the build_psnr_dfs helper to construct mean/std DataFrames
+        mean_speaker, std_speaker = build_psnr_dfs(latency_speaker_stats)
+        mean_listeners, std_listeners = build_psnr_dfs(latency_listeners_stats)
+        plt.figure(figsize=(6,4))
+        markers = ['o', 's', '^', 'D', 'v', 'P', 'X']
+        all_archs = sorted(set(list(mean_speaker.columns) + list(mean_listeners.columns)))
+        cmap = get_color_map(all_archs)
+        for i, arch in enumerate(all_archs):
+            color = cmap.get(arch)
+            mk = markers[i % len(markers)]
+            # speaker: solid line, filled marker
+            if arch in mean_speaker.columns:
+                plt.plot(mean_speaker.index, mean_speaker[arch], marker=mk, markersize=8, linewidth=2.0, markeredgewidth=1.4, linestyle='-', label=f'{arch} (speaker)', color=color)
+                if arch in std_speaker.columns:
+                    plt.fill_between(mean_speaker.index, mean_speaker[arch] - std_speaker[arch], mean_speaker[arch] + std_speaker[arch], alpha=0.16, color=color)
+            # listeners: dashed line, open marker
+            if arch in mean_listeners.columns:
+                plt.plot(mean_listeners.index, mean_listeners[arch], marker=mk, markersize=8, linewidth=2.0, markeredgewidth=1.4, markerfacecolor='none', linestyle='--', label=f'{arch} (listeners)', color=color)
+                if arch in std_listeners.columns:
+                    plt.fill_between(mean_listeners.index, mean_listeners[arch] - std_listeners[arch], mean_listeners[arch] + std_listeners[arch], alpha=0.10, color=color)
+        plt.xlabel('Number of Participants')
+        plt.ylabel('Mean Total Latency (ms)')
+        plt.title(f'Latency: Speaker vs Listeners - {scenario}')
+        plt.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
+        plt.legend(prop={'size': 9})
+        # force integer x-ticks
+        try:
+            idx = sorted(set(list(mean_speaker.index) + list(mean_listeners.index)))
+            xt = [int(x) for x in idx]
+            plt.xticks(xt)
+        except Exception:
+            pass
+        plt.tight_layout()
+        out = os.path.join(analysis_folder, 'latency_speaker_vs_listeners.svg')
+        plt.savefig(out)
+        plt.close()
+        print('Saved latency speaker-vs-listeners plot:', out)
+    except Exception as e:
+        print('Failed to create latency speaker-vs-listeners plot:', e)
 
 
 def build_arch_map(scenario_folder):
@@ -1143,7 +1311,9 @@ def collect_presence_records_for_run(run_path, arch, participants):
 
 def accumulate_run_results(metrics, arch, participants, run_path,
                            cpu_results, psnr_stats, missing_rows, resolution_rows, latency_rows, measured_rows,
-                           client_max_rows):
+                           measured_speaker_stats, measured_listeners_stats, psnr_speaker_stats, psnr_listeners_stats,
+                           latency_speaker_stats=None, latency_listeners_stats=None,
+                           client_max_rows=None):
     """Accumulate per-run metrics into the provided containers (mutates lists/dicts).
 
     Mirrors the original inlined logic.
@@ -1159,6 +1329,36 @@ def accumulate_run_results(metrics, arch, participants, run_path,
         if parts_eff not in psnr_stats[arch]:
             psnr_stats[arch][parts_eff] = []
         psnr_stats[arch][parts_eff].append(psnr_val)
+
+    # Speaker-vs-listeners PSNR aggregation (per-client mean values collected in analyze_run)
+    try:
+        pclients = metrics.get('psnr_per_client') or []
+        if pclients:
+            # visible filtering: include clients with no numeric id or id <= parts_eff when parts_eff present
+            visible = [p for p in pclients if (parts_eff is None) or (p.get('client_num') is None) or (p.get('client_num') <= parts_eff)]
+            if visible:
+                # select first as speaker client: prefer client_num==1, else lowest numeric, else first entry
+                speaker = next((p for p in visible if p.get('client_num') == 1), None)
+                if speaker is None:
+                    numeric = [p for p in visible if p.get('client_num') is not None]
+                    if numeric:
+                        speaker = min(numeric, key=lambda x: x['client_num'])
+                    else:
+                        speaker = visible[0]
+                listeners = [p for p in visible if p is not speaker]
+                speaker_val = float(speaker.get('mean_psnr')) if speaker.get('mean_psnr') is not None else None
+                listeners_vals = [float(p.get('mean_psnr')) for p in listeners if p.get('mean_psnr') is not None]
+                listeners_mean = float(np.mean(listeners_vals)) if listeners_vals else None
+                if parts_eff not in psnr_speaker_stats[arch]:
+                    psnr_speaker_stats[arch][parts_eff] = []
+                if parts_eff not in psnr_listeners_stats[arch]:
+                    psnr_listeners_stats[arch][parts_eff] = []
+                if speaker_val is not None:
+                    psnr_speaker_stats[arch][parts_eff].append(speaker_val)
+                if listeners_mean is not None:
+                    psnr_listeners_stats[arch][parts_eff].append(listeners_mean)
+    except Exception:
+        pass
 
     # missing frames summary appended (attach client_num inferred from receiver_folder)
     for m in metrics.get('missing_summary', []):
@@ -1185,6 +1385,63 @@ def accumulate_run_results(metrics, arch, participants, run_path,
         'measured_incoming_bps_host': metrics.get('measured_host_incoming_bps')
     }
     measured_rows.append(measured_row)
+
+    # First-vs-others measured outgoing bandwidth aggregation (per-client tx_bps list)
+    try:
+        pc_bw = metrics.get('measured_outgoing_bps_per_client_list') or []
+        if pc_bw:
+            visible_bw = [p for p in pc_bw if (parts_eff is None) or (p.get('client_num') is None) or (p.get('client_num') <= parts_eff)]
+            if visible_bw:
+                first = next((p for p in visible_bw if p.get('client_num') == 1), None)
+                if first is None:
+                    numeric = [p for p in visible_bw if p.get('client_num') is not None]
+                    if numeric:
+                        first = min(numeric, key=lambda x: x['client_num'])
+                    else:
+                        first = visible_bw[0]
+                rest = [p for p in visible_bw if p is not first]
+                first_tx = float(first.get('tx_bps')) if first.get('tx_bps') is not None else None
+                rest_vals = [float(p.get('tx_bps')) for p in rest if p.get('tx_bps') is not None]
+                rest_mean = float(np.mean(rest_vals)) if rest_vals else None
+                if parts_eff not in measured_speaker_stats[arch]:
+                    measured_speaker_stats[arch][parts_eff] = []
+                if parts_eff not in measured_listeners_stats[arch]:
+                    measured_listeners_stats[arch][parts_eff] = []
+                if first_tx is not None:
+                    measured_speaker_stats[arch][parts_eff].append(first_tx)
+                if rest_mean is not None:
+                    measured_listeners_stats[arch][parts_eff].append(rest_mean)
+    except Exception:
+        pass
+
+    # Speaker-vs-listeners latency aggregation (per-sender mean latency collected in analyze_run)
+    try:
+        lclients = metrics.get('latency_per_sender') or []
+        if lclients and latency_speaker_stats is not None and latency_listeners_stats is not None:
+            visible = [p for p in lclients if (parts_eff is None) or (p.get('client_num') is None) or (p.get('client_num') <= parts_eff)]
+            if visible:
+                # select speaker: prefer client_num==1, else lowest numeric, else first
+                speaker = next((p for p in visible if p.get('client_num') == 1), None)
+                if speaker is None:
+                    numeric = [p for p in visible if p.get('client_num') is not None]
+                    if numeric:
+                        speaker = min(numeric, key=lambda x: x['client_num'])
+                    else:
+                        speaker = visible[0]
+                listeners = [p for p in visible if p is not speaker]
+                speaker_val = float(speaker.get('mean_latency_ms')) if speaker.get('mean_latency_ms') is not None else None
+                listeners_vals = [float(p.get('mean_latency_ms')) for p in listeners if p.get('mean_latency_ms') is not None]
+                listeners_mean = float(np.mean(listeners_vals)) if listeners_vals else None
+                if parts_eff not in latency_speaker_stats.setdefault(arch, {}):
+                    latency_speaker_stats[arch][parts_eff] = []
+                if parts_eff not in latency_listeners_stats.setdefault(arch, {}):
+                    latency_listeners_stats[arch][parts_eff] = []
+                if speaker_val is not None:
+                    latency_speaker_stats[arch][parts_eff].append(speaker_val)
+                if listeners_mean is not None:
+                    latency_listeners_stats[arch][parts_eff].append(listeners_mean)
+    except Exception:
+        pass
 
     # latency/encode/decode
     latency_rows.append({'arch': arch, 'participants': parts_eff,
@@ -1612,7 +1869,9 @@ def process_group(participants, entries):
                  'avg_width', 'avg_height', 'avg_encode_ms', 'outgoing_bps', 'incoming_bps',
                  'avg_latency_ms', 'avg_decode_ms', 'avg_part_frame_size', 'missing_summary',
                  'measured_outgoing_bps_per_client', 'measured_incoming_bps_per_client',
+                 'measured_outgoing_bps_per_client_list', 'psnr_per_client',
                  'measured_host_outgoing_bps', 'measured_host_incoming_bps',
+                 'latency_per_sender',
                  'max_encode_by_client', 'max_decode_by_client']
     for arch, run_path in entries:
         try:
@@ -1643,6 +1902,13 @@ def process_scenario(ROOT_FOLDER, scenario):
     missing_rows = []
     resolution_rows = []
     measured_rows = []
+    # New aggregators for first-vs-others analysis
+    psnr_first_stats = defaultdict(dict)
+    psnr_rest_stats = defaultdict(dict)
+    measured_first_stats = defaultdict(dict)
+    measured_rest_stats = defaultdict(dict)
+    latency_first_stats = defaultdict(dict)
+    latency_rest_stats = defaultdict(dict)
     latency_rows = []
     client_max_rows = []
     presence_records = []
@@ -1699,11 +1965,19 @@ def process_scenario(ROOT_FOLDER, scenario):
                     if metrics is None:
                         continue
                     accumulate_run_results(metrics, arch, participants, run_path,
-                                           cpu_results, psnr_stats, missing_rows, resolution_rows, latency_rows, measured_rows,
-                                           client_max_rows)
+                                               cpu_results, psnr_stats, missing_rows, resolution_rows, latency_rows, measured_rows,
+                                               measured_first_stats, measured_rest_stats, psnr_first_stats, psnr_rest_stats,
+                                               latency_first_stats, latency_rest_stats,
+                                               client_max_rows)
 
     # Prepare PSNR mean/std and write diagnostics
     psnr_mean, psnr_std = build_psnr_dfs(psnr_stats)
+    # Create and save first-vs-others PSNR and measured-bandwidth plots using
+    # aggregators populated during accumulation.
+    try:
+        plot_psnr_speaker_vs_listeners(psnr_first_stats, psnr_rest_stats, ANALYSIS_FOLDER, scenario)
+    except Exception as e:
+        print('Failed to create PSNR speaker-vs-listeners plot:', e)
     # Merge per-client max encode/decode info collected during accumulation into presence records
     try:
         for cm in client_max_rows:
@@ -1730,6 +2004,16 @@ def process_scenario(ROOT_FOLDER, scenario):
         write_diagnostics(presence_records=presence_records, missing_records=missing_rows, analysis_folder=ANALYSIS_FOLDER)
     except Exception as e:
         print('Failed to write diagnostics summary:', e)
+
+    try:
+        plot_measured_bandwidth_speaker_vs_listeners(measured_first_stats, measured_rest_stats, ANALYSIS_FOLDER, scenario)
+    except Exception as e:
+        print('Failed to create measured bandwidth speaker-vs-listeners plot:', e)
+
+    try:
+        plot_latency_speaker_vs_listeners(latency_first_stats, latency_rest_stats, ANALYSIS_FOLDER, scenario)
+    except Exception as e:
+        print('Failed to create latency speaker-vs-listeners plot:', e)
 
     # Handle resolution/bitrate summaries and plots
     process_resolution_rows(resolution_rows, ANALYSIS_FOLDER)

@@ -74,10 +74,11 @@ LATENCY_MODES=${LATENCY_MODES:-none}
 # Send bandwidth mode (affects per-client `upBandwidth` in generated configs)
 # Allowed values:
 #  - all1000 : every client gets 1000 Mbps (default)
-#  - all1   : every client gets 1 Mbps
-#  - inc1   : each client gets i * 1 Mbps
-#  - inc5   : each client gets i * 5 Mbps
-#  - inc10  : each client gets i * 10 Mbps
+#  - all10   : every client gets 10 Mbps
+#  - all1    : every client gets 1 Mbps
+#  - inc1    : each client gets i * 1 Mbps
+#  - inc5    : each client gets i * 5 Mbps
+#  - inc10   : each client gets i * 10 Mbps
 SEND_BW_MODE=${SEND_BW_MODE:-all1000}
 
 
@@ -212,7 +213,7 @@ validate_params() {
     fi
 
     # validate send bandwidth mode(s) (comma-separated values allowed)
-    local bw_re='^(all1000|all1|inc1|inc5|inc10)(,(all1000|all1|inc1|inc5|inc10))*$'
+    local bw_re='^(all1000|all10|all1|inc1|inc5|inc10)(,(all1000|all10|all1|inc1|inc5|inc10))*$'
     if ! [[ "$SEND_BW_MODE" =~ $bw_re ]]; then
         echo "ERROR: Unknown send bandwidth mode '$SEND_BW_MODE' (allowed: all1000,all1,inc1,inc5,inc10 or comma-separated list)" >&2; exit 1
     fi
@@ -494,6 +495,12 @@ generate_client_configs() {
             all1000)
                 upload_bps=$((1000 * 1000000))
                 ;;
+            all10)
+                upload_bps=$((10 * 1000000))
+                ;;
+            all1)
+                upload_bps=$((1 * 1000000))
+                ;;
             inc1)
                 upload_bps=$(( i * 1000000 ))
                 ;;
@@ -504,7 +511,8 @@ generate_client_configs() {
                 upload_bps=$(( i * 10000000 ))
                 ;;
             *)
-                upload_bps=$(( i * 5000000 ))
+                # Fallback to the default all1000 behavior instead of an unexpected incremental value
+                upload_bps=$((1000 * 1000000))
                 ;;
         esac
         if grep -qE '^upBandwidth=' "${out}"; then

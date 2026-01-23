@@ -874,6 +874,7 @@ def plot_psnr_speaker_vs_listeners(psnr_speaker_stats, psnr_listeners_stats, ana
         plt.title(f'PSNR: Speaker vs Listeners - {scenario}')
         plt.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
         plt.ylim(0, 50)
+        plt.axhline(48.131, color='gray', linestyle=':', linewidth=2.0, label='Max PSNR (8-bit)', zorder=5)
         plt.legend(prop={'size': 9})
         # force x-axis to whole numbers (participants)
         try:
@@ -960,6 +961,25 @@ def plot_latency_speaker_vs_listeners(latency_speaker_stats, latency_listeners_s
         plt.ylabel('Mean Total Latency (ms)')
         plt.title(f'Latency: Speaker vs Listeners - {scenario}')
         plt.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
+        # compute automatic upper bound from mean+std and force y-axis to start at 0
+        try:
+            combined = (mean_speaker.fillna(0) + std_speaker.fillna(0)).values
+            combined2 = (mean_listeners.fillna(0) + std_listeners.fillna(0)).values
+            max_val1 = float(np.nanmax(combined)) if combined.size else None
+            max_val2 = float(np.nanmax(combined2)) if combined2.size else None
+            max_val = None
+            if max_val1 is not None and max_val2 is not None:
+                max_val = max(max_val1, max_val2)
+            elif max_val1 is not None:
+                max_val = max_val1
+            elif max_val2 is not None:
+                max_val = max_val2
+        except Exception:
+            max_val = None
+        if max_val is not None and max_val > 0:
+            plt.ylim(0, max(max_val * 1.05, 1.0))
+        else:
+            plt.ylim(0, 1)
         plt.legend(prop={'size': 9})
         # force integer x-ticks
         try:

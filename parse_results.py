@@ -2016,6 +2016,8 @@ def process_scenario(ROOT_FOLDER, scenario):
     latency_rows = []
     client_max_rows = []
     presence_records = []
+    # collect runs that are discarded due to missing frames or broken clients
+    discarded_runs = []
 
     # Build list of runs and collect presence records first (cheap). Parallelize collection
     runs = []
@@ -2066,8 +2068,57 @@ def process_scenario(ROOT_FOLDER, scenario):
                     continue
                 # Merge per-run metrics returned from the group worker
                 for arch, participants, run_path, metrics in group_results:
+                    # Treat analyze failures as discarded runs
                     if metrics is None:
+                        discarded_runs.append({'arch': arch, 'participants': participants, 'run_path': run_path, 'reason': 'analyze_failed'})
+                        # still continue to next; presence_records will contain any available diagnostics
                         continue
+
+                    # Always add missing-frame diagnostics to missing_rows so diagnostics CSVs include discarded runs
+                    for m in metrics.get('missing_summary', []):
+                        row = dict(m)
+                        sender_num = _extract_client_num_from_folder(m.get('local_folder'))
+                        receiver_num = _extract_client_num_from_folder(m.get('receiver_folder'))
+                        row.update({'arch': arch, 'participants': participants, 'run_path': run_path,
+                                    'sender_client_num': sender_num, 'receiver_client_num': receiver_num})
+                        missing_rows.append(row)
+
+                    # Determine if run should be discarded: any missing frames OR any broken client presence
+                    run_failed = False
+                    reasons = []
+                    # Missing frames
+                    for m in metrics.get('missing_summary', []):
+                        try:
+                            if int(m.get('missing', 0)) > 0:
+                                run_failed = True
+                                reasons.append('missing_frames')
+                                break
+                        except Exception:
+                            continue
+
+                    # Broken clients from presence records: look for entries matching this run with both traces missing/invalid
+                    if not run_failed:
+                        for p in presence_records:
+                            try:
+                                if p.get('run_path') == run_path and p.get('arch') == arch:
+                                    code = p.get('code')
+                                    local_valid = p.get('local_valid')
+                                    part_valid = p.get('part_valid')
+                                    # code 'M' means both traces missing; also treat both invalid as broken
+                                    if code == 'M' or (local_valid is False and part_valid is False):
+                                        run_failed = True
+                                        reasons.append('broken_client')
+                                        break
+                            except Exception:
+                                continue
+
+                    if run_failed:
+                        discarded_runs.append({'arch': arch, 'participants': participants, 'run_path': run_path, 'reason': ','.join(sorted(set(reasons))) or 'failed'})
+                        print(f"Discarding run due to failure: {arch} participants={participants} run={run_path} reason={','.join(sorted(set(reasons))) }")
+                        # do NOT accumulate this run's metrics into aggregate results; diagnostics already preserved
+                        continue
+
+                    # Otherwise, include the run in aggregated results
                     accumulate_run_results(metrics, arch, participants, run_path,
                                                cpu_results, psnr_stats, missing_rows, resolution_rows, latency_rows, measured_rows,
                                                measured_first_stats, measured_rest_stats, psnr_first_stats, psnr_rest_stats,
@@ -2136,7 +2187,8 @@ def process_scenario(ROOT_FOLDER, scenario):
     averaged_cpu = finalize_cpu_and_psnr(cpu_results, psnr_mean, psnr_std, ANALYSIS_FOLDER, scenario)
 
     # Return per-scenario averaged CPU mapping for root-level aggregation
-    return averaged_cpu
+    # and list of discarded runs for centralized reporting
+    return averaged_cpu, discarded_runs
 
 def main():
     parser = argparse.ArgumentParser(description='Analyze experimental results')
@@ -2156,6 +2208,7 @@ def main():
         return
 
     all_results_by_arch = defaultdict(list)
+    all_discarded_runs = []
     # If there are multiple scenarios, run them in parallel at the scenario level.
     if len(scenarios) > 1:
         max_workers = min(len(scenarios), (os.cpu_count() or 2))
@@ -2167,8 +2220,20 @@ def main():
                 try:
                     res = fut.result()
                     if res:
-                        for arch, rows in res.items():
-                            all_results_by_arch[arch].extend(rows)
+                        # process_scenario now returns (averaged_cpu, discarded_runs)
+                        try:
+                            averaged_cpu, discarded = res
+                        except Exception:
+                            averaged_cpu = res
+                            discarded = []
+                        if averaged_cpu:
+                            for arch, rows in averaged_cpu.items():
+                                all_results_by_arch[arch].extend(rows)
+                        if discarded:
+                            for d in discarded:
+                                # attach scenario for context
+                                d['scenario'] = sc
+                            all_discarded_runs.extend(discarded)
                 except Exception as e:
                     print(f"process_scenario failed for {sc}: {e}")
     else:
@@ -2176,8 +2241,18 @@ def main():
             try:
                 res = process_scenario(ROOT_FOLDER, scenario)
                 if res:
-                    for arch, rows in res.items():
-                        all_results_by_arch[arch].extend(rows)
+                    try:
+                        averaged_cpu, discarded = res
+                    except Exception:
+                        averaged_cpu = res
+                        discarded = []
+                    if averaged_cpu:
+                        for arch, rows in averaged_cpu.items():
+                            all_results_by_arch[arch].extend(rows)
+                    if discarded:
+                        for d in discarded:
+                            d['scenario'] = scenario
+                        all_discarded_runs.extend(discarded)
             except Exception as e:
                 print(f"process_scenario failed for {scenario}: {e}")
 
@@ -2186,6 +2261,28 @@ def main():
         write_root_cpu_summary(all_results_by_arch, ROOT_FOLDER)
     except Exception as e:
         print('Failed to write root CPU summary:', e)
+
+    # Write a single discarded runs summary into ROOT/analysis/discarded_runs.csv
+    try:
+        analysis_root = os.path.join(ROOT_FOLDER, 'analysis')
+        ensure_dir(analysis_root)
+        if all_discarded_runs:
+            out_rows = []
+            for d in all_discarded_runs:
+                out_rows.append({'Architecture': d.get('arch'), 'Participants': d.get('participants'),
+                                 'RunPath': d.get('run_path'), 'Reason': d.get('reason'), 'Scenario': d.get('scenario')})
+            df_disc = pd.DataFrame(out_rows)
+            disc_csv = os.path.join(analysis_root, 'discarded_runs.csv')
+            df_disc.to_csv(disc_csv, index=False, sep=';')
+            print(f'Wrote discarded runs summary to {disc_csv}')
+            # Print concise summary list
+            print('Discarded runs:')
+            for r in out_rows:
+                print(f" - {r.get('Architecture')} participants={r.get('Participants')} run={r.get('RunPath')} reason={r.get('Reason')}")
+        else:
+            print('No discarded runs detected.')
+    except Exception as e:
+        print('Failed to write discarded runs summary:', e)
 
     print('Analysis complete.')
 

@@ -1839,19 +1839,25 @@ def finalize_cpu_and_psnr(cpu_results, psnr_mean, psnr_std, ANALYSIS_FOLDER, sce
     for arch, rows in cpu_results.items():
         by_n = defaultdict(list)
         for participants, val in rows:
-            if val is not None:
-                by_n[participants].append(val)
+            try:
+                by_n[int(participants)].append(float(val))
+            except Exception:
+                # ignore malformed entries
+                continue
         averaged = []
         for participants, vals in sorted(by_n.items()):
             try:
-                averaged.append((participants, float(np.mean(vals))))
+                meanv = float(np.nanmean(vals)) if vals else None
             except Exception:
-                averaged.append((participants, None))
+                meanv = None
+            averaged.append((participants, meanv))
         averaged_cpu[arch] = averaged
     plot_cpu(averaged_cpu, ANALYSIS_FOLDER, scenario)
 
     if not psnr_mean.empty:
         plot_psnr(psnr_mean, psnr_std, ANALYSIS_FOLDER, scenario)
+    # return mapping for root-level aggregation
+    return averaged_cpu
 
 
 def process_group(participants, entries):
@@ -1887,6 +1893,104 @@ def process_group(participants, entries):
         # Keep the original missing_summary if present (it's a list of dicts and serializable)
         pruned_results.append((arch, participants, run_path, pr))
     return pruned_results
+
+
+def write_root_cpu_summary(results_by_arch, ROOT_FOLDER):
+    """Write a root-level CPU summary CSV and plot under ROOT_FOLDER/analysis.
+
+    results_by_arch: dict arch -> list of (participants, cpu_avg)
+    """
+    if not results_by_arch:
+        return
+    summary_rows = []
+    for arch, rows in results_by_arch.items():
+        # build sorted arrays, filter none/NaN
+        vals = [(int(p), float(v)) for (p, v) in rows if p is not None and v is not None]
+        if not vals:
+            continue
+        vals_sorted = sorted(vals, key=lambda x: x[0])
+        xs = np.array([v[0] for v in vals_sorted], dtype=float)
+        ys = np.array([v[1] for v in vals_sorted], dtype=float)
+        # compute AUC using trapezoidal rule; normalize by participant span if >0
+        try:
+            auc = float(np.trapz(ys, xs))
+        except Exception:
+            auc = float(np.nan)
+        span = float(xs.max() - xs.min()) if xs.size > 1 else 0.0
+        norm_auc = (auc / span) if span > 0 else auc
+        meanv = float(np.nanmean(ys))
+        medianv = float(np.nanmedian(ys))
+        summary_rows.append({'Architecture': arch, 'AUC': auc, 'Normalized_AUC': norm_auc,
+                             'Mean_CPU': meanv, 'Median_CPU': medianv, 'DataPoints': len(xs)})
+
+    if not summary_rows:
+        return
+    analysis_root = os.path.join(ROOT_FOLDER, 'analysis')
+    ensure_dir(analysis_root)
+
+    # Also produce per-participant aggregation (mean/std/count) across scenarios
+    cpu_by_parts_rows = []
+    mean_map = {}
+    for arch, rows in results_by_arch.items():
+        by_n = defaultdict(list)
+        for p, v in rows:
+            try:
+                if p is None or v is None:
+                    continue
+                by_n[int(p)].append(float(v))
+            except Exception:
+                continue
+        for parts, vals in sorted(by_n.items()):
+            meanv = float(np.nanmean(vals)) if vals else np.nan
+            stdv = float(np.nanstd(vals)) if vals else np.nan
+            cnt = len(vals)
+            cpu_by_parts_rows.append({'Architecture': arch, 'Participants': parts, 'Mean_CPU': meanv, 'Std_CPU': stdv, 'Count': cnt})
+        # prepare mapping for plotting
+        mean_map[arch] = [(parts, float(np.nanmean(vals))) for parts, vals in sorted(by_n.items())]
+
+    # write per-participant CSV
+    parts_csv = os.path.join(analysis_root, 'cpu_summary_by_participants.csv')
+    pd.DataFrame(cpu_by_parts_rows).to_csv(parts_csv, index=False, sep=';')
+    print('Wrote CPU summary by participants to', parts_csv)
+
+    # Note: per-user request, the aggregate AUC CSV and bar plot are omitted.
+
+    # Plot 2: per-participant mean with errorbars (std) per architecture
+    try:
+        fig, ax = plt.subplots(figsize=(8,4))
+        cmap = get_color_map(sorted(mean_map.keys()))
+        markers = ['o', 's', '^', 'D', 'v', 'P', 'X']
+        for i, (arch, pts) in enumerate(sorted(mean_map.items())):
+            if not pts:
+                continue
+            xs = [p for p, _ in pts]
+            ys = [y for _, y in pts]
+            # find stds from cpu_by_parts_rows
+            stds = []
+            for x in xs:
+                row = next((r for r in cpu_by_parts_rows if r['Architecture'] == arch and r['Participants'] == x), None)
+                stds.append(row['Std_CPU'] if row is not None else np.nan)
+            color = cmap.get(arch)
+            mk = markers[i % len(markers)]
+            ax.errorbar(xs, ys, yerr=stds, marker=mk, linestyle='-', label=arch, color=color, capsize=3)
+        ax.set_xlabel('Number of Participants')
+        ax.set_ylabel('Average Total CPU %')
+        ax.set_title('CPU by Participants (root summary)')
+        ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
+        try:
+            # set integer xticks
+            all_x = sorted({int(r['Participants']) for r in cpu_by_parts_rows})
+            ax.set_xticks(all_x)
+        except Exception:
+            pass
+        ax.legend(fontsize=9)
+        plt.tight_layout()
+        outp2 = os.path.join(analysis_root, 'cpu_summary_by_participants.svg')
+        fig.savefig(outp2)
+        plt.close(fig)
+        print('Wrote CPU by-participants plot to', outp2)
+    except Exception as e:
+        print('Failed to create CPU by-participants plot:', e)
 
 
 def process_scenario(ROOT_FOLDER, scenario):
@@ -2029,7 +2133,10 @@ def process_scenario(ROOT_FOLDER, scenario):
         print('Failed to process measured bandwidth rows:', e)
 
     # Finalize CPU and PSNR plots
-    finalize_cpu_and_psnr(cpu_results, psnr_mean, psnr_std, ANALYSIS_FOLDER, scenario)
+    averaged_cpu = finalize_cpu_and_psnr(cpu_results, psnr_mean, psnr_std, ANALYSIS_FOLDER, scenario)
+
+    # Return per-scenario averaged CPU mapping for root-level aggregation
+    return averaged_cpu
 
 def main():
     parser = argparse.ArgumentParser(description='Analyze experimental results')
@@ -2048,6 +2155,7 @@ def main():
         print('No scenarios found in', ROOT_FOLDER)
         return
 
+    all_results_by_arch = defaultdict(list)
     # If there are multiple scenarios, run them in parallel at the scenario level.
     if len(scenarios) > 1:
         max_workers = min(len(scenarios), (os.cpu_count() or 2))
@@ -2055,14 +2163,30 @@ def main():
         with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as exc:
             futures = {exc.submit(process_scenario, ROOT_FOLDER, sc): sc for sc in scenarios}
             for fut in concurrent.futures.as_completed(futures):
-                sc = futures[fut]
+                sc = futures.get(fut)
                 try:
-                    fut.result()
+                    res = fut.result()
+                    if res:
+                        for arch, rows in res.items():
+                            all_results_by_arch[arch].extend(rows)
                 except Exception as e:
                     print(f"process_scenario failed for {sc}: {e}")
     else:
         for scenario in scenarios:
-            process_scenario(ROOT_FOLDER, scenario)
+            try:
+                res = process_scenario(ROOT_FOLDER, scenario)
+                if res:
+                    for arch, rows in res.items():
+                        all_results_by_arch[arch].extend(rows)
+            except Exception as e:
+                print(f"process_scenario failed for {scenario}: {e}")
+
+    # After all scenarios processed, write a root-level CPU summary
+    try:
+        write_root_cpu_summary(all_results_by_arch, ROOT_FOLDER)
+    except Exception as e:
+        print('Failed to write root CPU summary:', e)
+
     print('Analysis complete.')
 
 

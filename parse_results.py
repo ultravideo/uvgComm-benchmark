@@ -478,6 +478,29 @@ def analyze_run(run_path):
     metrics['local_by_cname'] = local_by_cname
     metrics['participant_by_cname'] = participant_by_cname
 
+    # Debugging aid: if participant traces exist but later no latencies are found,
+    # it helps to know what columns are present in a sample participant file.
+    try:
+        total_part_files = sum(len(v) for v in participant_by_cname.values())
+        if total_part_files == 0:
+            print(f"[debug] No participant_*.csv files found in run {run_path}")
+        else:
+            # find first non-empty df to inspect columns
+            sample_cols = None
+            for plist in participant_by_cname.values():
+                for info in plist:
+                    if info.get('df') is not None:
+                        try:
+                            sample_cols = list(info.get('df').columns)
+                        except Exception:
+                            sample_cols = None
+                        break
+                if sample_cols is not None:
+                    break
+            # sample participant columns inspected during development; omit verbose debug output
+    except Exception:
+        pass
+
     # PSNR: collect per-client PSNR and overall average
     psnr_values = []
     psnr_per_client = []
@@ -537,16 +560,19 @@ def analyze_run(run_path):
         encvals, _ = extract_numeric_list(df, ['EncodeTime(ms)', 'EncodeTime', 'EncodeTimeMs', 'EncodeTime (ms)'], dtype=float)
         if encvals:
             encode_times.extend(encvals)
-            # record per-client max encode time
+            # record per-client max encode time (key by client folder path for reliable matching)
             try:
                 cfolder = info.get('client_folder')
-                cnum = _extract_client_num_from_folder(cfolder)
-                if cnum is None:
-                    # fallback: use folder basename index
-                    cnum = None
+                key = cfolder if cfolder is not None else None
                 cur = max(encvals) if encvals else None
                 if cur is not None:
-                    max_encode_by_client[cnum] = max(cur, float(max_encode_by_client.get(cnum, float('-inf')))) if cnum in max_encode_by_client else cur
+                    if key in max_encode_by_client:
+                        try:
+                            max_encode_by_client[key] = max(cur, float(max_encode_by_client.get(key, float('-inf'))))
+                        except Exception:
+                            max_encode_by_client[key] = cur
+                    else:
+                        max_encode_by_client[key] = cur
             except Exception:
                 pass
     metrics['avg_frame_size'] = float(np.mean(sizes)) if sizes else None
@@ -581,15 +607,19 @@ def analyze_run(run_path):
             dvals, _ = extract_numeric_list(df, ['DecodeTime(ms)', 'DecodeTime', 'DecodeTimeMs'], dtype=float)
             if dvals:
                 decode_times.extend(dvals)
-                # record per-client max decode time
+                # record per-client max decode time (key by client folder path for reliable matching)
                 try:
                     cfolder = info.get('client_folder')
-                    cnum = _extract_client_num_from_folder(cfolder)
-                    if cnum is None:
-                        cnum = None
+                    key = cfolder if cfolder is not None else None
                     curd = max(dvals) if dvals else None
                     if curd is not None:
-                        max_decode_by_client[cnum] = max(curd, float(max_decode_by_client.get(cnum, float('-inf')))) if cnum in max_decode_by_client else curd
+                        if key in max_decode_by_client:
+                            try:
+                                max_decode_by_client[key] = max(curd, float(max_decode_by_client.get(key, float('-inf'))))
+                            except Exception:
+                                max_decode_by_client[key] = curd
+                        else:
+                            max_decode_by_client[key] = curd
                 except Exception:
                     pass
 
@@ -1259,17 +1289,19 @@ def setup_analysis_folders(ROOT_FOLDER, scenario):
 
 
 def collect_presence_records_for_run(run_path, arch, participants):
-    """Return a list of presence record dicts for given run_path (same logic previously inlined).
+    """Return a tuple (filtered_records, unfiltered_records) of presence record dicts for given run_path.
 
+    The filtered list respects any `Visible_*` limit in metadata and is used for analysis.
+    The unfiltered list contains all client folders and is intended for diagnostics output.
     `participants` is the number of participants for this run.
     """
-    records = []
-    client_folders = sorted([p for p in glob.glob(os.path.join(run_path, 'uvgcomm-client*')) if os.path.isdir(p)])
-    # Respect visible participants limit from run metadata if present so
-    # diagnostics/presence records match analysis filtering.
+    # gather all client folders first (unfiltered)
+    client_folders_all = sorted([p for p in glob.glob(os.path.join(run_path, 'uvgcomm-client*')) if os.path.isdir(p)])
+
+    # determine visible limit (may be None)
+    visible_limit = None
     try:
         meta = parse_metadata(os.path.join(run_path, 'metadata.txt'))
-        visible_limit = None
         for vk in ('Visible_Participants', 'VisibleParticipants', 'Visible', 'VisibleCount'):
             if vk in meta:
                 try:
@@ -1277,56 +1309,67 @@ def collect_presence_records_for_run(run_path, arch, participants):
                 except Exception:
                     visible_limit = None
                 break
-        if visible_limit is not None:
-            def _keep(folder):
-                try:
-                    num = _extract_client_num_from_folder(folder)
-                    return (num is None) or (num <= visible_limit)
-                except Exception:
-                    return True
-            client_folders = [c for c in client_folders if _keep(c)]
     except Exception:
-        pass
-    for idx, cf in enumerate(client_folders, start=1):
-        client_num = _extract_client_num_from_folder(cf) or idx
-        local_paths = glob.glob(os.path.join(cf, 'local_*.csv'))
-        part_paths = glob.glob(os.path.join(cf, 'participant_*.csv'))
-        local_present = bool(local_paths)
-        part_present = bool(part_paths)
-        local_count = len(local_paths)
-        part_count = len(part_paths)
-        local_valid = False
-        part_valid = False
-        if local_present:
+        visible_limit = None
+
+    # produce filtered client folders according to visible_limit
+    client_folders_filtered = client_folders_all
+    if visible_limit is not None:
+        def _keep(folder):
             try:
-                local_df = read_csv_guess(local_paths[0])
-                local_valid = local_df is not None
+                num = _extract_client_num_from_folder(folder)
+                return (num is None) or (num <= visible_limit)
             except Exception:
-                local_valid = False
-        if part_present:
-            try:
-                part_df = read_csv_guess(part_paths[0])
-                part_valid = part_df is not None
-            except Exception:
-                part_valid = False
-        # compute single-letter code similar to previous implementation
-        code = None
-        if local_valid and part_valid:
-            code = 'B'
-        elif local_valid and not part_present:
-            code = 'L'
-        elif part_valid and not local_present:
-            code = 'P'
-        elif not local_present and not part_present:
-            code = 'M'
-        else:
-            code = '-'
-        records.append({'arch': arch, 'participants': participants, 'client_num': client_num,
-                        'local_present': local_present, 'part_present': part_present,
-                        'local_valid': local_valid, 'part_valid': part_valid,
-                        'local_count': local_count, 'part_count': part_count,
-                        'code': code, 'run_path': run_path})
-    return records
+                return True
+        client_folders_filtered = [c for c in client_folders_all if _keep(c)]
+
+    def _build_records(client_folders):
+        recs = []
+        for idx, cf in enumerate(client_folders, start=1):
+            client_num = _extract_client_num_from_folder(cf) or idx
+            local_paths = glob.glob(os.path.join(cf, 'local_*.csv'))
+            part_paths = glob.glob(os.path.join(cf, 'participant_*.csv'))
+            local_present = bool(local_paths)
+            part_present = bool(part_paths)
+            local_count = len(local_paths)
+            part_count = len(part_paths)
+            local_valid = False
+            part_valid = False
+            if local_present:
+                try:
+                    local_df = read_csv_guess(local_paths[0])
+                    local_valid = local_df is not None
+                except Exception:
+                    local_valid = False
+            if part_present:
+                try:
+                    part_df = read_csv_guess(part_paths[0])
+                    part_valid = part_df is not None
+                except Exception:
+                    part_valid = False
+            # compute single-letter code similar to previous implementation
+            code = None
+            if local_valid and part_valid:
+                code = 'B'
+            elif local_valid and not part_present:
+                code = 'L'
+            elif part_valid and not local_present:
+                code = 'P'
+            elif not local_present and not part_present:
+                code = 'M'
+            else:
+                code = '-'
+            recs.append({'arch': arch, 'participants': participants, 'client_num': client_num,
+                         'client_folder': cf,
+                         'local_present': local_present, 'part_present': part_present,
+                         'local_valid': local_valid, 'part_valid': part_valid,
+                         'local_count': local_count, 'part_count': part_count,
+                         'code': code, 'run_path': run_path})
+        return recs
+
+    filtered_records = _build_records(client_folders_filtered)
+    unfiltered_records = _build_records(client_folders_all)
+    return filtered_records, unfiltered_records
 
 
 def accumulate_run_results(metrics, arch, participants, run_path,
@@ -1475,8 +1518,15 @@ def accumulate_run_results(metrics, arch, participants, run_path,
         # union of client keys
         keys = set(list(me.keys()) + list(md.keys()))
         for k in keys:
-            client_max_rows.append({'arch': arch, 'participants': parts_eff, 'run_path': run_path,
-                                     'client_num': k, 'max_encode_ms': me.get(k), 'max_decode_ms': md.get(k)})
+            # k is the key used in analyze_run for per-client maxima (now a client_folder path or None)
+            client_folder_key = k
+            try:
+                client_num_val = _extract_client_num_from_folder(k) if isinstance(k, str) else k
+            except Exception:
+                client_num_val = None
+            client_max_rows.append({'arch': arch, 'participants': participants, 'run_path': run_path,
+                                     'client_folder': client_folder_key, 'client_num': client_num_val,
+                                     'max_encode_ms': me.get(k), 'max_decode_ms': md.get(k)})
     except Exception:
         pass
 
@@ -2036,6 +2086,8 @@ def process_scenario(ROOT_FOLDER, scenario):
     latency_rows = []
     client_max_rows = []
     presence_records = []
+    # preserve an unfiltered copy of presence records for diagnostics
+    presence_records_unfiltered = []
     # collect runs that are discarded due to missing frames or broken clients
     discarded_runs = []
 
@@ -2059,13 +2111,14 @@ def process_scenario(ROOT_FOLDER, scenario):
                 arch, participants, run_path = future_to_run[fut]
                 # Let exceptions surface or be logged here for visibility.
                 try:
-                    records = fut.result()
+                    filtered, unfiltered = fut.result()
                 except Exception as e:
                     print(f"[presence] failed for {arch}-{participants} {run_path}: {e}")
-                    records = []
+                    filtered, unfiltered = [], []
                 run_counter += 1
-                presence_records.extend(records)
-                print(f"[presence {run_counter}/{total_runs}] collected {len(records)} record(s) for {arch}-{participants} run {os.path.basename(run_path)}")
+                presence_records.extend(filtered)
+                presence_records_unfiltered.extend(unfiltered)
+                print(f"[presence {run_counter}/{total_runs}] collected filtered={len(filtered)} unfiltered={len(unfiltered)} record(s) for {arch}-{participants} run {os.path.basename(run_path)}")
                 tasks.append((arch, participants, run_path))
 
     # Analyze runs grouped by participant count. Parallelize across distinct participant counts
@@ -2155,28 +2208,66 @@ def process_scenario(ROOT_FOLDER, scenario):
         print('Failed to create PSNR speaker-vs-listeners plot:', e)
     # Merge per-client max encode/decode info collected during accumulation into presence records
     try:
+        # client_max_rows samples were printed during debugging; removed
+
         for cm in client_max_rows:
-            # find matching presence record
+            # find matching presence record: prefer exact client_folder match, fall back to numeric client_num
             matched = None
             for p in presence_records:
-                if p.get('arch') == cm.get('arch') and p.get('run_path') == cm.get('run_path') and (p.get('client_num') == cm.get('client_num')):
-                    matched = p
-                    break
+                try:
+                    if p.get('arch') != cm.get('arch') or p.get('run_path') != cm.get('run_path'):
+                        continue
+                    # match by folder if available
+                    if p.get('client_folder') and cm.get('client_folder') and p.get('client_folder') == cm.get('client_folder'):
+                        matched = p
+                        break
+                    # fall back to numeric client id match
+                    if p.get('client_num') is not None and cm.get('client_num') is not None and int(p.get('client_num')) == int(cm.get('client_num')):
+                        matched = p
+                        break
+                except Exception:
+                    continue
             if matched is not None:
                 matched['max_encode_ms'] = cm.get('max_encode_ms')
                 matched['max_decode_ms'] = cm.get('max_decode_ms')
+                # Also update the unfiltered presence records so diagnostics
+                # written from `presence_records_unfiltered` include these values.
+                try:
+                    for pu in presence_records_unfiltered:
+                        try:
+                            if pu.get('arch') != cm.get('arch') or pu.get('run_path') != cm.get('run_path'):
+                                continue
+                            if pu.get('client_folder') and cm.get('client_folder') and pu.get('client_folder') == cm.get('client_folder'):
+                                pu['max_encode_ms'] = cm.get('max_encode_ms')
+                                pu['max_decode_ms'] = cm.get('max_decode_ms')
+                                break
+                            if pu.get('client_num') is not None and cm.get('client_num') is not None and int(pu.get('client_num')) == int(cm.get('client_num')):
+                                pu['max_encode_ms'] = cm.get('max_encode_ms')
+                                pu['max_decode_ms'] = cm.get('max_decode_ms')
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
             else:
                 # append a minimal presence record if none exists
-                presence_records.append({'arch': cm.get('arch'), 'participants': cm.get('participants'),
-                                         'client_num': cm.get('client_num'), 'local_present': False, 'part_present': False,
-                                         'local_valid': False, 'part_valid': False, 'local_count': 0, 'part_count': 0,
-                                         'code': 'M', 'run_path': cm.get('run_path'),
-                                         'max_encode_ms': cm.get('max_encode_ms'), 'max_decode_ms': cm.get('max_decode_ms')})
+                minrec = {'arch': cm.get('arch'), 'participants': cm.get('participants'),
+                          'client_folder': cm.get('client_folder'), 'client_num': cm.get('client_num'),
+                          'local_present': False, 'part_present': False,
+                          'local_valid': False, 'part_valid': False, 'local_count': 0, 'part_count': 0,
+                          'code': 'M', 'run_path': cm.get('run_path'),
+                          'max_encode_ms': cm.get('max_encode_ms'), 'max_decode_ms': cm.get('max_decode_ms')}
+                presence_records.append(minrec)
+                # also ensure diagnostics sees this row
+                try:
+                    presence_records_unfiltered.append(dict(minrec))
+                except Exception:
+                    pass
     except Exception:
         pass
 
     try:
-        write_diagnostics(presence_records=presence_records, missing_records=missing_rows, analysis_folder=ANALYSIS_FOLDER)
+        write_diagnostics(presence_records=presence_records_unfiltered or presence_records, missing_records=missing_rows, analysis_folder=ANALYSIS_FOLDER)
     except Exception as e:
         print('Failed to write diagnostics summary:', e)
 

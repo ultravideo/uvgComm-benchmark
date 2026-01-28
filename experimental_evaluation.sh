@@ -12,6 +12,12 @@ SOURCE_FILE_720_URL="https://media.xiph.org/video/derf/y4m/Johnny_1280x720_60.y4
 SOURCE_FILE_720="./input/Johnny_1280x720_60.y4m"
 INPUT_FILE_720="./input/Johnny_1280x720_30fps.yuv"
 
+# 1080p (Beauty FullHD) source archive and input placeholder
+SOURCE_FULLHD_URL="https://ultravideo.fi/video/Beauty_1920x1080_120fps_420_8bit_YUV_RAW.7z"
+SOURCE_FULLHD_ARCHIVE="./input/Beauty_1920x1080_120fps_420_8bit_YUV_RAW.7z"
+EXTRACTED_FULLHD_FILE="./input/Beauty_1920x1080.yuv"
+INPUT_FILE_FULLHD="./input/Beauty_1920x1080_30fps.yuv"
+
 # 4K (Beauty) source archive and input placeholder
 SOURCE_4K_URL="https://ultravideo.fi/video/Beauty_3840x2160_120fps_420_8bit_YUV_RAW.7z"
 SOURCE_4K_ARCHIVE="./input/Beauty_3840x2160_120fps_420_8bit_YUV_RAW.7z"
@@ -281,29 +287,11 @@ prepare_tests() {
                "$INPUT_FILE_720"
     fi
 
-    if [ ! -f "$SOURCE_4K_ARCHIVE" ]; then
-        wget -O "$SOURCE_4K_ARCHIVE" "$SOURCE_4K_URL"
-    fi
+    # Prepare FullHD (1920x1080) using helper
+    prepare_archive "$SOURCE_FULLHD_ARCHIVE" "$SOURCE_FULLHD_URL" "$EXTRACTED_FULLHD_FILE" "$INPUT_FILE_FULLHD" 1920 1080 120
 
-    if [ ! -f "$EXTRACTED_4K_FILE" ] && [ -f "$SOURCE_4K_ARCHIVE" ]; then
-        if command -v 7z >/dev/null 2>&1; then
-            7z x -y -o"input" "$SOURCE_4K_ARCHIVE"
-        else
-            p7zip -d "$SOURCE_4K_ARCHIVE" || true
-        fi
-    fi
-
-    if [ ! -f "$EXTRACTED_4K_FILE" ]; then
-        extracted=$(find input -maxdepth 1 -type f -iname '*3840*2160*.yuv' -print -quit)
-        if [ -n "$extracted" ]; then
-            mv "$extracted" "$EXTRACTED_4K_FILE" 2>/dev/null || true
-        fi
-    fi
-
-    if [ ! -f "$INPUT_FILE_4K" ] && [ -f "$EXTRACTED_4K_FILE" ]; then
-        ffmpeg -y -f rawvideo -pixel_format yuv420p -video_size 3840x2160 -framerate 120 -i "$EXTRACTED_4K_FILE" \
-            -vf "select='not(mod(n,4))',setpts=N/($frame_rate*TB)" -vsync vfr -c:v rawvideo -pix_fmt yuv420p "$INPUT_FILE_4K"
-    fi
+    # Prepare 4K (3840x2160) using helper
+    prepare_archive "$SOURCE_4K_ARCHIVE" "$SOURCE_4K_URL" "$EXTRACTED_4K_FILE" "$INPUT_FILE_4K" 3840 2160 120
 
     mkdir -p "$RUN_FOLDER"
     # Generate usernames.conf once here (not per-scenario). Use MAX_CLIENTS as
@@ -320,7 +308,7 @@ prepare_tests() {
         fi
     done
 
-    echo "Preparation complete. Input files ready: $INPUT_FILE_720 and $INPUT_FILE_4K"
+    echo "Preparation complete. Input files ready: $INPUT_FILE_720, $INPUT_FILE_FULLHD and $INPUT_FILE_4K"
 }
 
 write_metadata() {
@@ -371,7 +359,7 @@ write_run_parameters() {
     {
         echo "cmd: ${ORIGINAL_CMDLINE-}"
         echo "opts: RUN_COUNT=${RUN_COUNT} CLIENTS_LIST=${CLIENTS_LIST} ARCHS=${ARCHS} RESOLUTIONS=${RESOLUTIONS} VIEW_MODE=${VIEW_MODE} VISIBLE_PARTICIPANTS=${VISIBLE_PARTICIPANTS} EXPERIMENT_TIME=${EXPERIMENT_TIME} LATENCY_MODES=${LATENCY_MODES} SEND_BW_MODE=${SEND_BW_MODE}"
-        echo "inputs: 720=${INPUT_FILE_720} 4k=${INPUT_FILE_4K}"
+        echo "inputs: 720=${INPUT_FILE_720} 1080=${INPUT_FILE_FULLHD} 4k=${INPUT_FILE_4K}"
         echo "estimated_total: ${total_hms:-unknown}"
         echo "start_ms: ${GLOBAL_START_MS-}"
     } > "${out_file}"
@@ -398,6 +386,59 @@ generate_usernames() {
     done
 
     echo "Generated ${users_file} with ${num_clients} clients"
+}
+
+# Helper: download, extract and convert a raw YUV archive to a 30fps input file
+# Usage: prepare_archive <archive_path> <archive_url> <extracted_yuv> <out_input_yuv> <width> <height> [src_framerate]
+prepare_archive() {
+    local archive_path="$1"
+    local archive_url="$2"
+    local extracted_yuv="$3"
+    local out_input="$4"
+    local width="$5"
+    local height="$6"
+    local src_framerate="${7:-120}"
+
+    # Download archive if missing
+    if [ ! -f "$archive_path" ]; then
+        wget -O "$archive_path" "$archive_url"
+    fi
+
+    # Extract if we have the archive but not the extracted YUV
+    if [ ! -f "$extracted_yuv" ] && [ -f "$archive_path" ]; then
+        if command -v 7z >/dev/null 2>&1; then
+            7z x -y -o"input" "$archive_path"
+        else
+            p7zip -d "$archive_path" || true
+        fi
+    fi
+
+    # Try to find an extracted file matching the resolution if extraction was lossy
+    if [ ! -f "$extracted_yuv" ]; then
+        extracted=$(find input -maxdepth 1 -type f -iname "*${width}*${height}*.yuv" -print -quit)
+        if [ -n "$extracted" ]; then
+            mv "$extracted" "$extracted_yuv" 2>/dev/null || true
+        fi
+    fi
+
+    # Convert to target 30fps input if needed and extracted file exists
+    if [ ! -f "$out_input" ] && [ -f "$extracted_yuv" ]; then
+        # compute frame selection modulus (e.g., 120->30 means mod=4)
+        local mod=1
+        if [ -n "$frame_rate" ] && [ "$frame_rate" -gt 0 ] 2>/dev/null; then
+            mod=$(( src_framerate / frame_rate ))
+            if [ "$mod" -lt 1 ]; then
+                mod=1
+            fi
+        else
+            mod=$(( src_framerate / 30 ))
+            if [ "$mod" -lt 1 ]; then
+                mod=1
+            fi
+        fi
+        ffmpeg -y -f rawvideo -pixel_format yuv420p -video_size ${width}x${height} -framerate ${src_framerate} -i "$extracted_yuv" \
+            -vf "select='not(mod(n,${mod}))',setpts=N/(${frame_rate}*TB)" -vsync vfr -c:v rawvideo -pix_fmt yuv420p "$out_input"
+    fi
 }
 
 generate_client_configs() {
@@ -1184,9 +1225,11 @@ for LATENCY_MODE in "${LATENCY_RUNS[@]}"; do
                 for arch in "${ARCHS_ARRAY[@]}"; do
                     for BW_MODE in "${SEND_BW_ARRAY[@]}"; do
 
-                        # Choose input file: use 4K file for large resolutions as before
-                        if [ "${RES}" = "3840x2160" ] || [ "${RES}" = "1920x1080" ]; then
+                        # Choose input file per-resolution: prefer matching extracted inputs
+                        if [ "${RES}" = "3840x2160" ]; then
                             input_file="${INPUT_FILE_4K}"
+                        elif [ "${RES}" = "1920x1080" ]; then
+                            input_file="${INPUT_FILE_FULLHD}"
                         else
                             input_file="${INPUT_FILE_720}"
                         fi

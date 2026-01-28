@@ -27,7 +27,6 @@ import matplotlib
 import numpy as np
 import concurrent.futures
 from collections import defaultdict
-from itertools import groupby
 
 # Centralized architecture color mapping for consistent plots.
 # Keys are checked case-insensitively/substrings in `get_color_map`.
@@ -77,30 +76,26 @@ def parse_metadata(metadata_path):
     # try to coerce some common numeric values
     for key in ['Clients', 'Start_Timestamp', 'End_timestamp', 'Run']:
         if key in d:
-            try:
-                d[key] = int(d[key])
-            except Exception:
-                pass
+            v = _to_int_or_none(d.get(key))
+            if v is not None:
+                d[key] = v
     return d
 
 
-def find_latest_run(arch_folder):
-    """arch_folder is path to e.g. .../720p/SFU-2 ; find run_* subfolder with largest number."""
-    runs = [p for p in glob.glob(os.path.join(arch_folder, 'run_*')) if os.path.isdir(p)]
-    if not runs:
+def _to_int_or_none(v):
+    """Best-effort int conversion used for metadata-derived values."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
         return None
-    best = None
-    best_n = -1
-    for r in runs:
-        base = os.path.basename(r)
-        try:
-            n = int(base.split('_', 1)[1])
-        except Exception:
-            n = -1
-        if n > best_n:
-            best_n = n
-            best = r
-    return best
+
+
+def _to_float_or_none(v):
+    """Best-effort float conversion used for metric values."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def ensure_dir(p):
@@ -116,10 +111,12 @@ def find_timestamp_column(df):
         if 'timestamp' in lc or lc == 'time' or 'timestamp_ms' in lc:
             return c
     # fallback to first column
-    try:
+
+    if len(df.columns) >= 1:
         return df.columns[0]
-    except Exception:
-        return None
+    return None
+
+
 def filter_df_by_ts(df, start_ts, end_ts):
     """Filter DataFrame by timestamp interval [start_ts, end_ts] using a guessed timestamp column.
 
@@ -175,13 +172,11 @@ def get_min_max_ts(df):
     tscol = find_timestamp_column(df)
     if tscol is None:
         return None, None
-    try:
-        tsvals = pd.to_numeric(df[tscol], errors='coerce').dropna().astype(int).values
-        if tsvals.size:
-            return int(tsvals.min()), int(tsvals.max())
-    except Exception:
-        pass
-    return None, None
+
+    tsvals = pd.to_numeric(df[tscol], errors='coerce').dropna()
+    if tsvals.empty:
+        return None, None
+    return int(tsvals.min()), int(tsvals.max())
 
 
 def _match_with_offset(local_sizes, part_sizes, lookahead, verbose=False):
@@ -339,14 +334,10 @@ def detect_missing_frames(local_by_cname, participant_by_cname, start_ts=None, e
             p_df = pinfo['df']
             # Ensure participant traces are trimmed at the run start timestamp
             if start_ts is not None and p_df is not None:
-                try:
-                    tscol = find_timestamp_column(p_df)
-                    if tscol is not None:
-                        df_ts = pd.to_numeric(p_df[tscol], errors='coerce')
-                        p_df = p_df[df_ts >= start_ts]
-                except Exception:
-                    # keep original p_df on any failure
-                    pass
+                tscol = find_timestamp_column(p_df)
+                if tscol is not None:
+                    df_ts = pd.to_numeric(p_df[tscol], errors='coerce')
+                    p_df = p_df[df_ts >= start_ts]
             # find size column in participant csv results
             part_sizes, part_size_col = extract_numeric_list(p_df, ['Size(Bytes)', 'Size'], dtype=int)
 
@@ -380,10 +371,7 @@ def analyze_run(run_path):
     visible_limit = None
     for vk in ('Visible_Participants', 'VisibleParticipants', 'Visible', 'VisibleCount'):
         if vk in metadata:
-            try:
-                visible_limit = int(metadata[vk])
-            except Exception:
-                visible_limit = None
+            visible_limit = _to_int_or_none(metadata.get(vk))
             break
     metrics['visible_participants'] = visible_limit
 
@@ -405,21 +393,16 @@ def analyze_run(run_path):
                     pct_col = c
                     break
             if ts_col and pct_col:
+                cpu_df[ts_col] = pd.to_numeric(cpu_df[ts_col], errors='coerce')
+                cpu_df[pct_col] = pd.to_numeric(cpu_df[pct_col], errors='coerce')
                 cpu_df = cpu_df.dropna(subset=[ts_col, pct_col])
-                try:
-                    cpu_df[ts_col] = cpu_df[ts_col].astype(int)
-                except Exception:
-                    pass
                 start = metadata.get('Start_Timestamp')
                 end = metadata.get('End_timestamp') or metadata.get('End_Timestamp')
                 if start and end:
                     sel = cpu_df[(cpu_df[ts_col] >= start) & (cpu_df[ts_col] <= end)]
                 else:
                     sel = cpu_df
-                try:
-                    cpu_avg = float(pd.to_numeric(sel[pct_col], errors='coerce').dropna().mean())
-                except Exception:
-                    cpu_avg = None
+                cpu_avg = float(sel[pct_col].mean()) if not sel.empty else None
     metrics['cpu_avg'] = cpu_avg
 
     # discover client folders (only client containers) and host folder(s) separately.
@@ -433,11 +416,8 @@ def analyze_run(run_path):
     if metrics.get('visible_participants') is not None:
         vl = metrics['visible_participants']
         def _keep_client(folder):
-            try:
-                num = _extract_client_num_from_folder(folder)
-                return (num is None) or (num <= vl)
-            except Exception:
-                return True
+            num = _extract_client_num_from_folder(folder)
+            return (num is None) or (num <= vl)
         client_folders = [c for c in client_folders if _keep_client(c)]
     # combined list used for measured bandwidth parsing (clients + host)
     bandwidth_folders = client_folders + host_folders
@@ -473,41 +453,20 @@ def analyze_run(run_path):
             # with timestamps earlier than start_ts) but do NOT truncate the end —
             # sent frames may arrive after the run end timestamp.
             if start_ts is not None:
-                try:
-                    tscol = find_timestamp_column(df)
-                    if tscol is not None:
-                        df_ts = pd.to_numeric(df[tscol], errors='coerce')
-                        df = df[df_ts >= start_ts]
-                except Exception:
-                    # if filtering fails, keep original df
-                    pass
+                tscol = find_timestamp_column(df)
+                if tscol is not None:
+                    df_ts = pd.to_numeric(df[tscol], errors='coerce')
+                    df = df[df_ts >= start_ts]
             participant_by_cname[cname].append({'path': path, 'df': df, 'client_folder': cfolder})
 
     metrics['local_by_cname'] = local_by_cname
     metrics['participant_by_cname'] = participant_by_cname
 
     # Debugging aid: if participant traces exist but later no latencies are found,
-    # it helps to know what columns are present in a sample participant file.
-    try:
-        total_part_files = sum(len(v) for v in participant_by_cname.values())
-        if total_part_files == 0:
-            print(f"[debug] No participant_*.csv files found in run {run_path}")
-        else:
-            # find first non-empty df to inspect columns
-            sample_cols = None
-            for plist in participant_by_cname.values():
-                for info in plist:
-                    if info.get('df') is not None:
-                        try:
-                            sample_cols = list(info.get('df').columns)
-                        except Exception:
-                            sample_cols = None
-                        break
-                if sample_cols is not None:
-                    break
-            # sample participant columns inspected during development; omit verbose debug output
-    except Exception:
-        pass
+    # it's useful to know whether participant traces were present at all.
+    total_part_files = sum(len(v) for v in participant_by_cname.values())
+    if total_part_files == 0:
+        print(f"[debug] No participant_*.csv files found in run {run_path}")
 
     # PSNR: collect per-client PSNR and overall average
     psnr_values = []
@@ -569,20 +528,12 @@ def analyze_run(run_path):
         if encvals:
             encode_times.extend(encvals)
             # record per-client max encode time (key by client folder path for reliable matching)
-            try:
-                cfolder = info.get('client_folder')
-                key = cfolder if cfolder is not None else None
-                cur = max(encvals) if encvals else None
-                if cur is not None:
-                    if key in max_encode_by_client:
-                        try:
-                            max_encode_by_client[key] = max(cur, float(max_encode_by_client.get(key, float('-inf'))))
-                        except Exception:
-                            max_encode_by_client[key] = cur
-                    else:
-                        max_encode_by_client[key] = cur
-            except Exception:
-                pass
+            cfolder = info.get('client_folder')
+            key = cfolder
+            cur = max(encvals) if encvals else None
+            if cur is not None:
+                prev = max_encode_by_client.get(key)
+                max_encode_by_client[key] = cur if prev is None else max(cur, prev)
     metrics['avg_frame_size'] = float(np.mean(sizes)) if sizes else None
     metrics['avg_width'] = float(np.mean(widths)) if widths else None
     metrics['avg_height'] = float(np.mean(heights)) if heights else None
@@ -607,29 +558,18 @@ def analyze_run(run_path):
             lvals, _ = extract_numeric_list(df, ['Latency(ms)', 'Latency', 'latency'], dtype=float)
             if lvals:
                 latencies.extend(lvals)
-                try:
-                    sender_lvals.extend([float(x) for x in lvals])
-                except Exception:
-                    pass
+                sender_lvals.extend(lvals)
 
             dvals, _ = extract_numeric_list(df, ['DecodeTime(ms)', 'DecodeTime', 'DecodeTimeMs'], dtype=float)
             if dvals:
                 decode_times.extend(dvals)
                 # record per-client max decode time (key by client folder path for reliable matching)
-                try:
-                    cfolder = info.get('client_folder')
-                    key = cfolder if cfolder is not None else None
-                    curd = max(dvals) if dvals else None
-                    if curd is not None:
-                        if key in max_decode_by_client:
-                            try:
-                                max_decode_by_client[key] = max(curd, float(max_decode_by_client.get(key, float('-inf'))))
-                            except Exception:
-                                max_decode_by_client[key] = curd
-                        else:
-                            max_decode_by_client[key] = curd
-                except Exception:
-                    pass
+                cfolder = info.get('client_folder')
+                key = cfolder
+                curd = max(dvals) if dvals else None
+                if curd is not None:
+                    prev = max_decode_by_client.get(key)
+                    max_decode_by_client[key] = curd if prev is None else max(curd, prev)
 
             pvals, _ = extract_numeric_list(df, ['Size(Bytes)', 'Size'], dtype=int)
             if pvals:
@@ -644,10 +584,7 @@ def analyze_run(run_path):
 
         # compute mean latency for this sender (across all receivers)
         if sender_lvals:
-            try:
-                mean_sender_lat = float(np.mean(sender_lvals))
-            except Exception:
-                mean_sender_lat = None
+            mean_sender_lat = float(np.mean(sender_lvals))
             sender_folder = None
             if cname in local_by_cname:
                 sender_folder = local_by_cname.get(cname, {}).get('client_folder')
@@ -660,28 +597,26 @@ def analyze_run(run_path):
     # setup/teardown intervals in the duration calculation. Fall back to trace-derived min/max
     # timestamps when metadata is not available.
     out_bps = None
-    try:
-        if out_total_bytes:
-            if start_ts is not None and end_ts is not None and end_ts > start_ts:
-                dur_s = (end_ts - start_ts) / 1000.0
-                out_bps = (out_total_bytes * 8.0) / dur_s if dur_s > 0 else None
-            elif out_min_ts is not None and out_max_ts is not None and out_max_ts > out_min_ts:
-                dur_s = (out_max_ts - out_min_ts) / 1000.0
-                out_bps = (out_total_bytes * 8.0) / dur_s if dur_s > 0 else None
-    except Exception:
-        out_bps = None
+    if out_total_bytes:
+        start_i = _to_int_or_none(start_ts)
+        end_i = _to_int_or_none(end_ts)
+        if start_i is not None and end_i is not None and end_i > start_i:
+            dur_s = (end_i - start_i) / 1000.0
+            out_bps = (out_total_bytes * 8.0) / dur_s if dur_s > 0 else None
+        elif out_min_ts is not None and out_max_ts is not None and out_max_ts > out_min_ts:
+            dur_s = (out_max_ts - out_min_ts) / 1000.0
+            out_bps = (out_total_bytes * 8.0) / dur_s if dur_s > 0 else None
 
     in_bps = None
-    try:
-        if in_total_bytes:
-            if start_ts is not None and end_ts is not None and end_ts > start_ts:
-                dur_s = (end_ts - start_ts) / 1000.0
-                in_bps = (in_total_bytes * 8.0) / dur_s if dur_s > 0 else None
-            elif in_min_ts is not None and in_max_ts is not None and in_max_ts > in_min_ts:
-                dur_s = (in_max_ts - in_min_ts) / 1000.0
-                in_bps = (in_total_bytes * 8.0) / dur_s if dur_s > 0 else None
-    except Exception:
-        in_bps = None
+    if in_total_bytes:
+        start_i = _to_int_or_none(start_ts)
+        end_i = _to_int_or_none(end_ts)
+        if start_i is not None and end_i is not None and end_i > start_i:
+            dur_s = (end_i - start_i) / 1000.0
+            in_bps = (in_total_bytes * 8.0) / dur_s if dur_s > 0 else None
+        elif in_min_ts is not None and in_max_ts is not None and in_max_ts > in_min_ts:
+            dur_s = (in_max_ts - in_min_ts) / 1000.0
+            in_bps = (in_total_bytes * 8.0) / dur_s if dur_s > 0 else None
     metrics['outgoing_bps'] = out_bps
     metrics['incoming_bps'] = in_bps
     metrics['avg_latency_ms'] = float(np.mean(latencies)) if latencies else None
@@ -764,90 +699,75 @@ def parse_measured_bandwidth(client_folders, start_ts=None, end_ts=None):
     measured_out_host = []
     measured_in_host = []
     per_client_bandwidth = []
-    try:
-        for cfolder in client_folders:
-            bw_path = os.path.join(cfolder, 'bandwidth.csv')
-            if not os.path.isfile(bw_path):
-                continue
-            df = read_csv_guess(bw_path)
-            if df is None:
-                continue
+    for cfolder in client_folders:
+        bw_path = os.path.join(cfolder, 'bandwidth.csv')
+        if not os.path.isfile(bw_path):
+            continue
+        df = read_csv_guess(bw_path)
+        if df is None:
+            continue
 
-            # Filter by run window if possible
-            df = filter_df_by_ts(df, start_ts, end_ts)
+        # Filter by run window if possible
+        df = filter_df_by_ts(df, start_ts, end_ts)
 
-            cols_lc = [c.lower() for c in df.columns]
-            rx_bps_col = None
-            tx_bps_col = None
-            rx_bytes_col = None
-            tx_bytes_col = None
-            for i, c in enumerate(cols_lc):
-                if 'rx_bps' in c or 'rxps' in c or 'rx_bytes/s' in c or 'rx_b/s' in c:
-                    rx_bps_col = df.columns[i]
-                if 'tx_bps' in c or 'txps' in c or 'tx_bytes/s' in c or 'tx_b/s' in c:
-                    tx_bps_col = df.columns[i]
-                if 'rx_bytes' in c:
-                    rx_bytes_col = df.columns[i]
-                if 'tx_bytes' in c:
-                    tx_bytes_col = df.columns[i]
+        cols_lc = [c.lower() for c in df.columns]
+        rx_bps_col = None
+        tx_bps_col = None
+        rx_bytes_col = None
+        tx_bytes_col = None
+        for i, c in enumerate(cols_lc):
+            if 'rx_bps' in c or 'rxps' in c or 'rx_bytes/s' in c or 'rx_b/s' in c:
+                rx_bps_col = df.columns[i]
+            if 'tx_bps' in c or 'txps' in c or 'tx_bytes/s' in c or 'tx_b/s' in c:
+                tx_bps_col = df.columns[i]
+            if 'rx_bytes' in c:
+                rx_bytes_col = df.columns[i]
+            if 'tx_bytes' in c:
+                tx_bytes_col = df.columns[i]
 
-            tscol = find_timestamp_column(df)
-            duration_s = None
-            if tscol is not None:
-                try:
-                    ts = pd.to_numeric(df[tscol], errors='coerce').dropna()
-                    if len(ts) >= 2:
-                        interval_ms = float(ts.iloc[-1] - ts.iloc[0])
-                        if interval_ms > 0:
-                            duration_s = interval_ms / 1000.0
-                    if duration_s is not None:
-                        duration_s = max(duration_s, 0.001)
-                except Exception:
-                    duration_s = None
+        tscol = find_timestamp_column(df)
+        duration_s = None
+        if tscol is not None:
+            ts = pd.to_numeric(df[tscol], errors='coerce').dropna()
+            if len(ts) >= 2:
+                interval_ms = float(ts.iloc[-1] - ts.iloc[0])
+                if interval_ms > 0:
+                    duration_s = max(interval_ms / 1000.0, 0.001)
 
-            def _rate_from_bytes(col_name):
-                if col_name is None or duration_s is None:
-                    return None
-                vals = pd.to_numeric(df[col_name], errors='coerce').dropna()
-                if len(vals) < 2:
-                    return None
-                return float((vals.iloc[-1] - vals.iloc[0]) / duration_s) * 8.0
+        def _rate_from_bytes(col_name):
+            if col_name is None or duration_s is None:
+                return None
+            vals = pd.to_numeric(df[col_name], errors='coerce').dropna()
+            if len(vals) < 2:
+                return None
+            return float((vals.iloc[-1] - vals.iloc[0]) / duration_s) * 8.0
 
-            rx_mean = _rate_from_bytes(rx_bytes_col)
-            tx_mean = _rate_from_bytes(tx_bytes_col)
+        rx_mean = _rate_from_bytes(rx_bytes_col)
+        tx_mean = _rate_from_bytes(tx_bytes_col)
 
-            if rx_mean is None and rx_bps_col is not None:
-                try:
-                    rx_mean = float(pd.to_numeric(df[rx_bps_col], errors='coerce').dropna().mean()) * 8.0
-                except Exception:
-                    rx_mean = None
-            if tx_mean is None and tx_bps_col is not None:
-                try:
-                    tx_mean = float(pd.to_numeric(df[tx_bps_col], errors='coerce').dropna().mean()) * 8.0
-                except Exception:
-                    tx_mean = None
+        if rx_mean is None and rx_bps_col is not None:
+            rx_avg = pd.to_numeric(df[rx_bps_col], errors='coerce').dropna().mean()
+            rx_mean = (float(rx_avg) * 8.0) if pd.notna(rx_avg) else None
+        if tx_mean is None and tx_bps_col is not None:
+            tx_avg = pd.to_numeric(df[tx_bps_col], errors='coerce').dropna().mean()
+            tx_mean = (float(tx_avg) * 8.0) if pd.notna(tx_avg) else None
 
-            # classify folder: treat explicit host folder separately
-            base = os.path.basename(cfolder)
-            is_host = (base == 'uvgcomm-host' or 'host' in base.lower())
-            if is_host:
-                if rx_mean is not None:
-                    measured_in_host.append(rx_mean)
-                if tx_mean is not None:
-                    measured_out_host.append(tx_mean)
-            else:
-                if rx_mean is not None:
-                    measured_in_clients.append(rx_mean)
-                if tx_mean is not None:
-                    measured_out_clients.append(tx_mean)
-                # record per-client measured values for later first-vs-others analysis
-                try:
-                    client_num = _extract_client_num_from_folder(cfolder)
-                except Exception:
-                    client_num = None
-                per_client_bandwidth.append({'client_folder': cfolder, 'client_num': client_num, 'tx_bps': tx_mean, 'rx_bps': rx_mean})
-    except Exception:
-        pass
+        # classify folder: treat explicit host folder separately
+        base = os.path.basename(cfolder)
+        is_host = (base == 'uvgcomm-host' or 'host' in base.lower())
+        if is_host:
+            if rx_mean is not None:
+                measured_in_host.append(rx_mean)
+            if tx_mean is not None:
+                measured_out_host.append(tx_mean)
+        else:
+            if rx_mean is not None:
+                measured_in_clients.append(rx_mean)
+            if tx_mean is not None:
+                measured_out_clients.append(tx_mean)
+            # record per-client measured values for later first-vs-others analysis
+            client_num = _extract_client_num_from_folder(cfolder)
+            per_client_bandwidth.append({'client_folder': cfolder, 'client_num': client_num, 'tx_bps': tx_mean, 'rx_bps': rx_mean})
 
     c_out_mean = float(np.mean(measured_out_clients)) if measured_out_clients else None
     c_in_mean = float(np.mean(measured_in_clients)) if measured_in_clients else None
@@ -958,10 +878,7 @@ def plot_measured_bandwidth_speaker_vs_listeners(measured_speaker_stats, measure
         ax.set_ylabel('Measured Outgoing Bandwidth (Mbps)')
         ax.set_title(f'Measured Bandwidth: Speaker vs Listeners - {scenario}')
         ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
-        try:
-            ax.set_xticks(idx)
-        except Exception:
-            pass
+        ax.set_xticks(idx)
         ax.legend(fontsize=8)
         plt.tight_layout()
         out = os.path.join(analysis_folder, 'measured_bandwidth_speaker_vs_listeners.svg')
@@ -1139,41 +1056,43 @@ def _client_crash_reason(run_path, client_num):
     crash reason string if a crash / non-zero exit appears in the log.
     Returns None if no evident crash is found.
     """
-    try:
-        client_folders = sorted([p for p in glob.glob(os.path.join(run_path, 'uvgcomm-client*')) if os.path.isdir(p)])
-        for cf in client_folders:
-            num = _extract_client_num_from_folder(cf)
-            if num is None:
-                continue
-            if int(num) != int(client_num):
-                continue
-            log_path = os.path.join(cf, 'docker.log')
-            if not os.path.isfile(log_path):
-                continue
-            try:
-                with open(log_path, 'r', errors='ignore') as f:
-                    # read tail to keep memory use small for large logs
-                    f.seek(0, os.SEEK_END)
-                    size = f.tell()
-                    tail_size = min(32768, size)
-                    f.seek(max(0, size - tail_size))
-                    tail = f.read()
-            except Exception:
-                continue
-            tail_lc = tail.lower()
-            if 'segmentation fault' in tail_lc or 'core dumped' in tail_lc:
-                return 'segmentation fault'
-            # docker exit codes are often printed as 'exited with code <n>'
-            import re
-            m = re.search(r'exited with code\s*(\d+)', tail_lc)
-            if m:
-                code = int(m.group(1))
-                return f'exited code {code}'
-            # generic non-zero exit hints
-            if 'exited' in tail_lc and 'code' in tail_lc:
-                return 'exited'
-    except Exception:
-        pass
+    target = _to_int_or_none(client_num)
+    if target is None:
+        return None
+
+    client_folders = sorted([p for p in glob.glob(os.path.join(run_path, 'uvgcomm-client*')) if os.path.isdir(p)])
+    for cf in client_folders:
+        num = _extract_client_num_from_folder(cf)
+        if num is None or num != target:
+            continue
+        log_path = os.path.join(cf, 'docker.log')
+        if not os.path.isfile(log_path):
+            continue
+        try:
+            with open(log_path, 'r', errors='ignore') as f:
+                # read tail to keep memory use small for large logs
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                tail_size = min(32768, size)
+                f.seek(max(0, size - tail_size))
+                tail = f.read()
+        except OSError:
+            continue
+
+        tail_lc = tail.lower()
+        if 'segmentation fault' in tail_lc or 'core dumped' in tail_lc:
+            return 'segmentation fault'
+
+        # docker exit codes are often printed as 'exited with code <n>'
+        import re
+        m = re.search(r'exited with code\s*(\d+)', tail_lc)
+        if m:
+            code = int(m.group(1))
+            return f'exited code {code}'
+
+        # generic non-zero exit hints
+        if 'exited' in tail_lc and 'code' in tail_lc:
+            return 'exited'
     return None
 
 
@@ -1234,11 +1153,7 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
                 # If both traces are missing, try to detect if the client container
                 # crashed (segfault / non-zero exit) and prefer a more informative
                 # status string for diagnostics.
-                crash = None
-                try:
-                    crash = _client_crash_reason(runp, client)
-                except Exception:
-                    crash = None
+                crash = _client_crash_reason(runp, client)
                 if crash:
                     status = f'crashed ({crash})'
                 else:
@@ -1418,34 +1333,28 @@ def accumulate_run_results(metrics, arch, participants, run_path,
         psnr_stats[arch][parts_eff].append(psnr_val)
 
     # Speaker-vs-listeners PSNR aggregation (per-client mean values collected in analyze_run)
-    try:
-        pclients = metrics.get('psnr_per_client') or []
-        if pclients:
-            # visible filtering: include clients with no numeric id or id <= parts_eff when parts_eff present
-            visible = [p for p in pclients if (parts_eff is None) or (p.get('client_num') is None) or (p.get('client_num') <= parts_eff)]
-            if visible:
-                # select first as speaker client: prefer client_num==1, else lowest numeric, else first entry
-                speaker = next((p for p in visible if p.get('client_num') == 1), None)
-                if speaker is None:
-                    numeric = [p for p in visible if p.get('client_num') is not None]
-                    if numeric:
-                        speaker = min(numeric, key=lambda x: x['client_num'])
-                    else:
-                        speaker = visible[0]
-                listeners = [p for p in visible if p is not speaker]
-                speaker_val = float(speaker.get('mean_psnr')) if speaker.get('mean_psnr') is not None else None
-                listeners_vals = [float(p.get('mean_psnr')) for p in listeners if p.get('mean_psnr') is not None]
-                listeners_mean = float(np.mean(listeners_vals)) if listeners_vals else None
-                if parts_eff not in psnr_speaker_stats[arch]:
-                    psnr_speaker_stats[arch][parts_eff] = []
-                if parts_eff not in psnr_listeners_stats[arch]:
-                    psnr_listeners_stats[arch][parts_eff] = []
-                if speaker_val is not None:
-                    psnr_speaker_stats[arch][parts_eff].append(speaker_val)
-                if listeners_mean is not None:
-                    psnr_listeners_stats[arch][parts_eff].append(listeners_mean)
-    except Exception:
-        pass
+    pclients = metrics.get('psnr_per_client') or []
+    if pclients:
+        # visible filtering: include clients with no numeric id or id <= parts_eff when parts_eff present
+        visible = [p for p in pclients if (parts_eff is None) or (p.get('client_num') is None) or (p.get('client_num') <= parts_eff)]
+        if visible:
+            # select first as speaker client: prefer client_num==1, else lowest numeric, else first entry
+            speaker = next((p for p in visible if p.get('client_num') == 1), None)
+            if speaker is None:
+                numeric = [p for p in visible if p.get('client_num') is not None]
+                speaker = min(numeric, key=lambda x: x['client_num']) if numeric else visible[0]
+            listeners = [p for p in visible if p is not speaker]
+
+            speaker_val = _to_float_or_none(speaker.get('mean_psnr'))
+            listeners_vals = [v for v in (_to_float_or_none(p.get('mean_psnr')) for p in listeners) if v is not None]
+            listeners_mean = float(np.mean(listeners_vals)) if listeners_vals else None
+
+            psnr_speaker_stats[arch].setdefault(parts_eff, [])
+            psnr_listeners_stats[arch].setdefault(parts_eff, [])
+            if speaker_val is not None:
+                psnr_speaker_stats[arch][parts_eff].append(speaker_val)
+            if listeners_mean is not None:
+                psnr_listeners_stats[arch][parts_eff].append(listeners_mean)
 
     # missing frames summary appended (attach client_num inferred from receiver_folder)
     for m in metrics.get('missing_summary', []):
@@ -1474,61 +1383,49 @@ def accumulate_run_results(metrics, arch, participants, run_path,
     measured_rows.append(measured_row)
 
     # First-vs-others measured outgoing bandwidth aggregation (per-client tx_bps list)
-    try:
-        pc_bw = metrics.get('measured_outgoing_bps_per_client_list') or []
-        if pc_bw:
-            visible_bw = [p for p in pc_bw if (parts_eff is None) or (p.get('client_num') is None) or (p.get('client_num') <= parts_eff)]
-            if visible_bw:
-                first = next((p for p in visible_bw if p.get('client_num') == 1), None)
-                if first is None:
-                    numeric = [p for p in visible_bw if p.get('client_num') is not None]
-                    if numeric:
-                        first = min(numeric, key=lambda x: x['client_num'])
-                    else:
-                        first = visible_bw[0]
-                rest = [p for p in visible_bw if p is not first]
-                first_tx = float(first.get('tx_bps')) if first.get('tx_bps') is not None else None
-                rest_vals = [float(p.get('tx_bps')) for p in rest if p.get('tx_bps') is not None]
-                rest_mean = float(np.mean(rest_vals)) if rest_vals else None
-                if parts_eff not in measured_speaker_stats[arch]:
-                    measured_speaker_stats[arch][parts_eff] = []
-                if parts_eff not in measured_listeners_stats[arch]:
-                    measured_listeners_stats[arch][parts_eff] = []
-                if first_tx is not None:
-                    measured_speaker_stats[arch][parts_eff].append(first_tx)
-                if rest_mean is not None:
-                    measured_listeners_stats[arch][parts_eff].append(rest_mean)
-    except Exception:
-        pass
+    pc_bw = metrics.get('measured_outgoing_bps_per_client_list') or []
+    if pc_bw:
+        visible_bw = [p for p in pc_bw if (parts_eff is None) or (p.get('client_num') is None) or (p.get('client_num') <= parts_eff)]
+        if visible_bw:
+            first = next((p for p in visible_bw if p.get('client_num') == 1), None)
+            if first is None:
+                numeric = [p for p in visible_bw if p.get('client_num') is not None]
+                first = min(numeric, key=lambda x: x['client_num']) if numeric else visible_bw[0]
+            rest = [p for p in visible_bw if p is not first]
+
+            first_tx = _to_float_or_none(first.get('tx_bps'))
+            rest_vals = [v for v in (_to_float_or_none(p.get('tx_bps')) for p in rest) if v is not None]
+            rest_mean = float(np.mean(rest_vals)) if rest_vals else None
+
+            measured_speaker_stats[arch].setdefault(parts_eff, [])
+            measured_listeners_stats[arch].setdefault(parts_eff, [])
+            if first_tx is not None:
+                measured_speaker_stats[arch][parts_eff].append(first_tx)
+            if rest_mean is not None:
+                measured_listeners_stats[arch][parts_eff].append(rest_mean)
 
     # Speaker-vs-listeners latency aggregation (per-sender mean latency collected in analyze_run)
-    try:
-        lclients = metrics.get('latency_per_sender') or []
-        if lclients and latency_speaker_stats is not None and latency_listeners_stats is not None:
-            visible = [p for p in lclients if (parts_eff is None) or (p.get('client_num') is None) or (p.get('client_num') <= parts_eff)]
-            if visible:
-                # select speaker: prefer client_num==1, else lowest numeric, else first
-                speaker = next((p for p in visible if p.get('client_num') == 1), None)
-                if speaker is None:
-                    numeric = [p for p in visible if p.get('client_num') is not None]
-                    if numeric:
-                        speaker = min(numeric, key=lambda x: x['client_num'])
-                    else:
-                        speaker = visible[0]
-                listeners = [p for p in visible if p is not speaker]
-                speaker_val = float(speaker.get('mean_latency_ms')) if speaker.get('mean_latency_ms') is not None else None
-                listeners_vals = [float(p.get('mean_latency_ms')) for p in listeners if p.get('mean_latency_ms') is not None]
-                listeners_mean = float(np.mean(listeners_vals)) if listeners_vals else None
-                if parts_eff not in latency_speaker_stats.setdefault(arch, {}):
-                    latency_speaker_stats[arch][parts_eff] = []
-                if parts_eff not in latency_listeners_stats.setdefault(arch, {}):
-                    latency_listeners_stats[arch][parts_eff] = []
-                if speaker_val is not None:
-                    latency_speaker_stats[arch][parts_eff].append(speaker_val)
-                if listeners_mean is not None:
-                    latency_listeners_stats[arch][parts_eff].append(listeners_mean)
-    except Exception:
-        pass
+    lclients = metrics.get('latency_per_sender') or []
+    if lclients and latency_speaker_stats is not None and latency_listeners_stats is not None:
+        visible = [p for p in lclients if (parts_eff is None) or (p.get('client_num') is None) or (p.get('client_num') <= parts_eff)]
+        if visible:
+            # select speaker: prefer client_num==1, else lowest numeric, else first
+            speaker = next((p for p in visible if p.get('client_num') == 1), None)
+            if speaker is None:
+                numeric = [p for p in visible if p.get('client_num') is not None]
+                speaker = min(numeric, key=lambda x: x['client_num']) if numeric else visible[0]
+            listeners = [p for p in visible if p is not speaker]
+
+            speaker_val = _to_float_or_none(speaker.get('mean_latency_ms'))
+            listeners_vals = [v for v in (_to_float_or_none(p.get('mean_latency_ms')) for p in listeners) if v is not None]
+            listeners_mean = float(np.mean(listeners_vals)) if listeners_vals else None
+
+            latency_speaker_stats.setdefault(arch, {}).setdefault(parts_eff, [])
+            latency_listeners_stats.setdefault(arch, {}).setdefault(parts_eff, [])
+            if speaker_val is not None:
+                latency_speaker_stats[arch][parts_eff].append(speaker_val)
+            if listeners_mean is not None:
+                latency_listeners_stats[arch][parts_eff].append(listeners_mean)
 
     # latency/encode/decode
     latency_rows.append({'arch': arch, 'participants': parts_eff,
@@ -1536,23 +1433,17 @@ def accumulate_run_results(metrics, arch, participants, run_path,
                          'avg_encode_ms': metrics.get('avg_encode_ms'),
                          'avg_decode_ms': metrics.get('avg_decode_ms')})
     # collect per-client max encode/decode reported by analyze_run (may use None keys)
-    try:
-        me = metrics.get('max_encode_by_client', {}) or {}
-        md = metrics.get('max_decode_by_client', {}) or {}
-        # union of client keys
-        keys = set(list(me.keys()) + list(md.keys()))
-        for k in keys:
-            # k is the key used in analyze_run for per-client maxima (now a client_folder path or None)
-            client_folder_key = k
-            try:
-                client_num_val = _extract_client_num_from_folder(k) if isinstance(k, str) else k
-            except Exception:
-                client_num_val = None
-            client_max_rows.append({'arch': arch, 'participants': participants, 'run_path': run_path,
-                                     'client_folder': client_folder_key, 'client_num': client_num_val,
-                                     'max_encode_ms': me.get(k), 'max_decode_ms': md.get(k)})
-    except Exception:
-        pass
+    me = metrics.get('max_encode_by_client', {}) or {}
+    md = metrics.get('max_decode_by_client', {}) or {}
+    # union of client keys
+    keys = set(list(me.keys()) + list(md.keys()))
+    for k in keys:
+        # k is the key used in analyze_run for per-client maxima (client_folder path or None)
+        client_folder_key = k
+        client_num_val = _extract_client_num_from_folder(k) if isinstance(k, str) else k
+        client_max_rows.append({'arch': arch, 'participants': participants, 'run_path': run_path,
+                                 'client_folder': client_folder_key, 'client_num': client_num_val,
+                                 'max_encode_ms': me.get(k), 'max_decode_ms': md.get(k)})
 
 
 def build_psnr_dfs(psnr_stats):
@@ -1583,14 +1474,12 @@ def process_resolution_rows(resolution_rows, ANALYSIS_FOLDER):
         return
     # Convert aggregate bps to per-client Mbps for clearer interpretation
     def _bps_to_mbps_per_client(bps, participants):
-        try:
-            if bps is None:
-                return None
-            if participants is None or participants == 0:
-                return float(bps) / 1e6
-            return float(bps) / float(participants) / 1e6
-        except Exception:
+        bps_f = _to_float_or_none(bps)
+        if bps_f is None:
             return None
+        if participants is None or participants == 0:
+            return bps_f / 1e6
+        return bps_f / float(participants) / 1e6
 
     out_rows = []
     for _, r in res_df.iterrows():
@@ -2274,64 +2163,52 @@ def process_scenario(ROOT_FOLDER, scenario):
     except Exception as e:
         print('Failed to create PSNR speaker-vs-listeners plot:', e)
     # Merge per-client max encode/decode info collected during accumulation into presence records
-    try:
-        # client_max_rows samples were printed during debugging; removed
+    for cm in client_max_rows:
+        cm_arch = cm.get('arch')
+        cm_run = cm.get('run_path')
+        cm_folder = cm.get('client_folder')
+        cm_client_num = _to_int_or_none(cm.get('client_num'))
 
-        for cm in client_max_rows:
-            # find matching presence record: prefer exact client_folder match, fall back to numeric client_num
-            matched = None
-            for p in presence_records:
-                try:
-                    if p.get('arch') != cm.get('arch') or p.get('run_path') != cm.get('run_path'):
-                        continue
-                    # match by folder if available
-                    if p.get('client_folder') and cm.get('client_folder') and p.get('client_folder') == cm.get('client_folder'):
-                        matched = p
-                        break
-                    # fall back to numeric client id match
-                    if p.get('client_num') is not None and cm.get('client_num') is not None and int(p.get('client_num')) == int(cm.get('client_num')):
-                        matched = p
-                        break
-                except Exception:
+        # find matching presence record: prefer exact client_folder match, fall back to numeric client_num
+        matched = None
+        for p in presence_records:
+            if p.get('arch') != cm_arch or p.get('run_path') != cm_run:
+                continue
+            if p.get('client_folder') and cm_folder and p.get('client_folder') == cm_folder:
+                matched = p
+                break
+            p_client_num = _to_int_or_none(p.get('client_num'))
+            if p_client_num is not None and cm_client_num is not None and p_client_num == cm_client_num:
+                matched = p
+                break
+
+        if matched is not None:
+            matched['max_encode_ms'] = cm.get('max_encode_ms')
+            matched['max_decode_ms'] = cm.get('max_decode_ms')
+
+            # Also update the unfiltered presence records so diagnostics include these values.
+            for pu in presence_records_unfiltered:
+                if pu.get('arch') != cm_arch or pu.get('run_path') != cm_run:
                     continue
-            if matched is not None:
-                matched['max_encode_ms'] = cm.get('max_encode_ms')
-                matched['max_decode_ms'] = cm.get('max_decode_ms')
-                # Also update the unfiltered presence records so diagnostics
-                # written from `presence_records_unfiltered` include these values.
-                try:
-                    for pu in presence_records_unfiltered:
-                        try:
-                            if pu.get('arch') != cm.get('arch') or pu.get('run_path') != cm.get('run_path'):
-                                continue
-                            if pu.get('client_folder') and cm.get('client_folder') and pu.get('client_folder') == cm.get('client_folder'):
-                                pu['max_encode_ms'] = cm.get('max_encode_ms')
-                                pu['max_decode_ms'] = cm.get('max_decode_ms')
-                                break
-                            if pu.get('client_num') is not None and cm.get('client_num') is not None and int(pu.get('client_num')) == int(cm.get('client_num')):
-                                pu['max_encode_ms'] = cm.get('max_encode_ms')
-                                pu['max_decode_ms'] = cm.get('max_decode_ms')
-                                break
-                        except Exception:
-                            continue
-                except Exception:
-                    pass
-            else:
-                # append a minimal presence record if none exists
-                minrec = {'arch': cm.get('arch'), 'participants': cm.get('participants'),
-                          'client_folder': cm.get('client_folder'), 'client_num': cm.get('client_num'),
-                          'local_present': False, 'part_present': False,
-                          'local_valid': False, 'part_valid': False, 'local_count': 0, 'part_count': 0,
-                          'code': 'M', 'run_path': cm.get('run_path'),
-                          'max_encode_ms': cm.get('max_encode_ms'), 'max_decode_ms': cm.get('max_decode_ms')}
-                presence_records.append(minrec)
-                # also ensure diagnostics sees this row
-                try:
-                    presence_records_unfiltered.append(dict(minrec))
-                except Exception:
-                    pass
-    except Exception:
-        pass
+                if pu.get('client_folder') and cm_folder and pu.get('client_folder') == cm_folder:
+                    pu['max_encode_ms'] = cm.get('max_encode_ms')
+                    pu['max_decode_ms'] = cm.get('max_decode_ms')
+                    break
+                pu_client_num = _to_int_or_none(pu.get('client_num'))
+                if pu_client_num is not None and cm_client_num is not None and pu_client_num == cm_client_num:
+                    pu['max_encode_ms'] = cm.get('max_encode_ms')
+                    pu['max_decode_ms'] = cm.get('max_decode_ms')
+                    break
+        else:
+            # append a minimal presence record if none exists
+            minrec = {'arch': cm_arch, 'participants': cm.get('participants'),
+                      'client_folder': cm_folder, 'client_num': cm.get('client_num'),
+                      'local_present': False, 'part_present': False,
+                      'local_valid': False, 'part_valid': False, 'local_count': 0, 'part_count': 0,
+                      'code': 'M', 'run_path': cm_run,
+                      'max_encode_ms': cm.get('max_encode_ms'), 'max_decode_ms': cm.get('max_decode_ms')}
+            presence_records.append(minrec)
+            presence_records_unfiltered.append(dict(minrec))
 
     try:
         write_diagnostics(presence_records=presence_records_unfiltered or presence_records, missing_records=missing_rows, analysis_folder=ANALYSIS_FOLDER)

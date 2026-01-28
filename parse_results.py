@@ -21,6 +21,7 @@ import os
 import glob
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import argparse
 import matplotlib
 import numpy as np
@@ -28,6 +29,13 @@ import concurrent.futures
 from collections import defaultdict
 from itertools import groupby
 
+# Centralized architecture color mapping for consistent plots.
+# Keys are checked case-insensitively/substrings in `get_color_map`.
+ARCH_COLOR_MAP = {
+    'p2p': '#1f77b4',      # P2P Mesh
+    'sfu': '#ff7f0e',      # SFU
+    'hybrid': '#2ca02c'    # Hybrid
+}
 # Use non-interactive backend for matplotlib
 matplotlib.use("Agg")
 
@@ -1019,10 +1027,10 @@ def plot_latency_speaker_vs_listeners(latency_speaker_stats, latency_listeners_s
         except Exception:
             pass
         plt.tight_layout()
-        out = os.path.join(analysis_folder, 'latency_speaker_vs_listeners.svg')
+        out = os.path.join(analysis_folder, 'latency_speaker_vs_listener.svg')
         plt.savefig(out)
         plt.close()
-        print('Saved latency speaker-vs-listeners plot:', out)
+        print('Saved latency speaker-vs-listener plot:', out)
     except Exception as e:
         print('Failed to create latency speaker-vs-listeners plot:', e)
 
@@ -1060,6 +1068,22 @@ def get_color_map(keys):
         prop_cycle = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
     cmap = {}
     for i, k in enumerate(sorted(keys)):
+        # Prefer canonical ARCH_COLOR_MAP entries for well-known architectures.
+        try:
+            if isinstance(k, str):
+                kn = k.strip().lower()
+                if 'p2p' in kn:
+                    cmap[k] = ARCH_COLOR_MAP.get('p2p')
+                    continue
+                if 'sfu' in kn:
+                    cmap[k] = ARCH_COLOR_MAP.get('sfu')
+                    continue
+                if 'hybrid' in kn:
+                    cmap[k] = ARCH_COLOR_MAP.get('hybrid')
+                    continue
+        except Exception:
+            pass
+        # Fallback to matplotlib cycle for unknown keys
         cmap[k] = prop_cycle[i % len(prop_cycle)]
     return cmap
 
@@ -1767,12 +1791,25 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
             key = (arch, parts_i)
             exp = expected_runs.get(key, 1)
             if 'avg_latency_ms' in g:
-                tvals = list(pd.to_numeric(g['avg_latency_ms'], errors='coerce').fillna(999).astype(float).tolist())
+                tvals = pd.to_numeric(g['avg_latency_ms'], errors='coerce').dropna().astype(float).tolist()
             else:
                 tvals = []
+            # If there are fewer samples than expected, omit this (log reason).
             if len(tvals) < exp:
-                tvals.extend([999.0] * (exp - len(tvals)))
-            mean_t = float(np.mean(tvals)) if tvals else 999.0
+                try:
+                    print(f"Insufficient latency samples for arch={arch} participants={parts_i}: expected {exp}, got {len(tvals)}; omitting from aggregates")
+                except Exception:
+                    print("Insufficient latency samples; omitting from aggregates")
+                mean_t = None
+            else:
+                mean_t = float(np.mean(tvals)) if tvals else None
+                # treat unreasonably large means as missing and log
+                if mean_t is not None and mean_t >= 900.0:
+                    try:
+                        print(f"Unreasonable mean latency for arch={arch} participants={parts_i}: {mean_t}; omitting from aggregates")
+                    except Exception:
+                        print("Unreasonable mean latency encountered; omitting from aggregates")
+                    mean_t = None
 
             mean_e = None
             mean_d = None
@@ -1785,59 +1822,97 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                              'mean_decode': mean_d, 'mean_total': mean_t})
 
         if agg_rows:
-            fig, ax = plt.subplots(figsize=(8,4))
-            labels = []
-            enc = []
-            dec = []
-            oth = []
-            agg_rows = sorted(agg_rows, key=lambda x: (x['arch'], x['participants']))
+            # Reorganize latency breakdown as grouped bars by participant count
+            # x-axis: participant counts; for each participant show architectures side-by-side
+            # with stacked segments (Encoding, Decoding, Other) so architectures are
+            # comparable per participant count.
+            # Build mapping participants -> arch -> segments
+            data_map = {}
+            archs = sorted({r['arch'] for r in agg_rows})
+            parts = sorted({int(r['participants']) for r in agg_rows})
+            for p in parts:
+                data_map[p] = {}
+                for a in archs:
+                    data_map[p][a] = {'enc': 0.0, 'dec': 0.0, 'oth': 0.0}
             for r in agg_rows:
-                labels.append(f"{r['arch']}-{int(r['participants'])}")
-                t = r['mean_total']
+                a = r['arch']
+                p = int(r['participants'])
+                t = r.get('mean_total') or 0.0
                 e = r.get('mean_encode')
                 d = r.get('mean_decode')
-                enc_present = e is not None
-                dec_present = d is not None
-                enc_val = float(e) if enc_present else 0.0
-                dec_val = float(d) if dec_present else 0.0
-                o = max(0.0, float(t) - enc_val - dec_val)
-                enc.append(enc_val if enc_present else 0.0)
-                dec.append(min(dec_val, 999.0) if dec_present else 0.0)
-                oth.append(o)
-            x = np.arange(len(labels))
-            ax.bar(x, enc, label='Encoding')
-            ax.bar(x, dec, bottom=enc, label='Decoding')
-            bottom_ed = np.array(enc) + np.array(dec)
-            ax.bar(x, oth, bottom=bottom_ed, label='Other')
+                enc_val = float(e) if e is not None else 0.0
+                dec_val = float(d) if d is not None else 0.0
+                oth_val = max(0.0, float(t) - enc_val - dec_val)
+                data_map[p][a] = {'enc': enc_val, 'dec': min(dec_val, 999.0), 'oth': oth_val}
+
+            fig, ax = plt.subplots(figsize=(10,5))
+            x = np.arange(len(parts))
+            total_width = 0.8
+            n_arch = max(1, len(archs))
+            bar_w = total_width / n_arch
+            cmap = get_color_map(archs)
+            hatch_map = {'enc': '', 'dec': '//', 'oth': '..'}
+            # draw bars per-architecture offset within each participant group
+            for i, arch in enumerate(archs):
+                pos = x - total_width/2 + i * bar_w + bar_w/2
+                enc_vals = [data_map[p][arch]['enc'] for p in parts]
+                dec_vals = [data_map[p][arch]['dec'] for p in parts]
+                oth_vals = [data_map[p][arch]['oth'] for p in parts]
+                col = cmap.get(arch)
+                p1 = ax.bar(pos, enc_vals, bar_w, color=col, label=arch if i == 0 else None, hatch=hatch_map['enc'], edgecolor='black')
+                p2 = ax.bar(pos, dec_vals, bar_w, bottom=enc_vals, color=col, hatch=hatch_map['dec'], edgecolor='black')
+                bottom_ed = np.array(enc_vals) + np.array(dec_vals)
+                p3 = ax.bar(pos, oth_vals, bar_w, bottom=bottom_ed, color=col, hatch=hatch_map['oth'], edgecolor='black')
+
+            # X axis ticks are participant counts (one group per participant count)
             ax.set_xticks(x)
-            ax.set_xticklabels(labels, rotation=45, ha='right')
+            ax.set_xticklabels([str(p) for p in parts], rotation=0)
+            ax.set_xlabel('Number of Participants')
             ax.set_ylabel('Time (ms)')
-            ax.set_title('Latency breakdown')
-            ax.legend()
+            ax.set_title('Latency breakdown (grouped by participants, architectures side-by-side)')
+            ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
+            # Build legend: show architectures (color) and stack segments (hatch)
+            arch_handles = [mpatches.Patch(facecolor=cmap.get(a), edgecolor='black', label=a) for a in archs]
+            seg_handles = [mpatches.Patch(facecolor='white', edgecolor='black', hatch=hatch_map[k], label=lab) for k, lab in [('enc','Encoding'), ('dec','Decoding'), ('oth','Other')]]
+            # Place two legends: architectures on upper left, segments on upper right
+            if arch_handles:
+                leg1 = ax.legend(handles=arch_handles, title='Architectures', fontsize=8, loc='upper left')
+                ax.add_artist(leg1)
+            ax.legend(handles=seg_handles, title='Segments', fontsize=8, loc='upper right')
             plt.tight_layout()
-            bar_out = os.path.join(ANALYSIS_FOLDER, 'latency_breakdown.svg')
+            bar_out = os.path.join(ANALYSIS_FOLDER, 'latency_barchart.svg')
             fig.savefig(bar_out)
             plt.close(fig)
-            print('Wrote latency breakdown plot to', bar_out)
+            print('Wrote latency barchart to', bar_out)
         else:
             fig, ax = plt.subplots(figsize=(6,3))
             ax.text(0.5, 0.5, 'No complete aggregated latency data available to plot', ha='center', va='center')
             ax.axis('off')
-            bar_out = os.path.join(ANALYSIS_FOLDER, 'latency_breakdown.svg')
+            bar_out = os.path.join(ANALYSIS_FOLDER, 'latency_barchart.svg')
             fig.savefig(bar_out)
             plt.close(fig)
-            print('Wrote placeholder latency breakdown plot to', bar_out)
+            print('Wrote placeholder latency barchart to', bar_out)
 
         # --- Simple line graph: mean_total per architecture vs participants ---
         try:
-            if agg_rows:
+            # Use only aggregated rows with a valid mean_total
+            valid_parts = sorted({int(r['participants']) for r in agg_rows if r.get('mean_total') is not None})
+            if not valid_parts:
+                fig, ax = plt.subplots(figsize=(6,3))
+                ax.text(0.5, 0.5, 'No latency totals available to plot', ha='center', va='center')
+                ax.axis('off')
+                line_out = os.path.join(ANALYSIS_FOLDER, 'latency_linechart.svg')
+                fig.savefig(line_out)
+                plt.close(fig)
+                print('Wrote placeholder latency linechart to', line_out)
+            else:
                 # Build mean/std DataFrames similar to PSNR plotting helper
-                participants_idx = sorted({int(r['participants']) for r in agg_rows})
+                participants_idx = valid_parts
                 mean_df = pd.DataFrame(index=participants_idx)
                 std_df = pd.DataFrame(index=participants_idx)
                 arch_keys = sorted({r['arch'] for r in agg_rows})
                 for arch in arch_keys:
-                    vals_map = {int(r['participants']): float(r['mean_total']) for r in agg_rows if r['arch'] == arch}
+                    vals_map = {int(r['participants']): float(r['mean_total']) for r in agg_rows if r['arch'] == arch and r.get('mean_total') is not None}
                     means = []
                     stds = []
                     for n in participants_idx:
@@ -1885,18 +1960,10 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                     ax.set_ylim(0, 1)
                 ax.legend(prop={'size': 10})
                 plt.tight_layout()
-                line_out = os.path.join(ANALYSIS_FOLDER, 'latency_totals_line.svg')
+                line_out = os.path.join(ANALYSIS_FOLDER, 'latency_linechart.svg')
                 fig.savefig(line_out)
                 plt.close(fig)
-                print('Wrote latency totals line plot to', line_out)
-            else:
-                fig, ax = plt.subplots(figsize=(6,3))
-                ax.text(0.5, 0.5, 'No latency totals available to plot', ha='center', va='center')
-                ax.axis('off')
-                line_out = os.path.join(ANALYSIS_FOLDER, 'latency_totals_line.svg')
-                fig.savefig(line_out)
-                plt.close(fig)
-                print('Wrote placeholder latency totals line plot to', line_out)
+                print('Wrote latency linechart to', line_out)
         except Exception as e:
             print('Failed to create latency totals line plot:', e)
     except Exception as e:

@@ -1722,16 +1722,30 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
             for p in parts:
                 data_map[p] = {}
                 for a in archs:
-                    data_map[p][a] = {'enc': 0.0, 'dec': 0.0, 'oth': 0.0}
+                    # None means "missing": do not draw this bar.
+                    data_map[p][a] = None
             for r in agg_rows:
                 a = r['arch']
                 p = int(r['participants'])
-                t = r.get('mean_total') or 0.0
+                t = r.get('mean_total')
                 e = r.get('mean_encode')
                 d = r.get('mean_decode')
-                enc_val = float(e) if e is not None else 0.0
-                dec_val = float(d) if d is not None else 0.0
-                oth_val = max(0.0, float(t) - enc_val - dec_val)
+
+                # Only draw the stacked bar if all three values exist.
+                # This avoids misleading bars where missing encode/decode are treated as zeros.
+                if t is None or e is None or d is None:
+                    data_map[p][a] = None
+                    continue
+
+                try:
+                    enc_val = float(e)
+                    dec_val = float(d)
+                    total_val = float(t)
+                except Exception:
+                    data_map[p][a] = None
+                    continue
+
+                oth_val = max(0.0, total_val - enc_val - dec_val)
                 data_map[p][a] = {'enc': enc_val, 'dec': min(dec_val, 999.0), 'oth': oth_val}
 
             fig, ax = plt.subplots(figsize=(10,5))
@@ -1744,14 +1758,19 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
             # draw bars per-architecture offset within each participant group
             for i, arch in enumerate(archs):
                 pos = x - total_width/2 + i * bar_w + bar_w/2
-                enc_vals = [data_map[p][arch]['enc'] for p in parts]
-                dec_vals = [data_map[p][arch]['dec'] for p in parts]
-                oth_vals = [data_map[p][arch]['oth'] for p in parts]
+                # Only plot bars for participant counts where all components exist.
+                mask = [data_map[p][arch] is not None for p in parts]
+                pos_m = np.array(pos)[mask]
+                enc_vals = [data_map[p][arch]['enc'] for p in parts if data_map[p][arch] is not None]
+                dec_vals = [data_map[p][arch]['dec'] for p in parts if data_map[p][arch] is not None]
+                oth_vals = [data_map[p][arch]['oth'] for p in parts if data_map[p][arch] is not None]
                 col = cmap.get(arch)
-                p1 = ax.bar(pos, enc_vals, bar_w, color=col, label=arch if i == 0 else None, hatch=hatch_map['enc'], edgecolor='black')
-                p2 = ax.bar(pos, dec_vals, bar_w, bottom=enc_vals, color=col, hatch=hatch_map['dec'], edgecolor='black')
+                if len(enc_vals) == 0:
+                    continue
+                ax.bar(pos_m, enc_vals, bar_w, color=col, label=arch if i == 0 else None, hatch=hatch_map['enc'], edgecolor='black')
+                ax.bar(pos_m, dec_vals, bar_w, bottom=enc_vals, color=col, hatch=hatch_map['dec'], edgecolor='black')
                 bottom_ed = np.array(enc_vals) + np.array(dec_vals)
-                p3 = ax.bar(pos, oth_vals, bar_w, bottom=bottom_ed, color=col, hatch=hatch_map['oth'], edgecolor='black')
+                ax.bar(pos_m, oth_vals, bar_w, bottom=bottom_ed, color=col, hatch=hatch_map['oth'], edgecolor='black')
 
             # X axis ticks are participant counts (one group per participant count)
             ax.set_xticks(x)

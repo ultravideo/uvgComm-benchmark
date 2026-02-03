@@ -2134,6 +2134,120 @@ def write_root_cpu_summary(results_by_arch, ROOT_FOLDER):
         print('Failed to create CPU by-participants plot:', e)
 
 
+def write_root_latency_summary(scenarios, ROOT_FOLDER):
+    """Aggregate per-scenario latency summaries into a root-level CSV and line plot.
+
+    - `scenarios` is a list of scenario folder names under ROOT_FOLDER
+    - Reads each `ROOT_FOLDER/analysis/<scenario>/latency_summary.csv` if present
+    - Detects latency type from the scenario name (lat-none, lat-local, lat-global)
+    - Groups by (LatencyType, Architecture, Participants) and averages `Avg. Latency(ms)`
+    - Writes `ROOT_FOLDER/analysis/latency_root_summary.csv` and
+      `ROOT_FOLDER/analysis/latency_root_linechart.svg`.
+    """
+    analysis_root = os.path.join(ROOT_FOLDER, 'analysis')
+    ensure_dir(analysis_root)
+
+    rows = []
+    for scenario in scenarios:
+        lat_csv = os.path.join(analysis_root, scenario, 'latency_summary.csv')
+        if not os.path.isfile(lat_csv):
+            continue
+        # read latency summary written by process_latency_rows (semicolon-separated)
+        try:
+            df = pd.read_csv(lat_csv, sep=';', engine='python')
+        except Exception:
+            # skip unreadable files
+            continue
+        if df.empty:
+            continue
+        sname = scenario.lower()
+        # Only accept the predetermined latency types to keep code minimal.
+        if 'lat-none' in sname:
+            ltype = 'none'
+        elif 'lat-local' in sname:
+            ltype = 'local'
+        elif 'lat-global' in sname:
+            ltype = 'global'
+        else:
+            # skip scenarios that are not one of the three known latency types
+            continue
+
+        # assume `process_latency_rows` produced these canonical columns
+        if not {'Architecture', 'Participants', 'Avg. Latency(ms)'}.issubset(set(df.columns)):
+            continue
+
+        for _, r in df.iterrows():
+            arch = r['Architecture']
+            parts = r['Participants']
+            try:
+                parts = int(parts) if pd.notna(parts) else None
+            except Exception:
+                parts = None
+            latv = r['Avg. Latency(ms)']
+            try:
+                latv = float(latv) if pd.notna(latv) else None
+            except Exception:
+                latv = None
+            if latv is None:
+                continue
+            rows.append({'LatencyType': ltype, 'Architecture': arch, 'Participants': parts, 'AvgLatencyMs': latv})
+
+    if not rows:
+        print('No per-scenario latency summaries found for root aggregation.')
+        return
+
+    rdf = pd.DataFrame(rows)
+    # average across bitrate variants (they are not exposed here)
+    agg = rdf.groupby(['LatencyType', 'Architecture', 'Participants'], dropna=False)['AvgLatencyMs'].mean().reset_index()
+
+    out_csv = os.path.join(analysis_root, 'latency_root_summary.csv')
+    agg.rename(columns={'AvgLatencyMs': 'Mean_Avg_Latency_ms'}).to_csv(out_csv, index=False, sep=';')
+    print('Wrote root latency summary to', out_csv)
+
+    # Plot with one line per (Architecture, LatencyType)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    archs = sorted(agg['Architecture'].dropna().unique())
+    cmap = get_color_map(archs)
+    linestyle_map = {'none': '-', 'local': '--', 'global': ':'}
+    latency_types = ['global', 'local', 'none']
+
+    max_val = 0.0
+    xticks = sorted(set(int(x) for x in agg['Participants'].dropna().unique()))
+    # Use consistent marker per architecture and list architectures first in legend
+    markers = ['o', 's', '^', 'D', 'v', 'P', 'X']
+    for i, arch in enumerate(archs):
+        marker = markers[i % len(markers)]
+        for lt in latency_types:
+            sel = agg[(agg['LatencyType'] == lt) & (agg['Architecture'] == arch)]
+            if sel.empty:
+                continue
+            sel_sorted = sel.sort_values('Participants')
+            xs = sel_sorted['Participants'].astype(float).tolist()
+            ys = sel_sorted['AvgLatencyMs'].astype(float).tolist()
+            if not xs or not ys:
+                continue
+            label = f"{arch} - {lt}"
+            ax.plot(xs, ys, label=label, color=cmap.get(arch), linestyle=linestyle_map.get(lt, '-'), marker=marker)
+            max_val = max(max_val, max(ys))
+
+    ax.set_xlabel('Number of Participants')
+    ax.set_ylabel('Mean Total Latency (ms)')
+    ax.set_title('Root Latency Summary by Architecture and Latency Type')
+    ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
+    if max_val <= 0:
+        ax.set_ylim(0, 1)
+    else:
+        ax.set_ylim(0, max_val * 1.05)
+    if xticks:
+        ax.set_xticks(xticks)
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    outp = os.path.join(analysis_root, 'latency_root_linechart.svg')
+    fig.savefig(outp)
+    plt.close(fig)
+    print('Wrote root latency linechart to', outp)
+
+
 def process_scenario(ROOT_FOLDER, scenario):
     """Process one scenario directory: analyze architectures and write CSVs/plots."""
     scenario_folder = os.path.join(ROOT_FOLDER, scenario)
@@ -2443,6 +2557,12 @@ def main():
         write_root_cpu_summary(all_results_by_arch, ROOT_FOLDER)
     except Exception as e:
         print('Failed to write root CPU summary:', e)
+
+    # Aggregate per-scenario latency summaries into a root-level summary
+    try:
+        write_root_latency_summary(scenarios, ROOT_FOLDER)
+    except Exception as e:
+        print('Failed to write root latency summary:', e)
 
     # Write a single discarded runs summary into ROOT/analysis/discarded_runs.csv
     try:

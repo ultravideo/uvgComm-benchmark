@@ -96,6 +96,7 @@ PROCESSED_DATASET_DIR=${PROCESSED_DATASET_DIR:-./datasets/netlatency_processed}
 #  - all1000 : every client gets 1000 Mbps (default)
 #  - matchdl : every client gets upload Mbps equal to the scenario download Mbps
 SEND_BW_MODE=${SEND_BW_MODE:-all1000}
+CAPTURE_MODE=${CAPTURE_MODE:-none} # none|pcap_host
 
 
 # ----------------------- functions ------------------------
@@ -114,6 +115,7 @@ Options:
     -e SECONDS     Evaluation period in seconds (default: ${EXPERIMENT_TIME}).
     -l MODES       Simulated latency mode(s): none|local|global|dataset-PlanetLab|dataset-Seattle (comma-separated list). Defaults to ${LATENCY_MODES}
     -b MODE        Send bandwidth mode (all1000|matchdl) or comma-separated list. Defaults to ${SEND_BW_MODE}
+    -m MODE        Capture mode (none|pcap_host). Default: ${CAPTURE_MODE}
     -h             Show this help
 EOF
 }
@@ -153,7 +155,7 @@ timer_margin_ms() {
 }
 
 parse_args() {
-    while getopts ":r:c:a:s:w:v:e:l:b:h" opt; do
+    while getopts ":r:c:a:s:w:v:e:l:b:m:h" opt; do
         case ${opt} in
             r ) RUN_COUNT="$OPTARG" ;;
             c ) CLIENTS_LIST="$OPTARG" ;;
@@ -164,6 +166,7 @@ parse_args() {
             e ) EXPERIMENT_TIME="$OPTARG" ;;
             l ) LATENCY_MODES="$OPTARG" ;;
             b ) SEND_BW_MODE="$OPTARG" ;;
+            m ) CAPTURE_MODE="$OPTARG" ;;
             h ) usage; exit 0 ;;
             \? ) echo "Invalid Option: -$OPTARG" 1>&2; usage; exit 1 ;;
             : ) echo "Invalid Option: -$OPTARG requires an argument" 1>&2; usage; exit 1 ;;
@@ -283,6 +286,18 @@ prepare_tests() {
     if ! command -v wget >/dev/null 2>&1; then
         echo "ERROR: wget not found. Please install wget."
         exit 1
+    fi
+
+    # If host pcap capture requested, ensure tcpdump and tshark exist
+    if [ "${CAPTURE_MODE}" = "pcap_host" ]; then
+        if ! command -v tcpdump >/dev/null 2>&1; then
+            echo "ERROR: tcpdump not found. Install tcpdump or set CAPTURE_MODE=none." >&2
+            exit 1
+        fi
+        if ! command -v tshark >/dev/null 2>&1; then
+            echo "ERROR: tshark not found. Install wireshark/tshark or set CAPTURE_MODE=none." >&2
+            exit 1
+        fi
     fi
 
     # For 7z extraction we prefer the `7z` utility (p7zip-full). If not present we will try `p7zip`.
@@ -504,6 +519,7 @@ write_metadata() {
         fi
         echo "View_Mode: $view_mode"
         echo "Visible_Participants: ${VISIBLE_PARTICIPANTS}"
+        echo "Capture_Mode: ${CAPTURE_MODE:-none}"
         echo "Start_Timestamp: $start"
         echo "End_timestamp: $end"
         echo "Run: $run"
@@ -1152,6 +1168,30 @@ start_bandwidth_monitor() {
     BW_MONITOR_LOG="${output_location}/bandwidth_monitor.log"
     : > "$BW_MONITOR_LOG"
 
+    # If CAPTURE_MODE requests host pcap, start tcpdump on appropriate host iface
+    if [ "${CAPTURE_MODE}" = "pcap_host" ]; then
+        # Try to detect bridge interface used by the docker network
+        host_iface=$(docker network inspect "$NETWORK_NAME" --format '{{.Options.com.docker.network.bridge.name}}' 2>/dev/null || true)
+        if [ -z "$host_iface" ]; then
+            host_iface=$(ip -o link | awk -F': ' '/br-/{print $2; exit}' 2>/dev/null || true)
+        fi
+        if [ -z "$host_iface" ]; then
+            host_iface=docker0
+        fi
+
+        # Verify detected interface exists; if not, fall back to the special 'any' interface
+        chosen_iface="$host_iface"
+        if ! ip link show dev "${chosen_iface}" >/dev/null 2>&1; then
+            echo "Warning: detected capture interface '${chosen_iface}' not present; falling back to 'any'" >> "$BW_MONITOR_LOG"
+            chosen_iface="any"
+        fi
+
+        # Start tcpdump only if we have a chosen interface (tcpdump accepts 'any')
+        tcpdump -i "${chosen_iface}" udp -w "${output_location}/capture_all.pcap" -U &> "${output_location}/tcpdump.log" &
+        BW_CAPTURE_PID=$!
+        echo "Started host pcap capture (pid=${BW_CAPTURE_PID}) on ${chosen_iface} -> ${output_location}/capture_all.pcap" >> "$BW_MONITOR_LOG"
+    fi
+
     (
         # containers list (clients then host)
         containers=()
@@ -1327,6 +1367,14 @@ stop_bandwidth_monitor() {
         unset BW_MONITOR_PID
         echo "Bandwidth monitor stopped"
     fi
+    # Stop host pcap capture if started
+    if [ -n "${BW_CAPTURE_PID-}" ]; then
+        # try graceful stop first
+        kill -INT "${BW_CAPTURE_PID}" 2>/dev/null || true
+        wait "${BW_CAPTURE_PID}" 2>/dev/null || true
+        unset BW_CAPTURE_PID
+        echo "Host pcap capture stopped"
+    fi
 }
 
 run_scenario() {
@@ -1471,6 +1519,33 @@ run_scenario() {
 
         # Stop bandwidth monitor and collect logs
         stop_bandwidth_monitor
+        # If host pcap capture was enabled, run a simple post-run traffic breakdown
+        if [ "${CAPTURE_MODE}" = "pcap_host" ]; then
+            pcap_file="${run_output_folder}/capture_all.pcap"
+            if [ -f "${pcap_file}" ]; then
+                echo "Postprocessing pcap: ${pcap_file}"
+                # Extract udp rows: ip.src ip.dst udp.srcport udp.dstport frame.len
+                tshark -r "${pcap_file}" -Y "udp" -T fields -e ip.src -e ip.dst -e udp.srcport -e udp.dstport -e frame.len 2>/dev/null |
+                awk -F'\t' 'BEGIN{OFS=";"; print "src;dst;sport;dport;packets;bytes;avg_pkt_size"} NF>=5{key=$1";"$2";"$3";"$4; pkts[key]++; bytes[key]+=$5} END{for(k in bytes) printf "%s;%d;%d;%.2f\n", k, pkts[k], bytes[k], (bytes[k]/pkts[k])}' > "${run_output_folder}/traffic_per_flow.csv"
+
+                # Aggregate by destination port (total bytes, packets)
+                awk -F ';' 'NR>1{dport=$4; pkts[dport]+=$5; bytes[dport]+=$6} END{print "dport;packets;bytes"; for(p in bytes) print p";"pkts[p]";"bytes[p]}' "${run_output_folder}/traffic_per_flow.csv" > "${run_output_folder}/traffic_per_port.csv" || true
+
+                # Aggregate by protocol (uses Wireshark protocol column) - total bytes and packets
+                tshark -r "${pcap_file}" -Y "udp" -T fields -e _ws.col.Protocol -e frame.len 2>/dev/null |
+                awk -F '\t' 'BEGIN{OFS=";"; print "protocol;packets;bytes;avg_pkt_size"} NF>=2{proto=$1; len=$2; pkts[proto]++; bytes[proto]+=len} END{for(p in bytes) printf "%s;%d;%d;%.2f\n", p, pkts[p], bytes[p], (bytes[p]/pkts[p])}' > "${run_output_folder}/traffic_per_protocol.csv" || true
+
+                # Print top protocols by bytes for quick inspection
+                echo "Top protocols (by bytes):"
+                ( head -n 1 "${run_output_folder}/traffic_per_protocol.csv" && tail -n +2 "${run_output_folder}/traffic_per_protocol.csv" | sort -t';' -k3 -nr | head -n 10 ) || true
+
+                # Print top 10 flows by bytes to STDOUT for quick inspection
+                echo "Top flows (by bytes):"
+                ( head -n 1 "${run_output_folder}/traffic_per_flow.csv" && tail -n +2 "${run_output_folder}/traffic_per_flow.csv" | sort -t';' -k6 -nr | head -n 10 )
+            else
+                echo "Warning: expected pcap ${pcap_file} not found"
+            fi
+        fi
         record_container_logs "$run_output_folder"
         cleanup
 

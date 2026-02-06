@@ -2248,6 +2248,187 @@ def write_root_latency_summary(scenarios, ROOT_FOLDER):
     print('Wrote root latency linechart to', outp)
 
 
+def write_root_measured_bandwidth_summary(scenarios, ROOT_FOLDER):
+    """Aggregate per-scenario measured bandwidth CSVs into root-level CSVs and plots.
+
+    For each resolution and view mode (parsed from scenario name), create a
+    CSV and an SVG plot under `ROOT_FOLDER/analysis/` showing mean client
+    outgoing/incoming Mbps per-client per-architecture with min/max filled ranges.
+    """
+    analysis_root = os.path.join(ROOT_FOLDER, 'analysis')
+    ensure_dir(analysis_root)
+
+    # collect rows per (resolution, view)
+    grouped = defaultdict(list)
+    for scenario in scenarios:
+        scen_csv = os.path.join(analysis_root, scenario, 'measured_bandwidth_per_client.csv')
+        if not os.path.isfile(scen_csv):
+            continue
+        try:
+            df = pd.read_csv(scen_csv, sep=';', engine='python')
+        except Exception:
+            continue
+
+        # attempt to extract resolution and view from scenario name
+        res = None
+        view = None
+        # resolution like 1920x1080
+        for token in scenario.split('_'):
+            if 'x' in token and token.split('x', 1)[0].isdigit():
+                res = token
+                break
+        if 'view-gallery' in scenario.lower() or 'view-gallery' in scen_csv.lower():
+            view = 'gallery'
+        elif 'view-speaker' in scenario.lower() or 'view-speaker' in scen_csv.lower():
+            view = 'speaker'
+
+        # fallback: try to read metadata under scenario folder for Resolution / View_Mode
+        if (res is None or view is None):
+            meta_path = os.path.join(ROOT_FOLDER, scenario, 'metadata.txt')
+            if os.path.isfile(meta_path):
+                meta = parse_metadata(meta_path)
+                if res is None:
+                    res = meta.get('Resolution')
+                if view is None:
+                    v = meta.get('View_Mode') or meta.get('View') or meta.get('ViewMode')
+                    if v:
+                        view = str(v).strip().lower()
+
+        if res is None:
+            # skip scenarios without resolution
+            continue
+        if view is None:
+            # default to gallery if unknown
+            view = 'gallery'
+
+        # attach resolution/view as attributes and collect rows
+        df['_scenario'] = scenario
+        df['_resolution'] = res
+        df['_view'] = view
+        grouped[(res, view)].append(df)
+
+    # For each resolution/view group, aggregate and write CSV + plot
+    for (res, view), dfs in grouped.items():
+        try:
+            all_df = pd.concat(dfs, ignore_index=True, sort=False)
+        except Exception:
+            continue
+
+        # normalize participants to numeric
+        try:
+            all_df['Participants'] = pd.to_numeric(all_df['Participants'], errors='coerce')
+        except Exception:
+            pass
+
+        # group by Architecture and Participants and compute mean/min/max for client in/out and host in/out
+        agg_rows = []
+        group_keys = ['Architecture', 'Participants']
+        grouped2 = all_df.groupby(group_keys, dropna=False)
+        for (arch, parts), g in grouped2:
+            def col_stats(col):
+                if col in g.columns:
+                    vals = pd.to_numeric(g[col], errors='coerce').dropna().values
+                    if vals.size:
+                        return float(np.mean(vals)), float(np.min(vals)), float(np.max(vals))
+                return None, None, None
+
+            out_mean, out_min, out_max = col_stats('Measured_Client_Outgoing_Mbps_per_client')
+            in_mean, in_min, in_max = col_stats('Measured_Client_Incoming_Mbps_per_client')
+            host_out_mean, host_out_min, host_out_max = col_stats('Measured_Host_Outgoing_Mbps')
+            host_in_mean, host_in_min, host_in_max = col_stats('Measured_Host_Incoming_Mbps')
+
+            agg_rows.append({'Architecture': arch, 'Participants': int(parts) if pd.notna(parts) else None,
+                             'Client_Out_Mean': out_mean, 'Client_Out_Min': out_min, 'Client_Out_Max': out_max,
+                             'Client_In_Mean': in_mean, 'Client_In_Min': in_min, 'Client_In_Max': in_max,
+                             'Host_Out_Mean': host_out_mean, 'Host_Out_Min': host_out_min, 'Host_Out_Max': host_out_max,
+                             'Host_In_Mean': host_in_mean, 'Host_In_Min': host_in_min, 'Host_In_Max': host_in_max})
+
+        if not agg_rows:
+            continue
+
+        out_df = pd.DataFrame(agg_rows)
+        csv_name = os.path.join(analysis_root, f'measured_bandwidth_root_{res}_view-{view}.csv')
+        out_df.to_csv(csv_name, index=False, sep=';')
+        print('Wrote root measured bandwidth CSV to', csv_name)
+
+        # Plot mean lines with min/max filled ranges for client Out/In per architecture
+        try:
+            fig, ax = plt.subplots(figsize=(10, 5))
+            archs = sorted([a for a in out_df['Architecture'].dropna().unique()])
+            cmap = get_color_map(archs)
+            markers = ['o', 's', '^', 'D', 'v', 'P', 'X']
+            for i, arch in enumerate(archs):
+                sub = out_df[out_df['Architecture'] == arch].sort_values('Participants')
+                xs = sub['Participants'].tolist()
+
+                # client out
+                ys_mean = sub['Client_Out_Mean'].tolist()
+                ys_min = sub['Client_Out_Min'].tolist()
+                ys_max = sub['Client_Out_Max'].tolist()
+                if any(pd.notna(ys_mean)):
+                    ax.plot(xs, ys_mean, marker=markers[i % len(markers)], linestyle='-', label=f'{arch} Out', color=cmap.get(arch))
+                    # show discrete min/max as errorbars (non-continuous)
+                    try:
+                        xm = np.array(xs, dtype=float)
+                        ym = np.array(ys_mean, dtype=float)
+                        ymi = np.array(ys_min, dtype=float)
+                        yma = np.array(ys_max, dtype=float)
+                        mask = ~np.isnan(ym)
+                        if np.any(mask):
+                            xm2 = xm[mask]
+                            ym2 = ym[mask]
+                            lower = ym2 - ymi[mask]
+                            upper = yma[mask] - ym2
+                            # replace negative or nan errs with 0
+                            lower = np.where(np.isfinite(lower) & (lower > 0), lower, 0.0)
+                            upper = np.where(np.isfinite(upper) & (upper > 0), upper, 0.0)
+                            ax.errorbar(xm2, ym2, yerr=[lower, upper], fmt='none', ecolor=cmap.get(arch), capsize=4, linewidth=1.2)
+                    except Exception:
+                        pass
+
+                # client in
+                ys_mean_in = sub['Client_In_Mean'].tolist()
+                ys_min_in = sub['Client_In_Min'].tolist()
+                ys_max_in = sub['Client_In_Max'].tolist()
+                if any(pd.notna(ys_mean_in)):
+                    ax.plot(xs, ys_mean_in, marker=markers[i % len(markers)], linestyle='--', label=f'{arch} In', color=cmap.get(arch))
+                    try:
+                        xm = np.array(xs, dtype=float)
+                        ym = np.array(ys_mean_in, dtype=float)
+                        ymi = np.array(ys_min_in, dtype=float)
+                        yma = np.array(ys_max_in, dtype=float)
+                        mask = ~np.isnan(ym)
+                        if np.any(mask):
+                            xm2 = xm[mask]
+                            ym2 = ym[mask]
+                            lower = ym2 - ymi[mask]
+                            upper = yma[mask] - ym2
+                            lower = np.where(np.isfinite(lower) & (lower > 0), lower, 0.0)
+                            upper = np.where(np.isfinite(upper) & (upper > 0), upper, 0.0)
+                            ax.errorbar(xm2, ym2, yerr=[lower, upper], fmt='none', ecolor=cmap.get(arch), capsize=4, linewidth=1.0)
+                    except Exception:
+                        pass
+
+            ax.set_xlabel('Number of Participants')
+            ax.set_ylabel('Measured Per-Client Bandwidth (Mbps)')
+            ax.set_title(f'Measured Bandwidth (per-client) - {res} view={view}')
+            ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
+            try:
+                xt = sorted(set(int(x) for x in out_df['Participants'].dropna().unique()))
+                ax.set_xticks(xt)
+            except Exception:
+                pass
+            ax.legend(fontsize=9)
+            plt.tight_layout()
+            outp = os.path.join(analysis_root, f'measured_bandwidth_root_{res}_view-{view}.svg')
+            fig.savefig(outp)
+            plt.close(fig)
+            print('Wrote root measured bandwidth plot to', outp)
+        except Exception as e:
+            print('Failed to create root measured bandwidth plot for', res, view, e)
+
+
+
 def process_scenario(ROOT_FOLDER, scenario):
     """Process one scenario directory: analyze architectures and write CSVs/plots."""
     scenario_folder = os.path.join(ROOT_FOLDER, scenario)
@@ -2563,6 +2744,12 @@ def main():
         write_root_latency_summary(scenarios, ROOT_FOLDER)
     except Exception as e:
         print('Failed to write root latency summary:', e)
+
+    # Aggregate per-scenario measured bandwidth summaries into root-level CSVs/plots
+    try:
+        write_root_measured_bandwidth_summary(scenarios, ROOT_FOLDER)
+    except Exception as e:
+        print('Failed to write root measured bandwidth summary:', e)
 
     # Write a single discarded runs summary into ROOT/analysis/discarded_runs.csv
     try:

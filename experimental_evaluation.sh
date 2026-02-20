@@ -298,16 +298,6 @@ prepare_tests() {
     # a reasonable upper bound; the file will be written in configs/.
     generate_usernames "$MAX_CLIENTS"
 
-
-    # Generate latency files for requested modes (one-time per run folder)
-    IFS=',' read -r -a _modes <<< "${LATENCY_MODES}"
-    for _mode in "${_modes[@]}"; do
-        # only generate files for actual latency modes
-        if [ "${_mode}" != "none" ]; then
-            generate_latencies "$RUN_FOLDER" "$MAX_CLIENTS" "${_mode}" || true
-        fi
-    done
-
     echo "Preparation complete. Input files ready: $INPUT_FILE_720, $INPUT_FILE_FULLHD and $INPUT_FILE_4K"
 }
 
@@ -577,6 +567,7 @@ create_clients() {
     local input_file="$2"
     local output_folder="$3"
     local LATENCY_MODE="${4:-}"
+    local LATENCY_FILE="${5:-}"
 
     for i in $(seq 1 "$num_clients"); do
         CONTAINER_NAME="${CLIENT_PREFIX}${i}"
@@ -601,7 +592,9 @@ create_clients() {
             # apply in-container latency if requested (LATENCY_MODE must be local/global)
             if [ -n "${LATENCY_MODE}" ] && [ "${LATENCY_MODE}" != "none" ]; then
             local lat_ms
-            local LATENCY_FILE="${RUN_FOLDER}/latencies_${LATENCY_MODE}.txt"
+            if [ -z "$LATENCY_FILE" ]; then
+                LATENCY_FILE="${RUN_FOLDER}/latencies_${LATENCY_MODE}_n${num_clients}.txt"
+            fi
             if [ -f "$LATENCY_FILE" ]; then
                 lat_ms=$(sed -n "$((i+1))p" "$LATENCY_FILE" 2>/dev/null || echo "")
             else
@@ -720,6 +713,7 @@ create_host() {
     local experiment_time_ms="$7"
     local cooldown_time_ms="$8"
     local latency_mode_param="${9:-}"
+    local latency_file="${10:-}"
     mkdir -p "$(dirname "${script_file}")"
 
     # Note: create_host_script already accounts for the setup phase via
@@ -753,7 +747,10 @@ create_host() {
 
     # apply in-container host/SFU latency if requested
     if [ -n "${latency_mode_param}" ] && [ "${latency_mode_param}" != "none" ]; then
-        local LATENCY_FILE="${RUN_FOLDER}/latencies_${latency_mode_param}.txt"
+        local LATENCY_FILE="${latency_file}"
+        if [ -z "$LATENCY_FILE" ]; then
+            LATENCY_FILE="${RUN_FOLDER}/latencies_${latency_mode_param}_n${clients}.txt"
+        fi
         if [ -f "$LATENCY_FILE" ]; then
             host_lat=$(sed -n '1p' "$LATENCY_FILE" 2>/dev/null || echo "")
         else
@@ -960,6 +957,7 @@ start_bandwidth_monitor() {
 
 generate_latencies() {
     # Usage: generate_latencies <out_dir> <num_clients> <scenario>
+    # Prints the generated latency file path to stdout.
 
     local out_dir="$1"
     local num_clients=${2:-$CLIENTS}
@@ -995,7 +993,7 @@ generate_latencies() {
     fi
 
     mkdir -p "${out_dir}"
-    local out="${out_dir}/latencies_${kind}.txt"
+    local out="${out_dir}/latencies_${kind}_n${num_clients}.txt"
 
     # Write SFU/host latency as first line
     echo "${sfu_lat}" > "$out"
@@ -1017,7 +1015,8 @@ generate_latencies() {
         done
     fi
 
-    echo "Generated latency file: $out (scenario=${kind}, clients=${num_clients}, sfu=${sfu_lat}ms)"
+    echo "Generated latency file: $out (scenario=${kind}, clients=${num_clients}, sfu=${sfu_lat}ms)" >&2
+    echo "$out"
 }
 
 stop_bandwidth_monitor() {
@@ -1034,7 +1033,7 @@ stop_bandwidth_monitor() {
 }
 
 run_scenario() {
-    # New signature: run_scenario <RESOLUTION> <ARCHITECTURE> <CLIENTS> <DOWNLOAD_BW> <UPLOAD_MODE> <LATENCY_MODE> <VIEW_MODE> <INPUT_FILE> <RUN_COUNT>
+    # New signature: run_scenario <RESOLUTION> <ARCHITECTURE> <CLIENTS> <DOWNLOAD_BW> <UPLOAD_MODE> <LATENCY_MODE> <VIEW_MODE> <INPUT_FILE> <LATENCY_FILE> <RUN_COUNT>
     local RESOLUTION="$1"
     local ARCHITECTURE="$2"
     # set CLIENTS as a global variable so other helper functions (cleanup, record_container_logs)
@@ -1045,7 +1044,8 @@ run_scenario() {
     local LATENCY_MODE_PARAM="$6"
     local VIEW_MODE="$7"
     local INPUT_FILE="$8"
-    local RUN_COUNT="${9}"
+    local LATENCY_FILE="${9:-}"
+    local RUN_COUNT="${10}"
 
     # Build a result folder name that encodes key parameters to make runs
     # self-describing and unique: resolution and latency mode (upload/view are global for the run)
@@ -1088,10 +1088,10 @@ run_scenario() {
              "$run_output_folder" "$experiment_start_ms" "$experiment_end_ms" "$run_index"
 
         # Create host first so it is ready when clients call in sequence.
-        create_host "$run_output_folder" "$ARCHITECTURE" "$CLIENTS" "$RESOLUTION" "$DOWNLOAD_BW" "$warmup_time_ms" "$experiment_time_ms" "$cooldown_time_ms" "$LATENCY_MODE_PARAM"
+        create_host "$run_output_folder" "$ARCHITECTURE" "$CLIENTS" "$RESOLUTION" "$DOWNLOAD_BW" "$warmup_time_ms" "$experiment_time_ms" "$cooldown_time_ms" "$LATENCY_MODE_PARAM" "$LATENCY_FILE"
 
         generate_client_configs "${UPLOAD_MODE}" "${VIEW_MODE}" "${CLIENTS}" || true
-        create_clients "$CLIENTS" "$INPUT_FILE" "$run_output_folder" "$LATENCY_MODE_PARAM"
+        create_clients "$CLIENTS" "$INPUT_FILE" "$run_output_folder" "$LATENCY_MODE_PARAM" "$LATENCY_FILE"
 
         # Start bandwidth monitor (polling interval 1s) - writes per-container CSVs
         start_bandwidth_monitor "$run_output_folder" 1
@@ -1225,6 +1225,11 @@ for LATENCY_MODE in "${LATENCY_RUNS[@]}"; do
                 for arch in "${ARCHS_ARRAY[@]}"; do
                     for BW_MODE in "${SEND_BW_ARRAY[@]}"; do
 
+                        latency_file=""
+                        if [ -n "${LATENCY_MODE}" ] && [ "${LATENCY_MODE}" != "none" ]; then
+                            latency_file=$(generate_latencies "$RUN_FOLDER" "$clients" "$LATENCY_MODE" 2>/dev/null || echo "")
+                        fi
+
                         # Choose input file per-resolution: prefer matching extracted inputs
                         if [ "${RES}" = "3840x2160" ]; then
                             input_file="${INPUT_FILE_4K}"
@@ -1234,7 +1239,7 @@ for LATENCY_MODE in "${LATENCY_RUNS[@]}"; do
                             input_file="${INPUT_FILE_720}"
                         fi
 
-                        run_scenario "$RES" "$arch" "$clients" "$DOWNLOAD_BW" "$BW_MODE" "$LATENCY_MODE" "$VIEW" "$input_file" "$RUN_COUNT"
+                        run_scenario "$RES" "$arch" "$clients" "$DOWNLOAD_BW" "$BW_MODE" "$LATENCY_MODE" "$VIEW" "$input_file" "$latency_file" "$RUN_COUNT"
                     done
                 done
             done

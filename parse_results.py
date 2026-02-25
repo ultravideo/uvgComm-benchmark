@@ -2176,6 +2176,33 @@ def write_root_latency_summary(scenarios, ROOT_FOLDER):
         if not {'Architecture', 'Participants', 'Avg. Latency(ms)'}.issubset(set(df.columns)):
             continue
 
+        # Try to extract resolution and upload-limit (upload bitrate configuration) from scenario name
+        res = None
+        upload = None
+        for token in scenario.split('_'):
+            if res is None and 'x' in token and token.split('x', 1)[0].isdigit():
+                res = token
+            # tokens like 'ul-all1', 'ul-all10', 'ul-500kbps' etc.
+            if upload is None and token.lower().startswith('ul'):
+                upload = token
+
+        # fallback: try to read metadata under scenario folder for Resolution / Upload limit
+        if (res is None or upload is None):
+            meta_path = os.path.join(ROOT_FOLDER, scenario, 'metadata.txt')
+            if os.path.isfile(meta_path):
+                meta = parse_metadata(meta_path)
+                if res is None:
+                    res = meta.get('Resolution')
+                if upload is None:
+                    # permissive keys
+                    upload = meta.get('Upload_Limit') or meta.get('Upload') or meta.get('Upload_Bitrate')
+
+        if res is None:
+            # skip scenarios without resolution (maintain original behavior)
+            continue
+        if upload is None:
+            upload = 'unknown'
+
         for _, r in df.iterrows():
             arch = r['Architecture']
             parts = r['Participants']
@@ -2190,62 +2217,81 @@ def write_root_latency_summary(scenarios, ROOT_FOLDER):
                 latv = None
             if latv is None:
                 continue
-            rows.append({'LatencyType': ltype, 'Architecture': arch, 'Participants': parts, 'AvgLatencyMs': latv})
+            rows.append({'Upload': str(upload), 'Resolution': str(res), 'LatencyType': ltype, 'Architecture': arch, 'Participants': parts, 'AvgLatencyMs': latv})
 
     if not rows:
         print('No per-scenario latency summaries found for root aggregation.')
         return
 
     rdf = pd.DataFrame(rows)
-    # average across bitrate variants (they are not exposed here)
-    agg = rdf.groupby(['LatencyType', 'Architecture', 'Participants'], dropna=False)['AvgLatencyMs'].mean().reset_index()
+    if rdf.empty:
+        print('No per-scenario latency summaries found for root aggregation.')
+        return
+
+    # Aggregate by Upload, Resolution, LatencyType, Architecture, Participants
+    agg = rdf.groupby(['Upload', 'Resolution', 'LatencyType', 'Architecture', 'Participants'], dropna=False)['AvgLatencyMs'].mean().reset_index()
 
     out_csv = os.path.join(analysis_root, 'latency_root_summary.csv')
-    agg.rename(columns={'AvgLatencyMs': 'Mean_Avg_Latency_ms'}).to_csv(out_csv, index=False, sep=';')
+    # rename column on the DataFrame used for plotting as well
+    agg = agg.rename(columns={'AvgLatencyMs': 'Mean_Avg_Latency_ms'})
+    agg.to_csv(out_csv, index=False, sep=';')
     print('Wrote root latency summary to', out_csv)
 
-    # Plot with one line per (Architecture, LatencyType)
-    fig, ax = plt.subplots(figsize=(10, 6))
-    archs = sorted(agg['Architecture'].dropna().unique())
-    cmap = get_color_map(archs)
+    # For each unique (Upload, Resolution) pair produce a separate latency linechart
+    uploads = sorted(agg['Upload'].dropna().unique())
+    resolutions = sorted(agg['Resolution'].dropna().unique())
     linestyle_map = {'none': '-', 'local': '--', 'global': ':'}
     latency_types = ['global', 'local', 'none']
-
-    max_val = 0.0
-    xticks = sorted(set(int(x) for x in agg['Participants'].dropna().unique()))
-    # Use consistent marker per architecture and list architectures first in legend
     markers = ['o', 's', '^', 'D', 'v', 'P', 'X']
-    for i, arch in enumerate(archs):
-        marker = markers[i % len(markers)]
-        for lt in latency_types:
-            sel = agg[(agg['LatencyType'] == lt) & (agg['Architecture'] == arch)]
-            if sel.empty:
-                continue
-            sel_sorted = sel.sort_values('Participants')
-            xs = sel_sorted['Participants'].astype(float).tolist()
-            ys = sel_sorted['AvgLatencyMs'].astype(float).tolist()
-            if not xs or not ys:
-                continue
-            label = f"{arch} - {lt}"
-            ax.plot(xs, ys, label=label, color=cmap.get(arch), linestyle=linestyle_map.get(lt, '-'), marker=marker)
-            max_val = max(max_val, max(ys))
 
-    ax.set_xlabel('Number of Participants')
-    ax.set_ylabel('Mean Total Latency (ms)')
-    ax.set_title('Root Latency Summary by Architecture and Latency Type')
-    ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
-    if max_val <= 0:
-        ax.set_ylim(0, 1)
-    else:
-        ax.set_ylim(0, max_val * 1.05)
-    if xticks:
-        ax.set_xticks(xticks)
-    ax.legend(fontsize=8)
-    plt.tight_layout()
-    outp = os.path.join(analysis_root, 'latency_root_linechart.svg')
-    fig.savefig(outp)
-    plt.close(fig)
-    print('Wrote root latency linechart to', outp)
+    for up in uploads:
+        for res in resolutions:
+            sub = agg[(agg['Upload'] == up) & (agg['Resolution'] == res)]
+            if sub.empty:
+                continue
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+            archs = sorted(sub['Architecture'].dropna().unique())
+            cmap = get_color_map(archs)
+            max_val = 0.0
+            try:
+                xticks = sorted(set(int(x) for x in sub['Participants'].dropna().unique()))
+            except Exception:
+                xticks = []
+
+            for i, arch in enumerate(archs):
+                marker = markers[i % len(markers)]
+                for lt in latency_types:
+                    sel = sub[(sub['LatencyType'] == lt) & (sub['Architecture'] == arch)]
+                    if sel.empty:
+                        continue
+                    sel_sorted = sel.sort_values('Participants')
+                    xs = sel_sorted['Participants'].astype(float).tolist()
+                    ys = sel_sorted['Mean_Avg_Latency_ms'].astype(float).tolist()
+                    if not xs or not ys:
+                        continue
+                    label = f"{arch} - {lt}"
+                    ax.plot(xs, ys, label=label, color=cmap.get(arch), linestyle=linestyle_map.get(lt, '-'), marker=marker)
+                    max_val = max(max_val, max(ys))
+
+            ax.set_xlabel('Number of Participants')
+            ax.set_ylabel('Mean Total Latency (ms)')
+            ax.set_title(f'Root Latency Summary - upload={up} res={res}')
+            ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
+            if max_val <= 0:
+                ax.set_ylim(0, 1)
+            else:
+                ax.set_ylim(0, max_val * 1.05)
+            if xticks:
+                ax.set_xticks(xticks)
+            ax.legend(fontsize=8)
+            plt.tight_layout()
+            safe_up = str(up).replace('/', '-').replace(' ', '_')
+            safe_res = str(res).replace('/', '-').replace(' ', '_')
+            outp = os.path.join(analysis_root, f'latency_root_linechart_ul-{safe_up}_res-{safe_res}.svg')
+            fig.savefig(outp)
+            plt.close(fig)
+            print('Wrote root latency linechart to', outp)
 
 
 def write_root_measured_bandwidth_summary(scenarios, ROOT_FOLDER):

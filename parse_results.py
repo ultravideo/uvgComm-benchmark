@@ -52,7 +52,7 @@ def read_csv_guess(path, na_values=["", "NA", "null"], dtype=None):
             if df is not None and df.shape[1] > 1:
                 df.columns = [c.strip() for c in df.columns]
                 return df
-        except Exception:
+        except Exception as e:
             continue
     try:
         # fallback: pandas default
@@ -60,7 +60,8 @@ def read_csv_guess(path, na_values=["", "NA", "null"], dtype=None):
         if df is not None:
             df.columns = [c.strip() for c in df.columns]
             return df
-    except Exception:
+    except Exception as e:
+        print(f'ERROR: read_csv_guess failed for {path}: {e}')
         return None
 
 
@@ -79,8 +80,8 @@ def parse_metadata(metadata_path):
         if key in d:
             try:
                 d[key] = int(d[key])
-            except Exception:
-                pass
+            except Exception as e:
+                print(f'WARNING: Failed to coerce {key}={d[key]} to int: {e}')
     return d
 
 
@@ -95,7 +96,8 @@ def find_latest_run(arch_folder):
         base = os.path.basename(r)
         try:
             n = int(base.split('_', 1)[1])
-        except Exception:
+        except Exception as e:
+            print(f'WARNING: Failed to extract run number from {base}: {e}')
             n = -1
         if n > best_n:
             best_n = n
@@ -118,7 +120,8 @@ def find_timestamp_column(df):
     # fallback to first column
     try:
         return df.columns[0]
-    except Exception:
+    except Exception as e:
+        print(f'WARNING: Failed to get first column from DataFrame: {e}')
         return None
 def filter_df_by_ts(df, start_ts, end_ts):
     """Filter DataFrame by timestamp interval [start_ts, end_ts] using a guessed timestamp column.
@@ -134,7 +137,8 @@ def filter_df_by_ts(df, start_ts, end_ts):
     try:
         df_ts = pd.to_numeric(df[tscol], errors='coerce')
         return df[(df_ts >= start_ts) & (df_ts <= end_ts)]
-    except Exception:
+    except Exception as e:
+        print(f'WARNING: Failed to filter DataFrame by timestamp range [{start_ts}, {end_ts}]: {e}')
         return df
 
 
@@ -151,7 +155,8 @@ def extract_numeric_list(df, candidates, dtype=int):
             vals = pd.to_numeric(df[col], errors='coerce').dropna()
             try:
                 vals = vals.astype(dtype).tolist()
-            except Exception:
+            except Exception as e:
+                print(f'WARNING: Failed to convert column {col} to dtype {dtype}: {e}')
                 vals = vals.tolist()
             return vals, col
     # fallback: find by substring match
@@ -162,7 +167,8 @@ def extract_numeric_list(df, candidates, dtype=int):
                 vals = pd.to_numeric(df[col], errors='coerce').dropna()
                 try:
                     vals = vals.astype(dtype).tolist()
-                except Exception:
+                except Exception as e:
+                    print(f'WARNING: Failed to convert column {col} to dtype {dtype}: {e}')
                     vals = vals.tolist()
                 return vals, col
     return [], None
@@ -179,8 +185,8 @@ def get_min_max_ts(df):
         tsvals = pd.to_numeric(df[tscol], errors='coerce').dropna().astype(int).values
         if tsvals.size:
             return int(tsvals.min()), int(tsvals.max())
-    except Exception:
-        pass
+    except Exception as e:
+        print(f'WARNING: Failed to extract min/max timestamps: {e}')
     return None, None
 
 
@@ -344,9 +350,9 @@ def detect_missing_frames(local_by_cname, participant_by_cname, start_ts=None, e
                     if tscol is not None:
                         df_ts = pd.to_numeric(p_df[tscol], errors='coerce')
                         p_df = p_df[df_ts >= start_ts]
-                except Exception:
+                except Exception as e:
                     # keep original p_df on any failure
-                    pass
+                    print(f'WARNING: Failed to trim participant trace at start_ts={start_ts}: {e}')
             # find size column in participant csv results
             part_sizes, part_size_col = extract_numeric_list(p_df, ['Size(Bytes)', 'Size'], dtype=int)
 
@@ -382,7 +388,8 @@ def analyze_run(run_path):
         if vk in metadata:
             try:
                 visible_limit = int(metadata[vk])
-            except Exception:
+            except Exception as e:
+                print(f'WARNING: Failed to parse visible_limit from {vk}={metadata[vk]}: {e}')
                 visible_limit = None
             break
     metrics['visible_participants'] = visible_limit
@@ -408,8 +415,8 @@ def analyze_run(run_path):
                 cpu_df = cpu_df.dropna(subset=[ts_col, pct_col])
                 try:
                     cpu_df[ts_col] = cpu_df[ts_col].astype(int)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f'WARNING: Failed to convert CPU timestamp column to int: {e}')
                 start = metadata.get('Start_Timestamp')
                 end = metadata.get('End_timestamp') or metadata.get('End_Timestamp')
                 if start and end:
@@ -418,7 +425,8 @@ def analyze_run(run_path):
                     sel = cpu_df
                 try:
                     cpu_avg = float(pd.to_numeric(sel[pct_col], errors='coerce').dropna().mean())
-                except Exception:
+                except Exception as e:
+                    print(f'WARNING: Failed to compute average CPU percentage: {e}')
                     cpu_avg = None
     metrics['cpu_avg'] = cpu_avg
 
@@ -436,7 +444,8 @@ def analyze_run(run_path):
             try:
                 num = _extract_client_num_from_folder(folder)
                 return (num is None) or (num <= vl)
-            except Exception:
+            except Exception as e:
+                print(f'WARNING: Failed to check client visibility for folder {folder}: {e}')
                 return True
         client_folders = [c for c in client_folders if _keep_client(c)]
     # combined list used for measured bandwidth parsing (clients + host)
@@ -478,9 +487,9 @@ def analyze_run(run_path):
                     if tscol is not None:
                         df_ts = pd.to_numeric(df[tscol], errors='coerce')
                         df = df[df_ts >= start_ts]
-                except Exception:
+                except Exception as e:
                     # if filtering fails, keep original df
-                    pass
+                    print(f'WARNING: Failed to filter participant trace at start_ts={start_ts}: {e}')
             participant_by_cname[cname].append({'path': path, 'df': df, 'client_folder': cfolder})
 
     metrics['local_by_cname'] = local_by_cname
@@ -500,14 +509,15 @@ def analyze_run(run_path):
                     if info.get('df') is not None:
                         try:
                             sample_cols = list(info.get('df').columns)
-                        except Exception:
+                        except Exception as e:
+                            print(f'WARNING: Failed to inspect sample participant columns: {e}')
                             sample_cols = None
                         break
                 if sample_cols is not None:
                     break
             # sample participant columns inspected during development; omit verbose debug output
-    except Exception:
-        pass
+    except Exception as e:
+        print(f'WARNING: Failed to collect participant file metadata: {e}')
 
     # PSNR: collect per-client PSNR and overall average
     psnr_values = []
@@ -577,12 +587,13 @@ def analyze_run(run_path):
                     if key in max_encode_by_client:
                         try:
                             max_encode_by_client[key] = max(cur, float(max_encode_by_client.get(key, float('-inf'))))
-                        except Exception:
+                        except Exception as e:
+                            print(f'WARNING: Failed to compute max encode time: {e}')
                             max_encode_by_client[key] = cur
                     else:
                         max_encode_by_client[key] = cur
-            except Exception:
-                pass
+            except Exception as e:
+                print(f'WARNING: Failed to record per-client max encode time: {e}')
     metrics['avg_frame_size'] = float(np.mean(sizes)) if sizes else None
     metrics['avg_width'] = float(np.mean(widths)) if widths else None
     metrics['avg_height'] = float(np.mean(heights)) if heights else None
@@ -609,8 +620,8 @@ def analyze_run(run_path):
                 latencies.extend(lvals)
                 try:
                     sender_lvals.extend([float(x) for x in lvals])
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f'WARNING: Failed to extend sender latency values: {e}')
 
             dvals, _ = extract_numeric_list(df, ['DecodeTime(ms)', 'DecodeTime', 'DecodeTimeMs'], dtype=float)
             if dvals:
@@ -624,12 +635,13 @@ def analyze_run(run_path):
                         if key in max_decode_by_client:
                             try:
                                 max_decode_by_client[key] = max(curd, float(max_decode_by_client.get(key, float('-inf'))))
-                            except Exception:
+                            except Exception as e:
+                                print(f'WARNING: Failed to compute max decode time: {e}')
                                 max_decode_by_client[key] = curd
                         else:
                             max_decode_by_client[key] = curd
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f'WARNING: Failed to record per-client max decode time: {e}')
 
             pvals, _ = extract_numeric_list(df, ['Size(Bytes)', 'Size'], dtype=int)
             if pvals:
@@ -646,7 +658,8 @@ def analyze_run(run_path):
         if sender_lvals:
             try:
                 mean_sender_lat = float(np.mean(sender_lvals))
-            except Exception:
+            except Exception as e:
+                print(f'WARNING: Failed to compute mean sender latency: {e}')
                 mean_sender_lat = None
             sender_folder = None
             if cname in local_by_cname:
@@ -668,7 +681,8 @@ def analyze_run(run_path):
             elif out_min_ts is not None and out_max_ts is not None and out_max_ts > out_min_ts:
                 dur_s = (out_max_ts - out_min_ts) / 1000.0
                 out_bps = (out_total_bytes * 8.0) / dur_s if dur_s > 0 else None
-    except Exception:
+    except Exception as e:
+        print(f'WARNING: Failed to calculate outgoing bitrate: {e}')
         out_bps = None
 
     in_bps = None
@@ -680,7 +694,8 @@ def analyze_run(run_path):
             elif in_min_ts is not None and in_max_ts is not None and in_max_ts > in_min_ts:
                 dur_s = (in_max_ts - in_min_ts) / 1000.0
                 in_bps = (in_total_bytes * 8.0) / dur_s if dur_s > 0 else None
-    except Exception:
+    except Exception as e:
+        print(f'WARNING: Failed to calculate incoming bitrate: {e}')
         in_bps = None
     metrics['outgoing_bps'] = out_bps
     metrics['incoming_bps'] = in_bps
@@ -802,7 +817,8 @@ def parse_measured_bandwidth(client_folders, start_ts=None, end_ts=None):
                             duration_s = interval_ms / 1000.0
                     if duration_s is not None:
                         duration_s = max(duration_s, 0.001)
-                except Exception:
+                except Exception as e:
+                    print(f'WARNING: Failed to calculate bandwidth interval duration: {e}')
                     duration_s = None
 
             def _rate_from_bytes(col_name):
@@ -819,12 +835,14 @@ def parse_measured_bandwidth(client_folders, start_ts=None, end_ts=None):
             if rx_mean is None and rx_bps_col is not None:
                 try:
                     rx_mean = float(pd.to_numeric(df[rx_bps_col], errors='coerce').dropna().mean()) * 8.0
-                except Exception:
+                except Exception as e:
+                    print(f'WARNING: Failed to compute rx mean bandwidth: {e}')
                     rx_mean = None
             if tx_mean is None and tx_bps_col is not None:
                 try:
                     tx_mean = float(pd.to_numeric(df[tx_bps_col], errors='coerce').dropna().mean()) * 8.0
-                except Exception:
+                except Exception as e:
+                    print(f'WARNING: Failed to compute tx mean bandwidth: {e}')
                     tx_mean = None
 
             # classify folder: treat explicit host folder separately
@@ -843,11 +861,12 @@ def parse_measured_bandwidth(client_folders, start_ts=None, end_ts=None):
                 # record per-client measured values for later first-vs-others analysis
                 try:
                     client_num = _extract_client_num_from_folder(cfolder)
-                except Exception:
+                except Exception as e:
+                    print(f'WARNING: Failed to extract client number from folder {cfolder}: {e}')
                     client_num = None
                 per_client_bandwidth.append({'client_folder': cfolder, 'client_num': client_num, 'tx_bps': tx_mean, 'rx_bps': rx_mean})
-    except Exception:
-        pass
+    except Exception as e:
+        print(f'WARNING: Failed to parse measured bandwidth data: {e}')
 
     c_out_mean = float(np.mean(measured_out_clients)) if measured_out_clients else None
     c_in_mean = float(np.mean(measured_in_clients)) if measured_in_clients else None
@@ -872,8 +891,8 @@ def plot_psnr(mean_df, std_df, analysis_folder, scenario):
     try:
         xt = [int(x) for x in mean_df.index]
         plt.xticks(xt)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f'WARNING: Failed to set x-axis ticks for PSNR plot: {e}')
     # Force y-limits to 0..50 and add horizontal 8-bit max line before legend so it's shown
     plt.ylim(0, 50)
     plt.axhline(48.131, color='gray', linestyle=':', linewidth=2.0, label='Max PSNR (8-bit)', zorder=5)
@@ -919,8 +938,8 @@ def plot_psnr_speaker_vs_listeners(psnr_speaker_stats, psnr_listeners_stats, ana
             idx = sorted(set(list(mean_speaker.index) + list(mean_listeners.index)))
             xt = [int(x) for x in idx]
             plt.xticks(xt)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f'WARNING: Failed to set x-axis ticks for PSNR speaker-vs-listeners plot: {e}')
         plt.tight_layout()
         out = os.path.join(analysis_folder, 'psnr_speaker_vs_listeners.svg')
         plt.savefig(out)
@@ -960,8 +979,8 @@ def plot_measured_bandwidth_speaker_vs_listeners(measured_speaker_stats, measure
         ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
         try:
             ax.set_xticks(idx)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f'WARNING: Failed to set x-axis ticks for measured bandwidth plot: {e}')
         ax.legend(fontsize=8)
         plt.tight_layout()
         out = os.path.join(analysis_folder, 'measured_bandwidth_speaker_vs_listeners.svg')
@@ -1012,7 +1031,8 @@ def plot_latency_speaker_vs_listeners(latency_speaker_stats, latency_listeners_s
                 max_val = max_val1
             elif max_val2 is not None:
                 max_val = max_val2
-        except Exception:
+        except Exception as e:
+            print(f'WARNING: Failed to compute automatic y-axis bounds: {e}')
             max_val = None
         if max_val is not None and max_val > 0:
             plt.ylim(0, max(max_val * 1.05, 1.0))
@@ -1024,8 +1044,8 @@ def plot_latency_speaker_vs_listeners(latency_speaker_stats, latency_listeners_s
             idx = sorted(set(list(mean_speaker.index) + list(mean_listeners.index)))
             xt = [int(x) for x in idx]
             plt.xticks(xt)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f'WARNING: Failed to set x-axis ticks for latency speaker-vs-listeners plot: {e}')
         plt.tight_layout()
         out = os.path.join(analysis_folder, 'latency_speaker_vs_listener.svg')
         plt.savefig(out)
@@ -1049,7 +1069,8 @@ def build_arch_map(scenario_folder):
         try:
             arch, clients = base.rsplit('-', 1)
             n = int(clients)
-        except Exception:
+        except Exception as e:
+            print(f'WARNING: Failed to parse architecture folder {base}: {e}')
             continue
         # include all inner run_* directories if present, otherwise the folder itself
         runs = sorted([p for p in glob.glob(os.path.join(af, 'run_*')) if os.path.isdir(p)])
@@ -1081,8 +1102,8 @@ def get_color_map(keys):
                 if 'hybrid' in kn:
                     cmap[k] = ARCH_COLOR_MAP.get('hybrid')
                     continue
-        except Exception:
-            pass
+        except Exception as e:
+            print(f'WARNING: Failed to map color for architecture {k}: {e}')
         # Fallback to matplotlib cycle for unknown keys
         cmap[k] = prop_cycle[i % len(prop_cycle)]
     return cmap
@@ -1096,7 +1117,8 @@ def _extract_client_num_from_folder(folder_path):
     nums = ''.join([c for c in base if c.isdigit()])
     try:
         return int(nums) if nums else None
-    except Exception:
+    except Exception as e:
+        print(f'WARNING: Failed to extract client number from folder {folder_path}: {e}')
         return None
 
 
@@ -1114,7 +1136,8 @@ def _diagnostics_sort_key(r):
     parts = r.get('Participants') if 'Participants' in r else r.get('participants')
     try:
         parts_i = int(parts) if parts is not None else 999999
-    except Exception:
+    except Exception as e:
+        print(f'WARNING: Failed to convert participants to int for sort: {e}')
         parts_i = 999999
 
     runp = r.get('RunPath') or r.get('run_path') or ''
@@ -1122,13 +1145,15 @@ def _diagnostics_sort_key(r):
     digits = ''.join([c for c in run_base if c.isdigit()])
     try:
         run_i = int(digits) if digits else (0 if run_base else 999999)
-    except Exception:
+    except Exception as e:
+        print(f'WARNING: Failed to extract run number for sort: {e}')
         run_i = 999999
 
     client = r.get('Client') if 'Client' in r else r.get('client')
     try:
         client_i = int(client) if client is not None else 999999
-    except Exception:
+    except Exception as e:
+        print(f'WARNING: Failed to convert client to int for sort: {e}')
         client_i = 999999
 
     return (arch_idx, parts_i, run_i, client_i)
@@ -1158,7 +1183,8 @@ def _client_crash_reason(run_path, client_num):
                     tail_size = min(32768, size)
                     f.seek(max(0, size - tail_size))
                     tail = f.read()
-            except Exception:
+            except Exception as e:
+                print(f'WARNING: Failed to read docker.log for client {client_num}: {e}')
                 continue
             tail_lc = tail.lower()
             if 'segmentation fault' in tail_lc or 'core dumped' in tail_lc:
@@ -1172,7 +1198,8 @@ def _client_crash_reason(run_path, client_num):
             # generic non-zero exit hints
             if 'exited' in tail_lc and 'code' in tail_lc:
                 return 'exited'
-    except Exception:
+    except Exception as e:
+        print(f'WARNING: Failed to detect client crash reason: {e}')
         pass
     return None
 
@@ -1330,10 +1357,12 @@ def collect_presence_records_for_run(run_path, arch, participants):
             if vk in meta:
                 try:
                     visible_limit = int(meta[vk])
-                except Exception:
+                except Exception as e:
+                    print(f'WARNING: Failed to parse visible_limit from {vk}={meta[vk]}: {e}')
                     visible_limit = None
                 break
-    except Exception:
+    except Exception as e:
+        print(f'WARNING: Failed to read metadata for visible limit: {e}')
         visible_limit = None
 
     # produce filtered client folders according to visible_limit
@@ -1343,7 +1372,8 @@ def collect_presence_records_for_run(run_path, arch, participants):
             try:
                 num = _extract_client_num_from_folder(folder)
                 return (num is None) or (num <= visible_limit)
-            except Exception:
+            except Exception as e:
+                print(f'WARNING: Failed to check visible limit for folder {folder}: {e}')
                 return True
         client_folders_filtered = [c for c in client_folders_all if _keep(c)]
 
@@ -1363,13 +1393,15 @@ def collect_presence_records_for_run(run_path, arch, participants):
                 try:
                     local_df = read_csv_guess(local_paths[0])
                     local_valid = local_df is not None
-                except Exception:
+                except Exception as e:
+                    print(f'WARNING: Failed to read local CSV {local_paths[0]}: {e}')
                     local_valid = False
             if part_present:
                 try:
                     part_df = read_csv_guess(part_paths[0])
                     part_valid = part_df is not None
-                except Exception:
+                except Exception as e:
+                    print(f'WARNING: Failed to read participant CSV {part_paths[0]}: {e}')
                     part_valid = False
             # compute single-letter code similar to previous implementation
             code = None
@@ -1444,8 +1476,8 @@ def accumulate_run_results(metrics, arch, participants, run_path,
                     psnr_speaker_stats[arch][parts_eff].append(speaker_val)
                 if listeners_mean is not None:
                     psnr_listeners_stats[arch][parts_eff].append(listeners_mean)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f'WARNING: Failed to aggregate speaker-vs-listeners PSNR: {e}')
 
     # missing frames summary appended (attach client_num inferred from receiver_folder)
     for m in metrics.get('missing_summary', []):
@@ -1498,8 +1530,8 @@ def accumulate_run_results(metrics, arch, participants, run_path,
                     measured_speaker_stats[arch][parts_eff].append(first_tx)
                 if rest_mean is not None:
                     measured_listeners_stats[arch][parts_eff].append(rest_mean)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f'WARNING: Failed to aggregate speaker-vs-listeners measured bandwidth: {e}')
 
     # Speaker-vs-listeners latency aggregation (per-sender mean latency collected in analyze_run)
     try:
@@ -1527,8 +1559,8 @@ def accumulate_run_results(metrics, arch, participants, run_path,
                     latency_speaker_stats[arch][parts_eff].append(speaker_val)
                 if listeners_mean is not None:
                     latency_listeners_stats[arch][parts_eff].append(listeners_mean)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f'WARNING: Failed to aggregate speaker-vs-listeners latency: {e}')
 
     # latency/encode/decode
     latency_rows.append({'arch': arch, 'participants': parts_eff,
@@ -1546,13 +1578,14 @@ def accumulate_run_results(metrics, arch, participants, run_path,
             client_folder_key = k
             try:
                 client_num_val = _extract_client_num_from_folder(k) if isinstance(k, str) else k
-            except Exception:
+            except Exception as e:
+                print(f'WARNING: Failed to extract client num from key {k}: {e}')
                 client_num_val = None
             client_max_rows.append({'arch': arch, 'participants': participants, 'run_path': run_path,
                                      'client_folder': client_folder_key, 'client_num': client_num_val,
                                      'max_encode_ms': me.get(k), 'max_decode_ms': md.get(k)})
-    except Exception:
-        pass
+    except Exception as e:
+        print(f'WARNING: Failed to collect per-client max encode/decode times: {e}')
 
 
 def build_psnr_dfs(psnr_stats):
@@ -1589,7 +1622,8 @@ def process_resolution_rows(resolution_rows, ANALYSIS_FOLDER):
             if participants is None or participants == 0:
                 return float(bps) / 1e6
             return float(bps) / float(participants) / 1e6
-        except Exception:
+        except Exception as e:
+            print(f'WARNING: Failed to convert {bps} bps to Mbps per client ({participants} participants): {e}')
             return None
 
     out_rows = []
@@ -1652,11 +1686,13 @@ def _plot_measured_bandwidth_generic(df, participants_col, arch_col, ycols, labe
         try:
             gagg_mean = g.groupby(participants_col)[ycols].mean()
             gagg_std = g.groupby(participants_col)[ycols].std().fillna(0.0)
-        except Exception:
+        except Exception as e:
+            print(f'WARNING: Failed to aggregate bandwidth data: {e}')
             try:
                 gagg_mean = g.set_index(participants_col)[ycols]
                 gagg_std = gagg_mean * 0.0
-            except Exception:
+            except Exception as e2:
+                print(f'WARNING: Failed fallback aggregation: {e2}')
                 continue
 
         x = list(gagg_mean.index)
@@ -1667,13 +1703,13 @@ def _plot_measured_bandwidth_generic(df, participants_col, arch_col, ycols, labe
             mk = marker if j == 0 else 'x'
             try:
                 max_val = max(max_val, float(np.nanmax((y + ystd).fillna(0.0))))
-            except Exception:
-                pass
+            except Exception as e:
+                print(f'WARNING: Failed to compute max bandwidth value: {e}')
             ax.plot(x, y, marker=mk, linestyle=ls, label=f'{arch_name} {labels[j]}', color=color)
             try:
                 ax.fill_between(x, (y - ystd), (y + ystd), color=color, alpha=0.12)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f'WARNING: Failed to fill between values for bandwidth plot: {e}')
 
     ax.set_xlabel('Participants')
     ax.set_ylabel(ylabel)
@@ -1682,8 +1718,8 @@ def _plot_measured_bandwidth_generic(df, participants_col, arch_col, ycols, labe
     try:
         xt = sorted(set(int(x) for x in df[participants_col].dropna().unique()))
         ax.set_xticks(xt)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f'WARNING: Failed to set x-axis ticks for bandwidth plot: {e}')
     if max_val is not None and max_val > 0:
         ax.set_ylim(0, max(max_val * 1.05, 0.1))
     else:
@@ -1691,8 +1727,14 @@ def _plot_measured_bandwidth_generic(df, participants_col, arch_col, ycols, labe
     ax.legend(fontsize=8)
     plt.tight_layout()
     out_path = os.path.join(ANALYSIS_FOLDER, out_filename)
-    fig.savefig(out_path)
-    plt.close(fig)
+    try:
+        fig.savefig(out_path)
+    except Exception as e:
+        print(f'WARNING: Failed to save bandwidth plot to {out_path}: {e}')
+    try:
+        plt.close(fig)
+    except Exception as e:
+        print(f'WARNING: Failed to close figure: {e}')
     print('Wrote measured bandwidth plot to', out_path)
 
 
@@ -1779,14 +1821,18 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
         expected_runs = {}
         for arch, entries in arch_map.items():
             for n, _ in entries:
-                expected_runs[(arch, n)] = expected_runs.get((arch, n), 0) + 1
+                try:
+                    expected_runs[(arch, n)] = expected_runs.get((arch, n), 0) + 1
+                except Exception as e:
+                    print(f'WARNING: Failed to build expected_runs entry for arch={arch} n={n}: {e}')
 
         agg_rows = []
         grouped = lat_df.groupby(['arch', 'participants'])
         for (arch, parts), g in grouped:
             try:
                 parts_i = int(parts)
-            except Exception:
+            except Exception as e:
+                print(f'WARNING: Failed to convert participants {parts} to int: {e}')
                 parts_i = parts
             key = (arch, parts_i)
             exp = expected_runs.get(key, 1)
@@ -1798,8 +1844,8 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
             if len(tvals) < exp:
                 try:
                     print(f"Insufficient latency samples for arch={arch} participants={parts_i}: expected {exp}, got {len(tvals)}; omitting from aggregates")
-                except Exception:
-                    print("Insufficient latency samples; omitting from aggregates")
+                except Exception as e:
+                    print(f"Insufficient latency samples; omitting from aggregates: {e}")
                 mean_t = None
             else:
                 mean_t = float(np.mean(tvals)) if tvals else None
@@ -1978,14 +2024,16 @@ def finalize_cpu_and_psnr(cpu_results, psnr_mean, psnr_std, ANALYSIS_FOLDER, sce
         for participants, val in rows:
             try:
                 by_n[int(participants)].append(float(val))
-            except Exception:
+            except Exception as e:
                 # ignore malformed entries
+                print(f'WARNING: Ignoring malformed CPU result for {arch}: participants={participants} val={val}: {e}')
                 continue
         averaged = []
         for participants, vals in sorted(by_n.items()):
             try:
                 meanv = float(np.nanmean(vals)) if vals else None
-            except Exception:
+            except Exception as e:
+                print(f'WARNING: Failed to compute mean CPU for arch={arch} participants={participants}: {e}')
                 meanv = None
             averaged.append((participants, meanv))
         averaged_cpu[arch] = averaged
@@ -2075,13 +2123,17 @@ def write_root_cpu_summary(results_by_arch, ROOT_FOLDER):
                 if p is None or v is None:
                     continue
                 by_n[int(p)].append(float(v))
-            except Exception:
+            except Exception as e:
+                print(f'WARNING: Ignoring malformed CPU result in root summary for arch={arch}: p={p} v={v}: {e}')
                 continue
         for parts, vals in sorted(by_n.items()):
             meanv = float(np.nanmean(vals)) if vals else np.nan
             stdv = float(np.nanstd(vals)) if vals else np.nan
             cnt = len(vals)
-            cpu_by_parts_rows.append({'Architecture': arch, 'Participants': parts, 'Mean_CPU': meanv, 'Std_CPU': stdv, 'Count': cnt})
+            try:
+                cpu_by_parts_rows.append({'Architecture': arch, 'Participants': parts, 'Mean_CPU': meanv, 'Std_CPU': stdv, 'Count': cnt})
+            except Exception as e:
+                print(f'WARNING: Failed to append CPU summary row for arch={arch} participants={parts}: {e}')
         # prepare mapping for plotting
         mean_map[arch] = [(parts, float(np.nanmean(vals))) for parts, vals in sorted(by_n.items())]
 
@@ -2122,8 +2174,8 @@ def write_root_cpu_summary(results_by_arch, ROOT_FOLDER):
             # set integer xticks
             all_x = sorted({int(r['Participants']) for r in cpu_by_parts_rows})
             ax.set_xticks(all_x)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f'WARNING: Failed to set x-axis ticks for CPU plot: {e}')
         ax.legend(fontsize=9)
         plt.tight_layout()
         outp2 = os.path.join(analysis_root, 'cpu_summary_by_participants.svg')
@@ -2155,8 +2207,9 @@ def write_root_latency_summary(scenarios, ROOT_FOLDER):
         # read latency summary written by process_latency_rows (semicolon-separated)
         try:
             df = pd.read_csv(lat_csv, sep=';', engine='python')
-        except Exception:
+        except Exception as e:
             # skip unreadable files
+            print(f'WARNING: Failed to read latency CSV {lat_csv}: {e}')
             continue
         if df.empty:
             continue
@@ -2189,13 +2242,16 @@ def write_root_latency_summary(scenarios, ROOT_FOLDER):
         # fallback: try to read metadata under scenario folder for Resolution / Upload limit
         if (res is None or upload is None):
             meta_path = os.path.join(ROOT_FOLDER, scenario, 'metadata.txt')
-            if os.path.isfile(meta_path):
-                meta = parse_metadata(meta_path)
-                if res is None:
-                    res = meta.get('Resolution')
-                if upload is None:
-                    # permissive keys
-                    upload = meta.get('Upload_Limit') or meta.get('Upload') or meta.get('Upload_Bitrate')
+            try:
+                if os.path.isfile(meta_path):
+                    meta = parse_metadata(meta_path)
+                    if res is None:
+                        res = meta.get('Resolution')
+                    if upload is None:
+                        # permissive keys
+                        upload = meta.get('Upload_Limit') or meta.get('Upload') or meta.get('Upload_Bitrate')
+            except Exception as e:
+                print(f'WARNING: Failed to read metadata from {meta_path}: {e}')
 
         if res is None:
             # skip scenarios without resolution (maintain original behavior)
@@ -2208,12 +2264,14 @@ def write_root_latency_summary(scenarios, ROOT_FOLDER):
             parts = r['Participants']
             try:
                 parts = int(parts) if pd.notna(parts) else None
-            except Exception:
+            except Exception as e:
+                print(f'WARNING: Failed to convert participants to int: {e}')
                 parts = None
             latv = r['Avg. Latency(ms)']
             try:
                 latv = float(latv) if pd.notna(latv) else None
-            except Exception:
+            except Exception as e:
+                print(f'WARNING: Failed to convert latency to float: {e}')
                 latv = None
             if latv is None:
                 continue
@@ -2312,7 +2370,8 @@ def write_root_measured_bandwidth_summary(scenarios, ROOT_FOLDER):
             continue
         try:
             df = pd.read_csv(scen_csv, sep=';', engine='python')
-        except Exception:
+        except Exception as e:
+            print(f'WARNING: Failed to read measured bandwidth CSV {scen_csv}: {e}')
             continue
 
         # attempt to extract resolution and view from scenario name
@@ -2331,14 +2390,17 @@ def write_root_measured_bandwidth_summary(scenarios, ROOT_FOLDER):
         # fallback: try to read metadata under scenario folder for Resolution / View_Mode
         if (res is None or view is None):
             meta_path = os.path.join(ROOT_FOLDER, scenario, 'metadata.txt')
-            if os.path.isfile(meta_path):
-                meta = parse_metadata(meta_path)
-                if res is None:
-                    res = meta.get('Resolution')
-                if view is None:
-                    v = meta.get('View_Mode') or meta.get('View') or meta.get('ViewMode')
-                    if v:
-                        view = str(v).strip().lower()
+            try:
+                if os.path.isfile(meta_path):
+                    meta = parse_metadata(meta_path)
+                    if res is None:
+                        res = meta.get('Resolution')
+                    if view is None:
+                        v = meta.get('View_Mode') or meta.get('View') or meta.get('ViewMode')
+                        if v:
+                            view = str(v).strip().lower()
+            except Exception as e:
+                print(f'WARNING: Failed to read metadata from {meta_path}: {e}')
 
         if res is None:
             # skip scenarios without resolution
@@ -2357,14 +2419,15 @@ def write_root_measured_bandwidth_summary(scenarios, ROOT_FOLDER):
     for (res, view), dfs in grouped.items():
         try:
             all_df = pd.concat(dfs, ignore_index=True, sort=False)
-        except Exception:
+        except Exception as e:
+            print(f'WARNING: Failed to concatenate DataFrames for res={res} view={view}: {e}')
             continue
 
         # normalize participants to numeric
         try:
             all_df['Participants'] = pd.to_numeric(all_df['Participants'], errors='coerce')
-        except Exception:
-            pass
+        except Exception as e:
+            print(f'WARNING: Failed to convert participants to numeric for res={res} view={view}: {e}')
 
         # group by Architecture and Participants and compute mean/min/max for client in/out and host in/out
         agg_rows = []
@@ -2476,7 +2539,13 @@ def write_root_measured_bandwidth_summary(scenarios, ROOT_FOLDER):
 
 
 def process_scenario(ROOT_FOLDER, scenario):
-    """Process one scenario directory: analyze architectures and write CSVs/plots."""
+    """Process one scenario directory: analyze architectures and write CSVs/plots.
+
+    Returns a tuple `(averaged_cpu, discarded_runs, failed_runs)`.  *discarded_runs* are
+    runs dropped from aggregation (broken clients, analysis failure, etc.).  *failed_runs*
+    are those with missing-frame errors; they are still accumulated but reported
+    separately for visibility.
+    """
     scenario_folder = os.path.join(ROOT_FOLDER, scenario)
     ANALYSIS_FOLDER = setup_analysis_folders(ROOT_FOLDER, scenario)
 
@@ -2500,8 +2569,11 @@ def process_scenario(ROOT_FOLDER, scenario):
     presence_records = []
     # preserve an unfiltered copy of presence records for diagnostics
     presence_records_unfiltered = []
-    # collect runs that are discarded due to missing frames or broken clients
+    # collect runs that are discarded due to broken clients or other analysis failures
     discarded_runs = []
+    # runs that failed because of missing frames; we still include their metrics in the
+    # aggregated results but mark them separately so callers can inspect them.
+    failed_runs = []
 
     # Build list of runs and collect presence records first (cheap). Parallelize collection
     runs = []
@@ -2582,26 +2654,32 @@ def process_scenario(ROOT_FOLDER, scenario):
                             continue
 
                     # Broken clients from presence records: look for entries matching this run with both traces missing/invalid
-                    if not run_failed:
-                        for p in presence_records:
-                            try:
-                                if p.get('run_path') == run_path and p.get('arch') == arch:
-                                    code = p.get('code')
-                                    local_valid = p.get('local_valid')
-                                    part_valid = p.get('part_valid')
-                                    # code 'M' means both traces missing; also treat both invalid as broken
-                                    if code == 'M' or (local_valid is False and part_valid is False):
-                                        run_failed = True
-                                        reasons.append('broken_client')
-                                        break
-                            except Exception:
-                                continue
+                    for p in presence_records:
+                        try:
+                            if p.get('run_path') == run_path and p.get('arch') == arch:
+                                code = p.get('code')
+                                local_valid = p.get('local_valid')
+                                part_valid = p.get('part_valid')
+                                # code 'M' means both traces missing; also treat both invalid as broken
+                                if code == 'M' or (local_valid is False and part_valid is False):
+                                    run_failed = True
+                                    reasons.append('broken_client')
+                                    break
+                        except Exception:
+                            continue
 
                     if run_failed:
-                        discarded_runs.append({'arch': arch, 'participants': participants, 'run_path': run_path, 'reason': ','.join(sorted(set(reasons))) or 'failed'})
-                        print(f"Discarding run due to failure: {arch} participants={participants} run={run_path} reason={','.join(sorted(set(reasons))) }")
-                        # do NOT accumulate this run's metrics into aggregate results; diagnostics already preserved
-                        continue
+                        # runs where the only failure reason is missing frames are classified as
+                        # "failed_runs" but are still accumulated into the final metrics.
+                        if len(reasons) == 1 and reasons[0] == 'missing_frames':
+                            failed_runs.append({'arch': arch, 'participants': participants, 'run_path': run_path, 'reason': 'missing_frames'})
+                            print(f"Marking run as failed (missing frames) but including in results: {arch} participants={participants} run={run_path}")
+                            # do not `continue` here; we want to accumulate these metrics below
+                        else:
+                            discarded_runs.append({'arch': arch, 'participants': participants, 'run_path': run_path, 'reason': ','.join(sorted(set(reasons))) or 'failed'})
+                            print(f"Discarding run due to failure: {arch} participants={participants} run={run_path} reason={','.join(sorted(set(reasons))) }")
+                            # do NOT accumulate this run's metrics into aggregate results; diagnostics already preserved
+                            continue
 
                     # Otherwise, include the run in aggregated results
                     accumulate_run_results(metrics, arch, participants, run_path,
@@ -2710,8 +2788,8 @@ def process_scenario(ROOT_FOLDER, scenario):
     averaged_cpu = finalize_cpu_and_psnr(cpu_results, psnr_mean, psnr_std, ANALYSIS_FOLDER, scenario)
 
     # Return per-scenario averaged CPU mapping for root-level aggregation
-    # and list of discarded runs for centralized reporting
-    return averaged_cpu, discarded_runs
+    # and lists of discarded & failed runs for centralized reporting
+    return averaged_cpu, discarded_runs, failed_runs
 
 def main():
     parser = argparse.ArgumentParser(description='Analyze experimental results')
@@ -2732,6 +2810,7 @@ def main():
 
     all_results_by_arch = defaultdict(list)
     all_discarded_runs = []
+    all_failed_runs = []
     # If there are multiple scenarios, run them in parallel at the scenario level.
     if len(scenarios) > 1:
         max_workers = min(len(scenarios), (os.cpu_count() or 2))
@@ -2743,12 +2822,19 @@ def main():
                 try:
                     res = fut.result()
                     if res:
-                        # process_scenario now returns (averaged_cpu, discarded_runs)
-                        try:
-                            averaged_cpu, discarded = res
-                        except Exception:
+                        # process_scenario now returns (averaged_cpu, discarded_runs, failed_runs)
+                        averaged_cpu = None
+                        discarded = []
+                        failed = []
+                        if isinstance(res, tuple):
+                            if len(res) == 3:
+                                averaged_cpu, discarded, failed = res
+                            elif len(res) == 2:
+                                averaged_cpu, discarded = res
+                            else:
+                                averaged_cpu = res
+                        else:
                             averaged_cpu = res
-                            discarded = []
                         if averaged_cpu:
                             for arch, rows in averaged_cpu.items():
                                 all_results_by_arch[arch].extend(rows)
@@ -2757,6 +2843,10 @@ def main():
                                 # attach scenario for context
                                 d['scenario'] = sc
                             all_discarded_runs.extend(discarded)
+                        if failed:
+                            for f in failed:
+                                f['scenario'] = sc
+                            all_failed_runs.extend(failed)
                 except Exception as e:
                     print(f"process_scenario failed for {sc}: {e}")
     else:
@@ -2764,11 +2854,18 @@ def main():
             try:
                 res = process_scenario(ROOT_FOLDER, scenario)
                 if res:
-                    try:
-                        averaged_cpu, discarded = res
-                    except Exception:
+                    averaged_cpu = None
+                    discarded = []
+                    failed = []
+                    if isinstance(res, tuple):
+                        if len(res) == 3:
+                            averaged_cpu, discarded, failed = res
+                        elif len(res) == 2:
+                            averaged_cpu, discarded = res
+                        else:
+                            averaged_cpu = res
+                    else:
                         averaged_cpu = res
-                        discarded = []
                     if averaged_cpu:
                         for arch, rows in averaged_cpu.items():
                             all_results_by_arch[arch].extend(rows)
@@ -2776,6 +2873,10 @@ def main():
                         for d in discarded:
                             d['scenario'] = scenario
                         all_discarded_runs.extend(discarded)
+                    if failed:
+                        for f in failed:
+                            f['scenario'] = scenario
+                        all_failed_runs.extend(failed)
             except Exception as e:
                 print(f"process_scenario failed for {scenario}: {e}")
 
@@ -2816,8 +2917,23 @@ def main():
                 print(f" - {r.get('Architecture')} participants={r.get('Participants')} run={r.get('RunPath')} reason={r.get('Reason')}")
         else:
             print('No discarded runs detected.')
+        # also write failed_runs summary if any
+        if all_failed_runs:
+            out_rows = []
+            for f in all_failed_runs:
+                out_rows.append({'Architecture': f.get('arch'), 'Participants': f.get('participants'),
+                                 'RunPath': f.get('run_path'), 'Reason': f.get('reason'), 'Scenario': f.get('scenario')})
+            df_fail = pd.DataFrame(out_rows)
+            fail_csv = os.path.join(analysis_root, 'failed_runs.csv')
+            df_fail.to_csv(fail_csv, index=False, sep=';')
+            print(f'Wrote failed runs summary to {fail_csv}')
+            print('Failed runs:')
+            for r in out_rows:
+                print(f" - {r.get('Architecture')} participants={r.get('Participants')} run={r.get('RunPath')} reason={r.get('Reason')}")
+        else:
+            print('No failed runs detected.')
     except Exception as e:
-        print('Failed to write discarded runs summary:', e)
+        print('Failed to write discarded/failed runs summaries:', e)
 
     print('Analysis complete.')
 

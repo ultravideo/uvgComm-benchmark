@@ -17,6 +17,7 @@ Usage:
 The script writes CSV summaries and SVG/PNG plots under <timestamp_folder>/analysis/
 """
 
+import math
 import os
 import glob
 import pandas as pd
@@ -42,6 +43,8 @@ matplotlib.use("Agg")
 # limit unmatched-frame debug prints per detect_missing_frames run
 _UNMATCHED_PRINT_LIMIT = int(os.environ.get('UVGCOMM_UNMATCHED_PRINT_LIMIT', '5'))
 _unmatched_print_count = 0
+
+GRAPH_NUM_CLIENT_LABEL = 'Number of Clients'
 
 
 def read_csv_guess(path, na_values=["", "NA", "null"], dtype=None):
@@ -745,15 +748,16 @@ def plot_cpu(results_by_arch, analysis_folder, scenario):
             ls = '-' if i % 2 == 0 else '--'
             # use default color cycle (will be set externally if desired)
             plt.plot(xs_arr[mask], ys_arr[mask], marker=m, linestyle=ls, label=arch)
-    plt.xlabel('Number of Participants')
+    plt.xlabel(GRAPH_NUM_CLIENT_LABEL)
     plt.ylabel('Average Total CPU %')
-    plt.title(f'CPU usage - {scenario}')
+    #plt.title(f'CPU usage - {scenario}')
     # nicer grid: horizontal lines only
     plt.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
-    plt.legend(prop={'size': 10})
+    ncol = len(results_by_arch) if len(results_by_arch) <= 3 else math.ceil(len(results_by_arch) / 2)
+    plt.legend(loc="lower center", bbox_to_anchor=(0.5, -0.3),  ncol=ncol, prop={'size': 10})
     # enforce y-axis 0-100 and ticks every 10%
-    plt.ylim(0, 100)
-    plt.yticks(np.arange(0, 101, 10))
+    #plt.ylim(0, 100)
+    #plt.yticks(np.arange(0, 101, 10))
     # x-axis should be whole numbers (participants)
     all_x = []
     for rows in results_by_arch.values():
@@ -883,9 +887,9 @@ def plot_psnr(mean_df, std_df, analysis_folder, scenario):
         if col in std_df.columns:
             std = std_df[col].fillna(0)
             plt.fill_between(mean_df.index, mean_df[col] - std, mean_df[col] + std, alpha=0.15)
-    plt.xlabel('Number of Participants')
+    plt.xlabel(GRAPH_NUM_CLIENT_LABEL)
     plt.ylabel('Average PSNR (Y)')
-    plt.title(f'Average PSNR - {scenario}')
+    #plt.title(f'Average PSNR - {scenario}')
     plt.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
     # set x-axis to whole numbers
     try:
@@ -896,7 +900,8 @@ def plot_psnr(mean_df, std_df, analysis_folder, scenario):
     # Force y-limits to 0..50 and add horizontal 8-bit max line before legend so it's shown
     plt.ylim(0, 50)
     plt.axhline(48.131, color='gray', linestyle=':', linewidth=2.0, label='Max PSNR (8-bit)', zorder=5)
-    plt.legend(prop={'size': 10})
+    ncol = len(mean_df.columns) if len(mean_df.columns) <= 3 else math.ceil(len(mean_df.columns) / 2)
+    plt.legend(loc="lower center", bbox_to_anchor=(0.5, -0.3),  ncol=ncol, prop={'size': 10})
     plt.tight_layout()
     out = os.path.join(analysis_folder, 'psnr.svg')
     plt.savefig(out)
@@ -926,13 +931,14 @@ def plot_psnr_speaker_vs_listeners(psnr_speaker_stats, psnr_listeners_stats, ana
                 plt.plot(mean_listeners.index, mean_listeners[arch], marker=mk, markersize=8, linewidth=2.0, markeredgewidth=1.4, markerfacecolor='none', linestyle='--', label=f'{arch} (listeners)', color=color)
                 if arch in std_listeners.columns:
                     plt.fill_between(mean_listeners.index, mean_listeners[arch] - std_listeners[arch], mean_listeners[arch] + std_listeners[arch], alpha=0.10, color=color)
-        plt.xlabel('Number of Participants')
+        plt.xlabel(GRAPH_NUM_CLIENT_LABEL)
         plt.ylabel('PSNR (Y)')
-        plt.title(f'PSNR: Speaker vs Listeners - {scenario}')
+        #plt.title(f'PSNR: Speaker vs Listeners - {scenario}')
         plt.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
         plt.ylim(0, 50)
         plt.axhline(48.131, color='gray', linestyle=':', linewidth=2.0, label='Max PSNR (8-bit)', zorder=5)
-        plt.legend(prop={'size': 9})
+        ncol = len(all_archs) if len(all_archs) <= 3 else math.ceil(len(all_archs) / 2)
+        plt.legend(loc="lower center", bbox_to_anchor=(0.5, -0.3),  ncol=ncol, prop={'size': 9})
         # force x-axis to whole numbers (participants)
         try:
             idx = sorted(set(list(mean_speaker.index) + list(mean_listeners.index)))
@@ -973,15 +979,16 @@ def plot_measured_bandwidth_speaker_vs_listeners(measured_speaker_stats, measure
             ax.plot(x, speaker_means, marker=mk, markersize=7, linewidth=2.0, markeredgewidth=1.2, linestyle='-', label=f'{arch} (speaker)', color=color)
             # listeners: dashed, open marker
             ax.plot(x, listeners_means, marker=mk, markersize=7, linewidth=2.0, markeredgewidth=1.2, markerfacecolor='none', linestyle='--', label=f'{arch} (listeners)', color=color)
-        ax.set_xlabel('Participants')
+        ax.set_xlabel(GRAPH_NUM_CLIENT_LABEL)
         ax.set_ylabel('Measured Outgoing Bandwidth (Mbps)')
-        ax.set_title(f'Measured Bandwidth: Speaker vs Listeners - {scenario}')
+        #ax.set_title(f'Measured Bandwidth: Speaker vs Listeners - {scenario}')
         ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
         try:
             ax.set_xticks(idx)
         except Exception as e:
             print(f'WARNING: Failed to set x-axis ticks for measured bandwidth plot: {e}')
-        ax.legend(fontsize=8)
+        ncol = len(cmap) if len(cmap) <= 3 else math.ceil(len(cmap) / 2)
+        ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.3),  ncol=ncol, fontsize=8)
         plt.tight_layout()
         out = os.path.join(analysis_folder, 'measured_bandwidth_speaker_vs_listeners.svg')
         fig.savefig(out)
@@ -1014,9 +1021,9 @@ def plot_latency_speaker_vs_listeners(latency_speaker_stats, latency_listeners_s
                 plt.plot(mean_listeners.index, mean_listeners[arch], marker=mk, markersize=8, linewidth=2.0, markeredgewidth=1.4, markerfacecolor='none', linestyle='--', label=f'{arch} (listeners)', color=color)
                 if arch in std_listeners.columns:
                     plt.fill_between(mean_listeners.index, mean_listeners[arch] - std_listeners[arch], mean_listeners[arch] + std_listeners[arch], alpha=0.10, color=color)
-        plt.xlabel('Number of Participants')
+        plt.xlabel(GRAPH_NUM_CLIENT_LABEL)
         plt.ylabel('Mean Total Latency (ms)')
-        plt.title(f'Latency: Speaker vs Listeners - {scenario}')
+        #plt.title(f'Latency: Speaker vs Listeners - {scenario}')
         plt.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
         # compute automatic upper bound from mean+std and force y-axis to start at 0
         try:
@@ -1038,7 +1045,8 @@ def plot_latency_speaker_vs_listeners(latency_speaker_stats, latency_listeners_s
             plt.ylim(0, max(max_val * 1.05, 1.0))
         else:
             plt.ylim(0, 1)
-        plt.legend(prop={'size': 9})
+        ncol = len(all_archs) if len(all_archs) <= 3 else math.ceil(len(all_archs) / 2)
+        plt.legend(loc="lower center", bbox_to_anchor=(0.5, -0.3),  ncol=ncol, prop={'size': 9})
         # force integer x-ticks
         try:
             idx = sorted(set(list(mean_speaker.index) + list(mean_listeners.index)))
@@ -1711,9 +1719,9 @@ def _plot_measured_bandwidth_generic(df, participants_col, arch_col, ycols, labe
             except Exception as e:
                 print(f'WARNING: Failed to fill between values for bandwidth plot: {e}')
 
-    ax.set_xlabel('Participants')
+    ax.set_xlabel(GRAPH_NUM_CLIENT_LABEL)
     ax.set_ylabel(ylabel)
-    ax.set_title(title)
+    #ax.set_title(title)
     ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
     try:
         xt = sorted(set(int(x) for x in df[participants_col].dropna().unique()))
@@ -1724,7 +1732,8 @@ def _plot_measured_bandwidth_generic(df, participants_col, arch_col, ycols, labe
         ax.set_ylim(0, max(max_val * 1.05, 0.1))
     else:
         ax.set_ylim(0, 1)
-    ax.legend(fontsize=8)
+    ncol = len(groups) if len(groups) <= 3 else math.ceil(len(groups) / 2)
+    ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.35),  ncol=ncol, fontsize=8)
     plt.tight_layout()
     out_path = os.path.join(ANALYSIS_FOLDER, out_filename)
     try:
@@ -1913,9 +1922,9 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
             # X axis ticks are participant counts (one group per participant count)
             ax.set_xticks(x)
             ax.set_xticklabels([str(p) for p in parts], rotation=0)
-            ax.set_xlabel('Number of Participants')
+            ax.set_xlabel(GRAPH_NUM_CLIENT_LABEL)
             ax.set_ylabel('Time (ms)')
-            ax.set_title('Latency breakdown (grouped by participants, architectures side-by-side)')
+            #ax.set_title('Latency breakdown (grouped by participants, architectures side-by-side)')
             ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
             # Build legend: show architectures (color) and stack segments (hatch)
             arch_handles = [mpatches.Patch(facecolor=cmap.get(a), edgecolor='black', label=a) for a in archs]
@@ -1985,9 +1994,9 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                             ax.fill_between(mean_df.index, (y - std), (y + std), alpha=0.15, color=cmap.get(col))
                         except Exception:
                             pass
-                ax.set_xlabel('Number of Participants')
+                ax.set_xlabel(GRAPH_NUM_CLIENT_LABEL)
                 ax.set_ylabel('Mean Total Latency (ms)')
-                ax.set_title('Mean Total Latency - aggregated runs')
+                #ax.set_title('Mean Total Latency - aggregated runs')
                 ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
                 try:
                     xt = [int(x) for x in mean_df.index]
@@ -2162,13 +2171,13 @@ def write_root_cpu_summary(results_by_arch, ROOT_FOLDER):
             color = cmap.get(arch)
             mk = markers[i % len(markers)]
             ax.errorbar(xs, ys, yerr=stds, marker=mk, linestyle='-', label=arch, color=color, capsize=3)
-        ax.set_xlabel('Number of Participants')
+        ax.set_xlabel(GRAPH_NUM_CLIENT_LABEL)
         ax.set_ylabel('Average Total CPU %')
-        ax.set_title('CPU by Participants (root summary)')
+        #ax.set_title('CPU by Participants (root summary)')
         ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
         # Force y-axis 0..100 and ticks every 10% for consistent CPU % visualization
-        ax.set_ylim(0, 100)
-        ax.set_yticks(np.arange(0, 101, 10))
+        #ax.set_ylim(0, 100)
+        #ax.set_yticks(np.arange(0, 101, 10))
         
         try:
             # set integer xticks
@@ -2176,7 +2185,8 @@ def write_root_cpu_summary(results_by_arch, ROOT_FOLDER):
             ax.set_xticks(all_x)
         except Exception as e:
             print(f'WARNING: Failed to set x-axis ticks for CPU plot: {e}')
-        ax.legend(fontsize=9)
+        ncol = len(mean_map) if len(mean_map) <= 3 else math.ceil(len(mean_map) / 2)
+        ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.3),  ncol=ncol, fontsize=9)
         plt.tight_layout()
         outp2 = os.path.join(analysis_root, 'cpu_summary_by_participants.svg')
         fig.savefig(outp2)
@@ -2332,7 +2342,7 @@ def write_root_latency_summary(scenarios, ROOT_FOLDER):
                     ax.plot(xs, ys, label=label, color=cmap.get(arch), linestyle=linestyle_map.get(lt, '-'), marker=marker)
                     max_val = max(max_val, max(ys))
 
-            ax.set_xlabel('Number of Participants')
+            ax.set_xlabel(GRAPH_NUM_CLIENT_LABEL)
             ax.set_ylabel('Mean Total Latency (ms)')
             ax.set_title(f'Root Latency Summary - upload={up} res={res}')
             ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
@@ -2342,7 +2352,8 @@ def write_root_latency_summary(scenarios, ROOT_FOLDER):
                 ax.set_ylim(0, max_val * 1.05)
             if xticks:
                 ax.set_xticks(xticks)
-            ax.legend(fontsize=8)
+            ncol = len(archs) if len(archs) <= 3 else math.ceil(len(archs) / 2)
+            ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.3),  ncol=ncol, fontsize=8)
             plt.tight_layout()
             safe_up = str(up).replace('/', '-').replace(' ', '_')
             safe_res = str(res).replace('/', '-').replace(' ', '_')
@@ -2518,16 +2529,17 @@ def write_root_measured_bandwidth_summary(scenarios, ROOT_FOLDER):
                     except Exception:
                         pass
 
-            ax.set_xlabel('Number of Participants')
+            ax.set_xlabel(GRAPH_NUM_CLIENT_LABEL)
             ax.set_ylabel('Measured Per-Client Bandwidth (Mbps)')
-            ax.set_title(f'Measured Bandwidth (per-client) - {res} view={view}')
+            #ax.set_title(f'Measured Bandwidth (per-client) - {res} view={view}')
             ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
             try:
                 xt = sorted(set(int(x) for x in out_df['Participants'].dropna().unique()))
                 ax.set_xticks(xt)
             except Exception:
                 pass
-            ax.legend(fontsize=9)
+            ncol = len(archs) if len(archs) <= 3 else math.ceil(len(archs) / 2)
+            ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.3),  ncol=ncol, fontsize=9)
             plt.tight_layout()
             outp = os.path.join(analysis_root, f'measured_bandwidth_root_{res}_view-{view}.svg')
             fig.savefig(outp)

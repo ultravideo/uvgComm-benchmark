@@ -2062,7 +2062,8 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                 std_df = pd.DataFrame(index=participants_idx)
                 arch_keys = sorted({r['arch'] for r in agg_rows})
                 for arch in arch_keys:
-                    vals_map = {int(r['participants']): float(r['mean_encode'] + r['mean_decode'] + r['mean_network']) for r in agg_rows if r['arch'] == arch and r.get('mean_encode') is not None and r.get('mean_decode') is not None and r.get('mean_network') is not None}
+                    #vals_map = {int(r['participants']): float(r['mean_encode'] + r['mean_decode'] + r['mean_network']) for r in agg_rows if r['arch'] == arch and r.get('mean_encode') is not None and r.get('mean_decode') is not None and r.get('mean_network') is not None}
+                    vals_map = {int(r['participants']): float(r['mean_network']) for r in agg_rows if r['arch'] == arch and r.get('mean_network') is not None}
                     means = []
                     stds = []
                     for n in participants_idx:

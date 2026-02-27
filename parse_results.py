@@ -603,7 +603,7 @@ def analyze_run(run_path):
                         max_encode_by_client[key] = cur
             except Exception as e:
                 print(f'WARNING: Failed to record per-client max encode time: {e}')
-        nlvals, _ = extract_numeric_list(df, ['NetworkLatency(ms)', 'NetworkLatency', 'NetworkLatencyMs'], dtype=int)
+        nlvals, _ = extract_numeric_list(df, ['NetworkLatency(ms)', 'NetworkLatency', 'NetworkLatencyMs'], dtype=float)
         if nlvals:
             network_latencies.extend(nlvals)
     metrics['avg_frame_size'] = float(np.mean(sizes)) if sizes else None

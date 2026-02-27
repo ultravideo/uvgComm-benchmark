@@ -222,7 +222,7 @@ def _match_with_offset(local_sizes, part_sizes, lookahead, verbose=False):
     # capture participant index after consuming initial consecutive matches
     found_p_idx = None
     # allow up to this many skipped participant entries between matched local frames
-    MAX_PART_SKIP = 2
+    MAX_PART_SKIP = 20
     for k in range(0, max_k + 1):
         p_idx = k
         ok = True
@@ -235,7 +235,7 @@ def _match_with_offset(local_sizes, part_sizes, lookahead, verbose=False):
                 if p_try >= n_part:
                     break
                 ps = part_sizes[p_try]
-                if ps == ls_n or ps == ls_n + 1:
+                if ps == ls_n or ps == ls_n + 1 or ps == ls_n - 1:
                     # accept this match and advance p_idx to the next position
                     p_idx = p_try + 1
                     match_found = True
@@ -278,7 +278,7 @@ def _match_with_offset(local_sizes, part_sizes, lookahead, verbose=False):
         ps = part_sizes[j]
 
         # direct match
-        if ps == ls or ps == ls + 1:
+        if ps == ls or ps == ls + 1 or ps == ls - 1:
             delivered += 1
             i += 1
             j += 1
@@ -288,7 +288,7 @@ def _match_with_offset(local_sizes, part_sizes, lookahead, verbose=False):
         for k in (1, 2):
             if (j + k) < n_part:
                 ps_k = part_sizes[j + k]
-                if ps_k == ls or ps_k == ls + 1:
+                if ps_k == ls or ps_k == ls + 1 or ps_k == ls - 1:
                     if verbose and _unmatched_print_count < _UNMATCHED_PRINT_LIMIT:
                         skipped_sizes = ','.join(str(x) for x in part_sizes[j:j+k])
                         _unmatched_print_count += 1
@@ -552,6 +552,8 @@ def analyze_run(run_path):
     max_encode_by_client = {}
     # per-client max decode time (ms)
     max_decode_by_client = {}
+    # Client reported network latency (ms) based on RTT measurements
+    network_latencies = []
     out_total_bytes = 0
     out_min_ts = None
     out_max_ts = None
@@ -597,10 +599,15 @@ def analyze_run(run_path):
                         max_encode_by_client[key] = cur
             except Exception as e:
                 print(f'WARNING: Failed to record per-client max encode time: {e}')
+        nlvals, _ = extract_numeric_list(df, ['NetworkLatency(ms)', 'NetworkLatency', 'NetworkLatencyMs'], dtype=int)
+        if nlvals:
+            network_latencies.extend(nlvals)
     metrics['avg_frame_size'] = float(np.mean(sizes)) if sizes else None
     metrics['avg_width'] = float(np.mean(widths)) if widths else None
     metrics['avg_height'] = float(np.mean(heights)) if heights else None
     metrics['avg_encode_ms'] = float(np.mean(encode_times)) if encode_times else None
+    
+    metrics['avg_network_latency_ms'] = float(np.mean(network_latencies)) if network_latencies else None
 
     # Latency / decode times / participant-side stats
     latencies = []
@@ -1573,8 +1580,9 @@ def accumulate_run_results(metrics, arch, participants, run_path,
     # latency/encode/decode
     latency_rows.append({'arch': arch, 'participants': parts_eff,
                          'avg_latency_ms': metrics.get('avg_latency_ms'),
+                         'avg_network_latency_ms': metrics.get('avg_network_latency_ms'),
                          'avg_encode_ms': metrics.get('avg_encode_ms'),
-                         'avg_decode_ms': metrics.get('avg_decode_ms')})
+                         'avg_decode_ms': metrics.get('avg_decode_ms'),})
     # collect per-client max encode/decode reported by analyze_run (may use None keys)
     try:
         me = metrics.get('max_encode_by_client', {}) or {}
@@ -1819,7 +1827,8 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
 
     lat_out = lat_df.rename(columns={
         'arch': 'Architecture', 'participants': 'Participants',
-        'avg_latency_ms': 'Avg. Latency(ms)', 'avg_encode_ms': 'Avg. Encoding Time (ms)',
+        'avg_latency_ms': 'Avg. Latency(ms)', 'avg_network_latency_ms': 'Avg. Network Latency(ms)',
+        'avg_encode_ms': 'Avg. Encoding Time (ms)',
         'avg_decode_ms': 'Avg. Decoding Time (ms)'
     })
     lat_csv = os.path.join(ANALYSIS_FOLDER, f'latency_summary.csv')
@@ -1868,13 +1877,15 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
 
             mean_e = None
             mean_d = None
-            if len(g) == exp and 'avg_encode_ms' in g and 'avg_decode_ms' in g:
-                if not g['avg_encode_ms'].isnull().any() and not g['avg_decode_ms'].isnull().any():
+            mean_n = None
+            if len(g) == exp and 'avg_encode_ms' in g and 'avg_decode_ms' in g and 'avg_network_latency_ms' in g:
+                if not g['avg_encode_ms'].isnull().any() and not g['avg_decode_ms'].isnull().any() and not g['avg_network_latency_ms'].isnull().any():
                     mean_e = float(np.mean(g['avg_encode_ms']))
                     mean_d = float(np.mean(g['avg_decode_ms']))
+                    mean_n = float(np.mean(g['avg_network_latency_ms']))
 
             agg_rows.append({'arch': arch, 'participants': parts_i, 'mean_encode': mean_e,
-                             'mean_decode': mean_d, 'mean_total': mean_t})
+                             'mean_decode': mean_d, 'mean_network': mean_n, 'mean_total': mean_t})
 
         if agg_rows:
             # Reorganize latency breakdown as grouped bars by participant count
@@ -1888,17 +1899,19 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
             for p in parts:
                 data_map[p] = {}
                 for a in archs:
-                    data_map[p][a] = {'enc': 0.0, 'dec': 0.0, 'oth': 0.0}
+                    data_map[p][a] = {'enc': 0.0, 'dec': 0.0, 'net': 0.0, 'oth': 0.0}
             for r in agg_rows:
                 a = r['arch']
                 p = int(r['participants'])
                 t = r.get('mean_total') or 0.0
                 e = r.get('mean_encode')
                 d = r.get('mean_decode')
+                n = r.get('mean_network')
                 enc_val = float(e) if e is not None else 0.0
                 dec_val = float(d) if d is not None else 0.0
-                oth_val = max(0.0, float(t) - enc_val - dec_val)
-                data_map[p][a] = {'enc': enc_val, 'dec': min(dec_val, 999.0), 'oth': oth_val}
+                net_val = float(n) if n is not None else 0.0
+                oth_val = max(0.0, float(t) - enc_val - dec_val - net_val)
+                data_map[p][a] = {'enc': enc_val, 'dec': min(dec_val, 999.0), 'net': net_val, 'oth': oth_val}
 
             fig, ax = plt.subplots(figsize=(10,5))
             x = np.arange(len(parts))
@@ -1906,18 +1919,21 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
             n_arch = max(1, len(archs))
             bar_w = total_width / n_arch
             cmap = get_color_map(archs)
-            hatch_map = {'enc': '', 'dec': '//', 'oth': '..'}
+            hatch_map = {'enc': '', 'dec': '//', 'net': '++', 'oth': '..'}
             # draw bars per-architecture offset within each participant group
             for i, arch in enumerate(archs):
                 pos = x - total_width/2 + i * bar_w + bar_w/2
                 enc_vals = [data_map[p][arch]['enc'] for p in parts]
                 dec_vals = [data_map[p][arch]['dec'] for p in parts]
+                net_vals = [data_map[p][arch]['net'] for p in parts]
                 oth_vals = [data_map[p][arch]['oth'] for p in parts]
                 col = cmap.get(arch)
                 p1 = ax.bar(pos, enc_vals, bar_w, color=col, label=arch if i == 0 else None, hatch=hatch_map['enc'], edgecolor='black')
                 p2 = ax.bar(pos, dec_vals, bar_w, bottom=enc_vals, color=col, hatch=hatch_map['dec'], edgecolor='black')
                 bottom_ed = np.array(enc_vals) + np.array(dec_vals)
-                p3 = ax.bar(pos, oth_vals, bar_w, bottom=bottom_ed, color=col, hatch=hatch_map['oth'], edgecolor='black')
+                p3 = ax.bar(pos, net_vals, bar_w, bottom=bottom_ed, color=col, hatch=hatch_map['net'], edgecolor='black')
+                bottom_ed_net = bottom_ed + np.array(net_vals)
+                #p4 = ax.bar(pos, oth_vals, bar_w, bottom=bottom_ed_net, color=col, hatch=hatch_map['oth'], edgecolor='black')
 
             # X axis ticks are participant counts (one group per participant count)
             ax.set_xticks(x)
@@ -1928,7 +1944,7 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
             ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
             # Build legend: show architectures (color) and stack segments (hatch)
             arch_handles = [mpatches.Patch(facecolor=cmap.get(a), edgecolor='black', label=a) for a in archs]
-            seg_handles = [mpatches.Patch(facecolor='white', edgecolor='black', hatch=hatch_map[k], label=lab) for k, lab in [('enc','Encoding'), ('dec','Decoding'), ('oth','Other')]]
+            seg_handles = [mpatches.Patch(facecolor='white', edgecolor='black', hatch=hatch_map[k], label=lab) for k, lab in [('enc','Encoding'), ('dec','Decoding'), ('net','Network'), ]]#('oth','Other')]]
             # Place two legends: architectures on upper left, segments on upper right
             if arch_handles:
                 leg1 = ax.legend(handles=arch_handles, title='Architectures', fontsize=8, loc='upper left')
@@ -2013,7 +2029,8 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                     ax.set_ylim(0, max(max_val * 1.05, 1.0))
                 else:
                     ax.set_ylim(0, 1)
-                ax.legend(prop={'size': 10})
+                ncol = len(mean_df.columns) if len(mean_df.columns) <= 3 else math.ceil(len(mean_df.columns) / 2)
+                ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.4),  ncol=ncol, prop={'size': 10})
                 plt.tight_layout()
                 line_out = os.path.join(ANALYSIS_FOLDER, 'latency_linechart.svg')
                 fig.savefig(line_out)
@@ -2021,6 +2038,80 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                 print('Wrote latency linechart to', line_out)
         except Exception as e:
             print('Failed to create latency totals line plot:', e)
+        # Simple line graph of the sum of mean_encode + mean_decode + mean_network (if available) per architecture vs participants, with shading for stddev if available. This is a simpler alternative to the stacked bar chart and may be more robust when there are fewer complete samples.
+        try:
+            # Use only aggregated rows with a valid mean_encode + mean_decode + mean_network
+            valid_parts = sorted({int(r['participants']) for r in agg_rows if r.get('mean_encode') is not None and r.get('mean_decode') is not None and r.get('mean_network') is not None})
+            if not valid_parts:
+                fig, ax = plt.subplots(figsize=(6,3))
+                ax.text(0.5, 0.5, 'No latency available to plot', ha='center', va='center')
+                ax.axis('off')
+                line_out = os.path.join(ANALYSIS_FOLDER, 'latency_encode_decode_network_linechart.svg')
+                fig.savefig(line_out)
+                plt.close(fig)
+                print('Wrote placeholder latency linechart to', line_out)
+            else:
+                # Build mean/std DataFrames similar to PSNR plotting helper
+                participants_idx = valid_parts
+                mean_df = pd.DataFrame(index=participants_idx)
+                std_df = pd.DataFrame(index=participants_idx)
+                arch_keys = sorted({r['arch'] for r in agg_rows})
+                for arch in arch_keys:
+                    vals_map = {int(r['participants']): float(r['mean_encode'] + r['mean_decode'] + r['mean_network']) for r in agg_rows if r['arch'] == arch and r.get('mean_encode') is not None and r.get('mean_decode') is not None and r.get('mean_network') is not None}
+                    means = []
+                    stds = []
+                    for n in participants_idx:
+                        v = vals_map.get(n)
+                        if v is None:
+                            means.append(np.nan)
+                            stds.append(np.nan)
+                        else:
+                            means.append(v)
+                            stds.append(0.0)
+                    mean_df[arch] = means
+                    std_df[arch] = stds
+
+                # Plot with shading for std (mirrors plot_psnr style)
+                fig, ax = plt.subplots(figsize=(8,4))
+                markers = ['o', 's', '^', 'D', 'v', 'P', 'X', '*']
+                cmap = get_color_map(mean_df.columns)
+                for i, col in enumerate(mean_df.columns):
+                    y = mean_df[col]
+                    ax.plot(mean_df.index, y, marker=markers[i % len(markers)], label=col, color=cmap.get(col))
+                    if col in std_df.columns:
+                        std = std_df[col].fillna(0)
+                        try:
+                            ax.fill_between(mean_df.index, (y - std), (y + std), alpha=0.15, color=cmap.get(col))
+                        except Exception:
+                            pass
+                ax.set_xlabel(GRAPH_NUM_CLIENT_LABEL)
+                ax.set_ylabel('Mean Total Latency (ms)')
+                #ax.set_title('Mean Total Latency - aggregated runs')
+                ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
+                try:
+                    xt = [int(x) for x in mean_df.index]
+                    ax.set_xticks(xt)
+                except Exception:
+                    pass
+                # enforce y-axis starting at zero; compute automatic upper bound from mean+std
+                try:
+                    combined = (mean_df.fillna(0) + std_df.fillna(0)).values
+                    max_val = float(np.nanmax(combined)) if combined.size else None
+                except Exception:
+                    max_val = None
+                if max_val is not None and max_val > 0:
+                    ax.set_ylim(0, max(max_val * 1.05, 1.0))
+                else:
+                    ax.set_ylim(0, 1)
+                ncol = len(mean_df.columns) if len(mean_df.columns) <= 3 else math.ceil(len(mean_df.columns) / 2)
+                ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.4),  ncol=ncol, prop={'size': 10})
+                plt.tight_layout()
+                line_out = os.path.join(ANALYSIS_FOLDER, 'latency_encode_decode_network_linechart.svg')
+                fig.savefig(line_out)
+                plt.close(fig)
+                print('Wrote latency encode+decode+network linechart to', line_out)
+        except Exception as e:
+            print('Failed to create latency encode+decode+network line plot:', e)
     except Exception as e:
         print('Failed to create latency breakdown plot:', e)
 
@@ -2067,7 +2158,7 @@ def process_group(participants, entries):
     # keys to keep from analyze_run's metrics (avoid DataFrames)
     keep_keys = ['metadata', 'cpu_avg', 'avg_psnr', 'psnr_count', 'avg_frame_size',
                  'avg_width', 'avg_height', 'avg_encode_ms', 'outgoing_bps', 'incoming_bps',
-                 'avg_latency_ms', 'avg_decode_ms', 'avg_part_frame_size', 'missing_summary',
+                 'avg_latency_ms', 'avg_network_latency_ms', 'avg_decode_ms', 'avg_part_frame_size', 'missing_summary',
                  'measured_outgoing_bps_per_client', 'measured_incoming_bps_per_client',
                  'measured_outgoing_bps_per_client_list', 'psnr_per_client',
                  'measured_host_outgoing_bps', 'measured_host_incoming_bps',

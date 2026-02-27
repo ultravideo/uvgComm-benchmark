@@ -893,9 +893,10 @@ def parse_measured_bandwidth(client_folders, start_ts=None, end_ts=None):
 
 def plot_psnr(mean_df, std_df, analysis_folder, scenario):
     plt.figure(figsize=(6,4))
-    markers = ['o', 's', '^', 'D', 'v', 'P', 'X']
+    cmap = get_color_map(mean_df.columns.unique())
+    markers = ['o', 's', '^', 'D', 'v', 'P', 'X', '*']
     for i, col in enumerate(mean_df.columns):
-        plt.plot(mean_df.index, mean_df[col], marker=markers[i % len(markers)], label=col)
+        plt.plot(mean_df.index, mean_df[col], marker=markers[i % len(markers)], label=col, color=cmap.get(col))
         if col in std_df.columns:
             std = std_df[col].fillna(0)
             plt.fill_between(mean_df.index, mean_df[col] - std, mean_df[col] + std, alpha=0.15)
@@ -912,8 +913,8 @@ def plot_psnr(mean_df, std_df, analysis_folder, scenario):
     # Force y-limits to 0..50 and add horizontal 8-bit max line before legend so it's shown
     plt.ylim(0, 50)
     plt.axhline(48.131, color='gray', linestyle=':', linewidth=2.0, label='Max PSNR (8-bit)', zorder=5)
-    ncol = len(mean_df.columns) if len(mean_df.columns) <= 3 else math.ceil(len(mean_df.columns) / 2)
-    plt.legend(loc="lower center", bbox_to_anchor=(0.5, -0.3),  ncol=ncol, prop={'size': 10})
+    ncol = len(mean_df.columns)+1
+    plt.legend(loc="lower center", bbox_to_anchor=(0.5, -0.4),  ncol=ncol, prop={'size': 10})
     plt.tight_layout()
     out = os.path.join(analysis_folder, 'psnr.svg')
     plt.savefig(out)

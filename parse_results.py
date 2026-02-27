@@ -544,6 +544,10 @@ def analyze_run(run_path):
     metrics['psnr_per_client'] = psnr_per_client
 
     # Frame sizes and resolution stats from local frames
+    # Define column candidates for metrics extraction (controlled by extract_bandwidth flag)
+    use_new_size = True
+    size_col_candidates = ['BandwidthCost(Bytes)', 'BandwidthCost'] if use_new_size else ['Size(Bytes)', 'Size']
+    
     sizes = []
     widths = []
     heights = []
@@ -561,11 +565,11 @@ def analyze_run(run_path):
         df = info['df']
         if df is None:
             continue
-        vals, sc = extract_numeric_list(df, ['Size(Bytes)', 'Size'], dtype=int)
+        # Extract sizes (required)
+        vals, sc = extract_numeric_list(df, size_col_candidates, dtype=int)
         if vals:
             sizes.extend(vals)
             out_total_bytes += sum(vals)
-
         mn_ts, mx_ts = get_min_max_ts(df)
         if mn_ts is not None:
             out_min_ts = mn_ts if out_min_ts is None else min(out_min_ts, mn_ts)
@@ -653,7 +657,7 @@ def analyze_run(run_path):
                 except Exception as e:
                     print(f'WARNING: Failed to record per-client max decode time: {e}')
 
-            pvals, _ = extract_numeric_list(df, ['Size(Bytes)', 'Size'], dtype=int)
+            pvals, _ = extract_numeric_list(df, size_col_candidates, dtype=int)
             if pvals:
                 participant_sizes.extend(pvals)
                 in_total_bytes += sum(pvals)
@@ -712,6 +716,7 @@ def analyze_run(run_path):
     metrics['avg_latency_ms'] = float(np.mean(latencies)) if latencies else None
     metrics['avg_decode_ms'] = float(np.mean(decode_times)) if decode_times else None
     metrics['avg_part_frame_size'] = float(np.mean(participant_sizes)) if participant_sizes else None
+
     # attach per-client maxima for encode/decode (keys may be None if folder name lacks digits)
     metrics['max_encode_by_client'] = max_encode_by_client
     metrics['max_decode_by_client'] = max_decode_by_client

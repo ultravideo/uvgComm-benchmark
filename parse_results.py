@@ -1887,6 +1887,16 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                 except Exception as e:
                     print(f'WARNING: Failed to build expected_runs entry for arch={arch} n={n}: {e}')
 
+        def _mean_from_group(g, col):
+            """Return mean of numeric column `col` in group `g`, or None if empty/unavailable."""
+            try:
+                if col not in g:
+                    return None
+                vals = pd.to_numeric(g[col], errors='coerce').dropna().astype(float).tolist()
+                return float(np.mean(vals)) if vals else None
+            except Exception:
+                return None
+
         agg_rows = []
         grouped = lat_df.groupby(['arch', 'participants'])
         for (arch, parts), g in grouped:
@@ -1897,35 +1907,29 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                 parts_i = parts
             key = (arch, parts_i)
             exp = expected_runs.get(key, 1)
-            if 'avg_latency_ms' in g:
-                tvals = pd.to_numeric(g['avg_latency_ms'], errors='coerce').dropna().astype(float).tolist()
-            else:
+            # Compute means from whatever samples are available.
+            # A single broken/discarded repeat should not wipe out the whole participant count.
+            try:
+                tvals = pd.to_numeric(g['avg_latency_ms'], errors='coerce').dropna().astype(float).tolist() if 'avg_latency_ms' in g else []
+            except Exception:
                 tvals = []
-            # If there are fewer samples than expected, omit this (log reason).
-            if len(tvals) < exp:
+            if exp and len(tvals) < exp:
                 try:
-                    print(f"Insufficient latency samples for arch={arch} participants={parts_i}: expected {exp}, got {len(tvals)}; omitting from aggregates")
-                except Exception as e:
-                    print(f"Insufficient latency samples; omitting from aggregates: {e}")
+                    print(f"Latency samples fewer than expected for arch={arch} participants={parts_i}: expected {exp}, got {len(tvals)}; using available samples")
+                except Exception:
+                    pass
+            mean_t = float(np.mean(tvals)) if tvals else None
+            # treat unreasonably large means as missing and log
+            if mean_t is not None and mean_t >= 900.0:
+                try:
+                    print(f"Unreasonable mean latency for arch={arch} participants={parts_i}: {mean_t}; omitting from aggregates")
+                except Exception:
+                    print("Unreasonable mean latency encountered; omitting from aggregates")
                 mean_t = None
-            else:
-                mean_t = float(np.mean(tvals)) if tvals else None
-                # treat unreasonably large means as missing and log
-                if mean_t is not None and mean_t >= 900.0:
-                    try:
-                        print(f"Unreasonable mean latency for arch={arch} participants={parts_i}: {mean_t}; omitting from aggregates")
-                    except Exception:
-                        print("Unreasonable mean latency encountered; omitting from aggregates")
-                    mean_t = None
 
-            mean_e = None
-            mean_d = None
-            mean_n = None
-            if len(g) == exp and 'avg_encode_ms' in g and 'avg_decode_ms' in g and 'avg_network_latency_ms' in g:
-                if not g['avg_encode_ms'].isnull().any() and not g['avg_decode_ms'].isnull().any() and not g['avg_network_latency_ms'].isnull().any():
-                    mean_e = float(np.mean(g['avg_encode_ms']))
-                    mean_d = float(np.mean(g['avg_decode_ms']))
-                    mean_n = float(np.mean(g['avg_network_latency_ms']))
+            mean_e = _mean_from_group(g, 'avg_encode_ms')
+            mean_d = _mean_from_group(g, 'avg_decode_ms')
+            mean_n = _mean_from_group(g, 'avg_network_latency_ms')
 
             agg_rows.append({'arch': arch, 'participants': parts_i, 'mean_encode': mean_e,
                              'mean_decode': mean_d, 'mean_network': mean_n, 'mean_total': mean_t})

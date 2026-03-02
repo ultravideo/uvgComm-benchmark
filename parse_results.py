@@ -1510,9 +1510,27 @@ def accumulate_run_results(metrics, arch, participants, run_path,
         missing_rows.append(row)
 
     # resolution/frame size + bitrates
+    # For the synthetic bandwidth diagnostic plot, we need to normalize by the
+    # number of visible participants (senders) when a visible limit is used.
+    # Do NOT change the x-axis participant count used elsewhere; only attach
+    # this as an extra field for `process_resolution_rows`.
+    visible_parts = None
+    try:
+        vp = metrics.get('visible_participants')
+        if vp is None:
+            md = metrics.get('metadata') or {}
+            for vk in ('Visible_Participants', 'VisibleParticipants', 'Visible', 'VisibleCount'):
+                if vk in md and md.get(vk) not in (None, ''):
+                    vp = md.get(vk)
+                    break
+        if vp is not None:
+            visible_parts = int(vp)
+    except Exception:
+        visible_parts = None
     row_rs = {'arch': arch, 'participants': parts_eff, 'avg_width': metrics.get('avg_width'),
               'avg_height': metrics.get('avg_height'), 'avg_frame_size': metrics.get('avg_frame_size'),
-              'outgoing_bps': metrics.get('outgoing_bps'), 'incoming_bps': metrics.get('incoming_bps')}
+              'outgoing_bps': metrics.get('outgoing_bps'), 'incoming_bps': metrics.get('incoming_bps'),
+              'visible_participants': visible_parts}
     resolution_rows.append(row_rs)
 
     # Measured bandwidth collected from per-container monitoring (clients vs host)
@@ -1651,8 +1669,27 @@ def process_resolution_rows(resolution_rows, ANALYSIS_FOLDER):
     out_rows = []
     for _, r in res_df.iterrows():
         parts = int(r.get('participants')) if pd.notna(r.get('participants')) else None
-        out_mbps = _bps_to_mbps_per_client(r.get('outgoing_bps'), parts)
-        in_mbps = _bps_to_mbps_per_client(r.get('incoming_bps'), parts)
+        # IMPORTANT: only fix the y-values for the diagnostic synthetic-bandwidth plot.
+        # If the run was executed with a visible participant limit, outgoing/incoming
+        # bps are based on that visible subset, so normalize per-client using the
+        # visible participant count (senders) instead of total participants.
+        div_parts = parts
+        try:
+            vp = r.get('visible_participants')
+            if pd.notna(vp):
+                vp_i = int(vp)
+                if vp_i > 0:
+                    # Use visible participant limit only when it is smaller than
+                    # the total participants. This keeps 1..9 correct even if
+                    # metadata always records Visible_Participants: 9.
+                    if parts is None or parts == 0:
+                        div_parts = vp_i
+                    else:
+                        div_parts = min(int(parts), vp_i)
+        except Exception:
+            div_parts = parts
+        out_mbps = _bps_to_mbps_per_client(r.get('outgoing_bps'), div_parts)
+        in_mbps = _bps_to_mbps_per_client(r.get('incoming_bps'), div_parts)
         out_rows.append({
             'Architecture': r.get('arch'),
             'Participants': parts,

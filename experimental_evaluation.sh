@@ -102,8 +102,8 @@ Options:
     -w VIEW        View mode to use (gallery|speaker) or comma-separated list. Defaults to ${VIEW_MODE}
     -v VISIBLE     Number of visible participants in gallery view (default: ${VISIBLE_PARTICIPANTS}).
     -e SECONDS     Evaluation period in seconds (default: ${EXPERIMENT_TIME}).
-    -l             Enable simulated per-client latency (uses built-in defaults).
-    -b MODE        Send bandwidth mode (all1000|all1|inc1|inc5|inc10) or comma-separated list. Defaults to ${SEND_BW_MODE}
+    -l MODES       Simulated latency mode(s): none|local|global (comma-separated list). Defaults to ${LATENCY_MODES}
+    -b MODE        Send bandwidth mode (all1000|all10|all1|inc1|inc5|inc10) or comma-separated list. Defaults to ${SEND_BW_MODE}
     -h             Show this help
 EOF
 }

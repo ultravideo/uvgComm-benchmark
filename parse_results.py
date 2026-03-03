@@ -605,7 +605,17 @@ def analyze_run(run_path):
                 print(f'WARNING: Failed to record per-client max encode time: {e}')
         nlvals, _ = extract_numeric_list(df, ['NetworkLatency(ms)', 'NetworkLatency', 'NetworkLatencyMs'], dtype=float)
         if nlvals:
-            network_latencies.extend(nlvals)
+            # Network latency uses -1 as a sentinel for "no measurement"; exclude negatives.
+            try:
+                for v in nlvals:
+                    try:
+                        fv = float(v)
+                    except Exception:
+                        continue
+                    if fv >= 0:
+                        network_latencies.append(fv)
+            except Exception as e:
+                print(f'WARNING: Failed to collect network latency values: {e}')
     metrics['avg_frame_size'] = float(np.mean(sizes)) if sizes else None
     metrics['avg_width'] = float(np.mean(widths)) if widths else None
     metrics['avg_height'] = float(np.mean(heights)) if heights else None
@@ -631,11 +641,18 @@ def analyze_run(run_path):
                 continue
             lvals, _ = extract_numeric_list(df, ['Latency(ms)', 'Latency', 'latency'], dtype=float)
             if lvals:
-                latencies.extend(lvals)
+                # Latency may use negative sentinel values (e.g., -1) for "unknown".
                 try:
-                    sender_lvals.extend([float(x) for x in lvals])
+                    for v in lvals:
+                        try:
+                            fv = float(v)
+                        except Exception:
+                            continue
+                        if fv >= 0:
+                            latencies.append(fv)
+                            sender_lvals.append(fv)
                 except Exception as e:
-                    print(f'WARNING: Failed to extend sender latency values: {e}')
+                    print(f'WARNING: Failed to collect participant latency values: {e}')
 
             dvals, _ = extract_numeric_list(df, ['DecodeTime(ms)', 'DecodeTime', 'DecodeTimeMs'], dtype=float)
             if dvals:

@@ -998,22 +998,35 @@ generate_latencies() {
     # Write SFU/host latency as first line
     echo "${sfu_lat}" > "$out"
 
-    # Generate deterministic, evenly spaced client latencies across range
-    if [ "$num_clients" -le 1 ] 2>/dev/null; then
-        # single client -> midpoint
-        val=$(( (client_min + client_max) / 2 ))
+    # Generate deterministic, per-client latencies independent of num_clients.
+    #
+    # We map each client index i to a value in [client_min, client_max] using a
+    # low-discrepancy (quasi-uniform) sequence based on the golden-ratio
+    # conjugate. This keeps client i's latency identical across runs even when
+    # the total number of clients changes.
+    #
+    # Formula (paper-friendly):
+    #   u_i = frac(i * phi), where phi = (sqrt(5)-1)/2 ≈ 0.6180339887
+    #   L_i = client_min + floor(u_i * (span + 1)), span = client_max - client_min
+    local span=$(( client_max - client_min ))
+    local phi_frac="0.618033988749895"  # (sqrt(5)-1)/2
+
+    for ii in $(seq 1 "$num_clients"); do
+        # awk does the floating-point fractional part and final integer mapping.
+        local val
+        val=$(awk -v i="$ii" -v min="$client_min" -v max="$client_max" -v phi="$phi_frac" '
+            BEGIN {
+                span = max - min;
+                x = i * phi;
+                u = x - int(x);
+                v = min + int(u * (span + 1));
+                if (v < min) v = min;
+                if (v > max) v = max;
+                printf "%d", v;
+            }
+        ')
         echo "$val" >> "$out"
-    else
-        local span=$(( client_max - client_min ))
-        for ii in $(seq 1 "$num_clients"); do
-            # integer arithmetic: value = min + round((ii-1)*(span)/(num_clients-1))
-            local step_num=$(( (ii-1) * span ))
-            local step_den=$(( num_clients - 1 ))
-            local add=$(( step_num / step_den ))
-            local val=$(( client_min + add ))
-            echo "$val" >> "$out"
-        done
-    fi
+    done
 
     echo "Generated latency file: $out (scenario=${kind}, clients=${num_clients}, sfu=${sfu_lat}ms)" >&2
     echo "$out"

@@ -45,7 +45,7 @@ _UNMATCHED_PRINT_LIMIT = int(os.environ.get('UVGCOMM_UNMATCHED_PRINT_LIMIT', '5'
 _unmatched_print_count = 0
 
 GRAPH_NUM_CLIENT_LABEL = 'Number of Clients'
-
+FIGSIZE = (6,4)
 
 def read_csv_guess(path, na_values=["", "NA", "null"], dtype=None):
     """Try to read CSV using common separators. Returns DataFrame or None on failure."""
@@ -761,9 +761,10 @@ def analyze_run(run_path):
 
 def plot_cpu(results_by_arch, analysis_folder, scenario):
     # results_by_arch: dict[arch] -> list of (n_clients, cpu_avg)
-    plt.figure(figsize=(6,4))
+    plt.figure(figsize=FIGSIZE)
+    cmap = get_color_map(results_by_arch.keys())
     markers = ['o', 's', '^', 'D', 'v', 'P', 'X']
-    for i, (arch, rows) in enumerate(results_by_arch.items()):
+    for i, (arch, rows) in enumerate(sorted(results_by_arch.items())):
         rows_sorted = sorted(rows, key=lambda x: x[0])
         xs = [r[0] for r in rows_sorted]
         ys = [r[1] for r in rows_sorted]
@@ -776,7 +777,7 @@ def plot_cpu(results_by_arch, analysis_folder, scenario):
             m = markers[i % len(markers)]
             ls = '-' if i % 2 == 0 else '--'
             # use default color cycle (will be set externally if desired)
-            plt.plot(xs_arr[mask], ys_arr[mask], marker=m, linestyle=ls, label=arch)
+            plt.plot(xs_arr[mask], ys_arr[mask], marker=m, linestyle=ls, label=arch, color=cmap[arch])
     plt.xlabel(GRAPH_NUM_CLIENT_LABEL)
     plt.ylabel('Average Total CPU %')
     #plt.title(f'CPU usage - {scenario}')
@@ -909,10 +910,10 @@ def parse_measured_bandwidth(client_folders, start_ts=None, end_ts=None):
 
 
 def plot_psnr(mean_df, std_df, analysis_folder, scenario):
-    plt.figure(figsize=(6,4))
+    plt.figure(figsize=FIGSIZE)
     cmap = get_color_map(mean_df.columns.unique())
     markers = ['o', 's', '^', 'D', 'v', 'P', 'X', '*']
-    for i, col in enumerate(mean_df.columns):
+    for i, col in enumerate(sorted(mean_df.columns)):
         plt.plot(mean_df.index, mean_df[col], marker=markers[i % len(markers)], label=col, color=cmap.get(col))
         if col in std_df.columns:
             std = std_df[col].fillna(0)
@@ -944,7 +945,7 @@ def plot_psnr_speaker_vs_listeners(psnr_speaker_stats, psnr_listeners_stats, ana
     try:
         mean_speaker, std_speaker = build_psnr_dfs(psnr_speaker_stats)
         mean_listeners, std_listeners = build_psnr_dfs(psnr_listeners_stats)
-        plt.figure(figsize=(6,4))
+        plt.figure(figsize=FIGSIZE)
         markers = ['o', 's', '^', 'D', 'v', 'P', 'X']
         all_archs = sorted(set(list(mean_speaker.columns) + list(mean_listeners.columns)))
         cmap = get_color_map(all_archs)
@@ -991,7 +992,7 @@ def plot_measured_bandwidth_speaker_vs_listeners(measured_speaker_stats, measure
         idx = sorted({n for arch in measured_speaker_stats for n in measured_speaker_stats[arch]} | {n for arch in measured_listeners_stats for n in measured_listeners_stats[arch]})
         if not idx:
             return
-        fig, ax = plt.subplots(figsize=(8,4))
+        fig, ax = plt.subplots(figsize=FIGSIZE)
         markers = ['o', 's', '^', 'D', 'v', 'P', 'X']
         cmap = get_color_map(sorted(set(list(measured_speaker_stats.keys()) + list(measured_listeners_stats.keys()))))
         for i, arch in enumerate(sorted(set(list(measured_speaker_stats.keys()) + list(measured_listeners_stats.keys())))):
@@ -1034,7 +1035,7 @@ def plot_latency_speaker_vs_listeners(latency_speaker_stats, latency_listeners_s
         # reuse the build_psnr_dfs helper to construct mean/std DataFrames
         mean_speaker, std_speaker = build_psnr_dfs(latency_speaker_stats)
         mean_listeners, std_listeners = build_psnr_dfs(latency_listeners_stats)
-        plt.figure(figsize=(6,4))
+        plt.figure(figsize=FIGSIZE)
         markers = ['o', 's', '^', 'D', 'v', 'P', 'X']
         all_archs = sorted(set(list(mean_speaker.columns) + list(mean_listeners.columns)))
         cmap = get_color_map(all_archs)
@@ -1747,7 +1748,7 @@ def _plot_measured_bandwidth_generic(df, participants_col, arch_col, ycols, labe
     ycols: list of column names to plot (one or more), labels: list of labels for legend suffix.
     out_filename: relative filename to write under ANALYSIS_FOLDER.
     """
-    fig, ax = plt.subplots(figsize=(8,4))
+    fig, ax = plt.subplots(figsize=FIGSIZE)
     cmap = get_color_map(df[arch_col].unique())
     markers = ['o', 's', '^', 'D', 'v', 'P', 'X', '*']
     groups = df.groupby(arch_col)
@@ -1977,7 +1978,7 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                 oth_val = max(0.0, float(t) - enc_val - dec_val - net_val)
                 data_map[p][a] = {'enc': enc_val, 'dec': min(dec_val, 999.0), 'net': net_val, 'oth': oth_val}
 
-            fig, ax = plt.subplots(figsize=(10,5))
+            fig, ax = plt.subplots(figsize=FIGSIZE)
             x = np.arange(len(parts))
             total_width = 0.8
             n_arch = max(1, len(archs))
@@ -2020,7 +2021,7 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
             plt.close(fig)
             print('Wrote latency barchart to', bar_out)
         else:
-            fig, ax = plt.subplots(figsize=(6,3))
+            fig, ax = plt.subplots(figsize=FIGSIZE)
             ax.text(0.5, 0.5, 'No complete aggregated latency data available to plot', ha='center', va='center')
             ax.axis('off')
             bar_out = os.path.join(ANALYSIS_FOLDER, 'latency_barchart.svg')
@@ -2033,7 +2034,7 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
             # Use only aggregated rows with a valid mean_total
             valid_parts = sorted({int(r['participants']) for r in agg_rows if r.get('mean_total') is not None})
             if not valid_parts:
-                fig, ax = plt.subplots(figsize=(6,3))
+                fig, ax = plt.subplots(figsize=FIGSIZE)
                 ax.text(0.5, 0.5, 'No latency totals available to plot', ha='center', va='center')
                 ax.axis('off')
                 line_out = os.path.join(ANALYSIS_FOLDER, 'latency_linechart.svg')
@@ -2062,7 +2063,7 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                     std_df[arch] = stds
 
                 # Plot with shading for std (mirrors plot_psnr style)
-                fig, ax = plt.subplots(figsize=(8,4))
+                fig, ax = plt.subplots(figsize=FIGSIZE)
                 markers = ['o', 's', '^', 'D', 'v', 'P', 'X', '*']
                 cmap = get_color_map(mean_df.columns)
                 for i, col in enumerate(mean_df.columns):
@@ -2107,7 +2108,7 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
             # Use only aggregated rows with a valid mean_encode + mean_decode + mean_network
             valid_parts = sorted({int(r['participants']) for r in agg_rows if r.get('mean_encode') is not None and r.get('mean_decode') is not None and r.get('mean_network') is not None})
             if not valid_parts:
-                fig, ax = plt.subplots(figsize=(6,3))
+                fig, ax = plt.subplots(figsize=FIGSIZE)
                 ax.text(0.5, 0.5, 'No latency available to plot', ha='center', va='center')
                 ax.axis('off')
                 line_out = os.path.join(ANALYSIS_FOLDER, 'latency_encode_decode_network_linechart.svg')
@@ -2137,7 +2138,7 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                     std_df[arch] = stds
 
                 # Plot with shading for std (mirrors plot_psnr style)
-                fig, ax = plt.subplots(figsize=(8,4))
+                fig, ax = plt.subplots(figsize=FIGSIZE)
                 markers = ['o', 's', '^', 'D', 'v', 'P', 'X', '*']
                 cmap = get_color_map(mean_df.columns)
                 for i, col in enumerate(mean_df.columns):
@@ -2311,7 +2312,7 @@ def write_root_cpu_summary(results_by_arch, ROOT_FOLDER):
 
     # Plot 2: per-participant mean with errorbars (std) per architecture
     try:
-        fig, ax = plt.subplots(figsize=(8,4))
+        fig, ax = plt.subplots(figsize=FIGSIZE)
         cmap = get_color_map(sorted(mean_map.keys()))
         markers = ['o', 's', '^', 'D', 'v', 'P', 'X']
         for i, (arch, pts) in enumerate(sorted(mean_map.items())):

@@ -788,7 +788,7 @@ def plot_cpu(results_by_arch, analysis_folder, scenario):
             # use default color cycle (will be set externally if desired)
             plt.plot(xs_arr[mask], ys_arr[mask], marker=m, linestyle=ls, label=arch, color=cmap[arch])
     plt.xlabel(GRAPH_NUM_CLIENT_LABEL)
-    plt.ylabel('Average Total CPU %')
+    plt.ylabel('Total CPU usage %')
     #plt.title(f'CPU usage - {scenario}')
     # nicer grid: horizontal lines only
     plt.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
@@ -928,7 +928,7 @@ def plot_psnr(mean_df, std_df, analysis_folder, scenario):
             std = std_df[col].fillna(0)
             plt.fill_between(mean_df.index, mean_df[col] - std, mean_df[col] + std, alpha=0.15)
     plt.xlabel(GRAPH_NUM_CLIENT_LABEL)
-    plt.ylabel('Average PSNR (Y)')
+    plt.ylabel('PSNR (dB)')
     #plt.title(f'Average PSNR - {scenario}')
     plt.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
     # set x-axis to whole numbers
@@ -939,8 +939,8 @@ def plot_psnr(mean_df, std_df, analysis_folder, scenario):
         print(f'WARNING: Failed to set x-axis ticks for PSNR plot: {e}')
     # Force y-limits to 0..50 and add horizontal 8-bit max line before legend so it's shown
     plt.ylim(30, 50)
-    plt.axhline(48.131, color='gray', linestyle=':', linewidth=2.0, label='Max PSNR (8-bit)', zorder=5)
-    ncol = len(mean_df.columns)+1
+    #plt.axhline(48.131, color='gray', linestyle=':', linewidth=2.0, label='Max PSNR (8-bit)', zorder=5)
+    ncol = len(mean_df.columns)#+1
     plt.legend(loc="lower center", bbox_to_anchor=(0.5, -0.4),  ncol=ncol, prop={'size': 10})
     plt.tight_layout()
     out = os.path.join(analysis_folder, 'psnr.svg')
@@ -1020,7 +1020,7 @@ def plot_measured_bandwidth_speaker_vs_listeners(measured_speaker_stats, measure
             # listeners: dashed, open marker
             ax.plot(x, listeners_means, marker=mk, markersize=7, linewidth=2.0, markeredgewidth=1.2, markerfacecolor='none', linestyle='--', label=f'{arch} (listeners)', color=color)
         ax.set_xlabel(GRAPH_NUM_CLIENT_LABEL)
-        ax.set_ylabel('Measured Outgoing Bandwidth (Mbps)')
+        ax.set_ylabel('Bandwidth (Mbps)')
         #ax.set_title(f'Measured Bandwidth: Speaker vs Listeners - {scenario}')
         ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
         try:
@@ -1062,7 +1062,7 @@ def plot_latency_speaker_vs_listeners(latency_speaker_stats, latency_listeners_s
                 if arch in std_listeners.columns:
                     plt.fill_between(mean_listeners.index, mean_listeners[arch] - std_listeners[arch], mean_listeners[arch] + std_listeners[arch], alpha=0.10, color=color)
         plt.xlabel(GRAPH_NUM_CLIENT_LABEL)
-        plt.ylabel('Mean Total Latency (ms)')
+        plt.ylabel('Latency (ms)')
         #plt.title(f'Latency: Speaker vs Listeners - {scenario}')
         plt.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
         # compute automatic upper bound from mean+std and force y-axis to start at 0
@@ -2085,7 +2085,7 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                         except Exception:
                             pass
                 ax.set_xlabel(GRAPH_NUM_CLIENT_LABEL)
-                ax.set_ylabel('Mean Total Latency (ms)')
+                ax.set_ylabel('Latency (ms)')
                 #ax.set_title('Mean Total Latency - aggregated runs')
                 ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
                 try:
@@ -2160,7 +2160,7 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                         except Exception:
                             pass
                 ax.set_xlabel(GRAPH_NUM_CLIENT_LABEL)
-                ax.set_ylabel('Mean Total Latency (ms)')
+                ax.set_ylabel('Latency (ms)')
                 #ax.set_title('Mean Total Latency - aggregated runs')
                 ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
                 try:
@@ -2338,7 +2338,7 @@ def write_root_cpu_summary(results_by_arch, ROOT_FOLDER):
             mk = markers[i % len(markers)]
             ax.errorbar(xs, ys, yerr=stds, marker=mk, linestyle='-', label=arch, color=color, capsize=3)
         ax.set_xlabel(GRAPH_NUM_CLIENT_LABEL)
-        ax.set_ylabel('Average Total CPU %')
+        ax.set_ylabel('CPU usage (%)')
         #ax.set_title('CPU by Participants (root summary)')
         ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
         # Force y-axis 0..100 and ticks every 10% for consistent CPU % visualization
@@ -2509,7 +2509,7 @@ def write_root_latency_summary(scenarios, ROOT_FOLDER):
                     max_val = max(max_val, max(ys))
 
             ax.set_xlabel(GRAPH_NUM_CLIENT_LABEL)
-            ax.set_ylabel('Mean Total Latency (ms)')
+            ax.set_ylabel('Latency (ms)')
             ax.set_title(f'Root Latency Summary - upload={up} res={res}')
             ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
             if max_val <= 0:
@@ -2696,7 +2696,7 @@ def write_root_measured_bandwidth_summary(scenarios, ROOT_FOLDER):
                         pass
 
             ax.set_xlabel(GRAPH_NUM_CLIENT_LABEL)
-            ax.set_ylabel('Measured Per-Client Bandwidth (Mbps)')
+            ax.set_ylabel('Bandwidth (Mbps)')
             #ax.set_title(f'Measured Bandwidth (per-client) - {res} view={view}')
             ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
             try:

@@ -1030,7 +1030,7 @@ def plot_measured_bandwidth_speaker_vs_listeners(measured_speaker_stats, measure
             # listeners: dashed, open marker
             ax.plot(x, listeners_means, marker=mk, markersize=7, linewidth=2.0, markeredgewidth=1.2, markerfacecolor='none', linestyle='--', label=f"{arch.replace('_', ' ')} (listeners)", color=color)
         ax.set_xlabel(GRAPH_NUM_CLIENT_LABEL)
-        ax.set_ylabel('Bandwidth (Mbps)')
+        ax.set_ylabel('Bandwidth (Mb/s)')
         #ax.set_title(f'Measured Bandwidth: Speaker vs Listeners - {scenario}')
         ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
         try:
@@ -1755,7 +1755,7 @@ def process_resolution_rows(resolution_rows, ANALYSIS_FOLDER):
                                          ANALYSIS_FOLDER,
                                          'diagnostic_bandwidth_mbps_per_client.svg',
                                          'Outgoing and Incoming Bandwidth (per-client) (diagnostic)',
-                                         'Bandwidth (Mbps)')
+                                         'Bandwidth (Mb/s)')
     except Exception as e:
         print('Failed to create diagnostic bandwidth plot:', e)
 
@@ -1881,7 +1881,7 @@ def process_measured_bandwidth_rows(measured_rows, ANALYSIS_FOLDER):
                                          ANALYSIS_FOLDER,
                                          'measured_bandwidth_clients_mbps_per_client.svg',
                                          'Measured Outgoing and Incoming Bandwidth (clients only)',
-                                         'Bandwidth (Mbps)')
+                                         'Bandwidth (Mb/s)')
     except Exception as e:
         print('Failed to create measured client bandwidth plot:', e)
 
@@ -1894,7 +1894,7 @@ def process_measured_bandwidth_rows(measured_rows, ANALYSIS_FOLDER):
                                          ANALYSIS_FOLDER,
                                          'measured_bandwidth_host_mbps.svg',
                                          'Measured Host Outgoing and Incoming Bandwidth',
-                                         'Bandwidth (Mbps)')
+                                         'Bandwidth (Mb/s)')
     except Exception as e:
         print('Failed to create measured host bandwidth plot:', e)
 
@@ -2716,7 +2716,7 @@ def write_root_measured_bandwidth_summary(scenarios, ROOT_FOLDER):
                         pass
 
             ax.set_xlabel(GRAPH_NUM_CLIENT_LABEL)
-            ax.set_ylabel('Bandwidth (Mbps)')
+            ax.set_ylabel('Bandwidth (Mb/s)')
             #ax.set_title(f'Measured Bandwidth (per-client) - {res} view={view}')
             ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
             try:

@@ -784,11 +784,11 @@ def plot_cpu(results_by_arch, analysis_folder, scenario):
         mask = ~np.isnan(ys_arr)
         if np.any(mask):
             m = markers[i % len(markers)]
-            ls = '-' if i % 2 == 0 else '--'
+            ls = '-' #if i % 2 == 0 else '--'
             # use default color cycle (will be set externally if desired)
-            plt.plot(xs_arr[mask], ys_arr[mask], marker=m, linestyle=ls, label=arch, color=cmap[arch])
+            plt.plot(xs_arr[mask], ys_arr[mask], marker=m, linestyle=ls, label=arch.replace('_', ' '), color=cmap[arch])
     plt.xlabel(GRAPH_NUM_CLIENT_LABEL)
-    plt.ylabel('Total CPU usage %')
+    plt.ylabel('CPU usage %')
     #plt.title(f'CPU usage - {scenario}')
     # nicer grid: horizontal lines only
     plt.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
@@ -923,7 +923,7 @@ def plot_psnr(mean_df, std_df, analysis_folder, scenario):
     cmap = get_color_map(mean_df.columns.unique())
     markers=MARKERS
     for i, col in enumerate(sorted(mean_df.columns)):
-        plt.plot(mean_df.index, mean_df[col], marker=markers[i % len(markers)], label=col, color=cmap.get(col))
+        plt.plot(mean_df.index, mean_df[col], marker=markers[i % len(markers)], label=col.replace('_', ' '), color=cmap.get(col))
         if col in std_df.columns:
             std = std_df[col].fillna(0)
             plt.fill_between(mean_df.index, mean_df[col] - std, mean_df[col] + std, alpha=0.15)
@@ -938,13 +938,23 @@ def plot_psnr(mean_df, std_df, analysis_folder, scenario):
     except Exception as e:
         print(f'WARNING: Failed to set x-axis ticks for PSNR plot: {e}')
     # Force y-limits to 0..50 and add horizontal 8-bit max line before legend so it's shown
-    plt.ylim(30, 50)
+    plt.ylim(20, 50)
     #plt.axhline(48.131, color='gray', linestyle=':', linewidth=2.0, label='Max PSNR (8-bit)', zorder=5)
     ncol = len(mean_df.columns)#+1
-    plt.legend(loc="lower center", bbox_to_anchor=(0.5, -0.4),  ncol=ncol, prop={'size': 10})
+    plt.legend(loc="lower center", bbox_to_anchor=(0.5, -0.35),  ncol=ncol, prop={'size': 10})
     plt.tight_layout()
     out = os.path.join(analysis_folder, 'psnr.svg')
     plt.savefig(out)
+    # Write plotted data to CSV
+    try:
+        out_csv = os.path.join(analysis_folder, 'psnr_data.csv')
+        # Create a dataframe with Participants (index) and PSNR means for each architecture
+        csv_df = mean_df.copy()
+        csv_df.index.name = 'Participants'
+        csv_df.to_csv(out_csv, sep=';')
+        print('Saved PSNR data to:', out_csv)
+    except Exception as e:
+        print(f'WARNING: Failed to write PSNR data CSV: {e}')
     plt.close()
     print('Saved PSNR plot:', out)
 
@@ -963,12 +973,12 @@ def plot_psnr_speaker_vs_listeners(psnr_speaker_stats, psnr_listeners_stats, ana
             mk = markers[i % len(markers)]
             # first: solid line, filled marker
             if arch in mean_speaker.columns:
-                plt.plot(mean_speaker.index, mean_speaker[arch], marker=mk, markersize=8, linewidth=2.0, markeredgewidth=1.4, linestyle='-', label=f'{arch} (speaker)', color=color)
+                plt.plot(mean_speaker.index, mean_speaker[arch], marker=mk, markersize=8, linewidth=2.0, markeredgewidth=1.4, linestyle='-', label=f"{arch.replace('_', ' ')} (speaker)", color=color)
                 if arch in std_speaker.columns:
                     plt.fill_between(mean_speaker.index, mean_speaker[arch] - std_speaker[arch], mean_speaker[arch] + std_speaker[arch], alpha=0.16, color=color)
             # others: dashed line, open marker
             if arch in mean_listeners.columns:
-                plt.plot(mean_listeners.index, mean_listeners[arch], marker=mk, markersize=8, linewidth=2.0, markeredgewidth=1.4, markerfacecolor='none', linestyle='--', label=f'{arch} (listeners)', color=color)
+                plt.plot(mean_listeners.index, mean_listeners[arch], marker=mk, markersize=8, linewidth=2.0, markeredgewidth=1.4, markerfacecolor='none', linestyle='--', label=f"{arch.replace('_', ' ')} (listeners)", color=color)
                 if arch in std_listeners.columns:
                     plt.fill_between(mean_listeners.index, mean_listeners[arch] - std_listeners[arch], mean_listeners[arch] + std_listeners[arch], alpha=0.10, color=color)
         plt.xlabel(GRAPH_NUM_CLIENT_LABEL)
@@ -1016,9 +1026,9 @@ def plot_measured_bandwidth_speaker_vs_listeners(measured_speaker_stats, measure
             color = cmap.get(arch)
             mk = markers[i % len(markers)]
             # speaker: solid, filled marker
-            ax.plot(x, speaker_means, marker=mk, markersize=7, linewidth=2.0, markeredgewidth=1.2, linestyle='-', label=f'{arch} (speaker)', color=color)
+            ax.plot(x, speaker_means, marker=mk, markersize=7, linewidth=2.0, markeredgewidth=1.2, linestyle='-', label=f"{arch.replace('_', ' ')} (speaker)", color=color)
             # listeners: dashed, open marker
-            ax.plot(x, listeners_means, marker=mk, markersize=7, linewidth=2.0, markeredgewidth=1.2, markerfacecolor='none', linestyle='--', label=f'{arch} (listeners)', color=color)
+            ax.plot(x, listeners_means, marker=mk, markersize=7, linewidth=2.0, markeredgewidth=1.2, markerfacecolor='none', linestyle='--', label=f"{arch.replace('_', ' ')} (listeners)", color=color)
         ax.set_xlabel(GRAPH_NUM_CLIENT_LABEL)
         ax.set_ylabel('Bandwidth (Mbps)')
         #ax.set_title(f'Measured Bandwidth: Speaker vs Listeners - {scenario}')
@@ -1053,12 +1063,12 @@ def plot_latency_speaker_vs_listeners(latency_speaker_stats, latency_listeners_s
             mk = markers[i % len(markers)]
             # speaker: solid line, filled marker
             if arch in mean_speaker.columns:
-                plt.plot(mean_speaker.index, mean_speaker[arch], marker=mk, markersize=8, linewidth=2.0, markeredgewidth=1.4, linestyle='-', label=f'{arch} (speaker)', color=color)
+                plt.plot(mean_speaker.index, mean_speaker[arch], marker=mk, markersize=8, linewidth=2.0, markeredgewidth=1.4, linestyle='-', label=f"{arch.replace('_', ' ')} (speaker)", color=color)
                 if arch in std_speaker.columns:
                     plt.fill_between(mean_speaker.index, mean_speaker[arch] - std_speaker[arch], mean_speaker[arch] + std_speaker[arch], alpha=0.16, color=color)
             # listeners: dashed line, open marker
             if arch in mean_listeners.columns:
-                plt.plot(mean_listeners.index, mean_listeners[arch], marker=mk, markersize=8, linewidth=2.0, markeredgewidth=1.4, markerfacecolor='none', linestyle='--', label=f'{arch} (listeners)', color=color)
+                plt.plot(mean_listeners.index, mean_listeners[arch], marker=mk, markersize=8, linewidth=2.0, markeredgewidth=1.4, markerfacecolor='none', linestyle='--', label=f"{arch.replace('_', ' ')} (listeners)", color=color)
                 if arch in std_listeners.columns:
                     plt.fill_between(mean_listeners.index, mean_listeners[arch] - std_listeners[arch], mean_listeners[arch] + std_listeners[arch], alpha=0.10, color=color)
         plt.xlabel(GRAPH_NUM_CLIENT_LABEL)
@@ -1086,7 +1096,7 @@ def plot_latency_speaker_vs_listeners(latency_speaker_stats, latency_listeners_s
         else:
             plt.ylim(0, 1)
         ncol = len(all_archs) if len(all_archs) <= 3 else math.ceil(len(all_archs) / 2)
-        plt.legend(loc="lower center", bbox_to_anchor=(0.5, -0.3),  ncol=ncol, prop={'size': 9})
+        plt.legend(loc="lower center", bbox_to_anchor=(0.5, -0.25),  ncol=ncol, prop={'size': 9})
         # force integer x-ticks
         try:
             idx = sorted(set(list(mean_speaker.index) + list(mean_listeners.index)))
@@ -1745,7 +1755,7 @@ def process_resolution_rows(resolution_rows, ANALYSIS_FOLDER):
                                          ANALYSIS_FOLDER,
                                          'diagnostic_bandwidth_mbps_per_client.svg',
                                          'Outgoing and Incoming Bandwidth (per-client) (diagnostic)',
-                                         'Per-Client Bandwidth (Mbps)')
+                                         'Bandwidth (Mbps)')
     except Exception as e:
         print('Failed to create diagnostic bandwidth plot:', e)
 
@@ -1791,9 +1801,9 @@ def _plot_measured_bandwidth_generic(df, participants_col, arch_col, ycols, labe
                 max_val = max(max_val, float(np.nanmax((y + ystd).fillna(0.0))))
             except Exception as e:
                 print(f'WARNING: Failed to compute max bandwidth value: {e}')
-            ax.plot(x, y, marker=mk, linestyle=ls, label=f'{arch_name} {labels[j]}', color=color)
+            ax.plot(x, y, marker=mk, linestyle=ls, label=f"{arch_name.replace('_', ' ')} {labels[j]}", color=color)
             try:
-                ax.fill_between(x, (y - ystd), (y + ystd), color=color, alpha=0.12)
+                pass#ax.fill_between(x, (y - ystd), (y + ystd), color=color, alpha=0.12)
             except Exception as e:
                 print(f'WARNING: Failed to fill between values for bandwidth plot: {e}')
 
@@ -1811,7 +1821,7 @@ def _plot_measured_bandwidth_generic(df, participants_col, arch_col, ycols, labe
     else:
         ax.set_ylim(0, 1)
     ncol = len(groups) if len(groups) <= 3 else math.ceil(len(groups) / 2)
-    ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.35),  ncol=ncol)
+    ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.4),  ncol=ncol)
     plt.tight_layout()
     out_path = os.path.join(ANALYSIS_FOLDER, out_filename)
     try:
@@ -1871,7 +1881,7 @@ def process_measured_bandwidth_rows(measured_rows, ANALYSIS_FOLDER):
                                          ANALYSIS_FOLDER,
                                          'measured_bandwidth_clients_mbps_per_client.svg',
                                          'Measured Outgoing and Incoming Bandwidth (clients only)',
-                                         'Measured Per-Client Bandwidth (Mbps)')
+                                         'Bandwidth (Mbps)')
     except Exception as e:
         print('Failed to create measured client bandwidth plot:', e)
 
@@ -1884,7 +1894,7 @@ def process_measured_bandwidth_rows(measured_rows, ANALYSIS_FOLDER):
                                          ANALYSIS_FOLDER,
                                          'measured_bandwidth_host_mbps.svg',
                                          'Measured Host Outgoing and Incoming Bandwidth',
-                                         'Measured Host Bandwidth (Mbps)')
+                                         'Bandwidth (Mbps)')
     except Exception as e:
         print('Failed to create measured host bandwidth plot:', e)
 
@@ -2077,7 +2087,7 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                 cmap = get_color_map(mean_df.columns)
                 for i, col in enumerate(mean_df.columns):
                     y = mean_df[col]
-                    ax.plot(mean_df.index, y, marker=markers[i % len(markers)], label=col, color=cmap.get(col))
+                    ax.plot(mean_df.index, y, marker=markers[i % len(markers)], label=col.replace('_', ' '), color=cmap.get(col))
                     if col in std_df.columns:
                         std = std_df[col].fillna(0)
                         try:
@@ -2104,7 +2114,7 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                 else:
                     ax.set_ylim(0, 1)
                 ncol = len(mean_df.columns) if len(mean_df.columns) <= 3 else math.ceil(len(mean_df.columns) / 2)
-                ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.4),  ncol=ncol, prop={'size': 10})
+                ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.35),  ncol=ncol, prop={'size': 10})
                 plt.tight_layout()
                 line_out = os.path.join(ANALYSIS_FOLDER, 'latency_linechart.svg')
                 fig.savefig(line_out)
@@ -2152,7 +2162,7 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                 cmap = get_color_map(mean_df.columns)
                 for i, col in enumerate(mean_df.columns):
                     y = mean_df[col]
-                    ax.plot(mean_df.index, y, marker=markers[i % len(markers)], label=col, color=cmap.get(col))
+                    ax.plot(mean_df.index, y, marker=markers[i % len(markers)], label=col.replace('_', ' '), color=cmap.get(col))
                     if col in std_df.columns:
                         std = std_df[col].fillna(0)
                         try:
@@ -2179,10 +2189,20 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                 else:
                     ax.set_ylim(0, 1)
                 ncol = len(mean_df.columns) if len(mean_df.columns) <= 3 else math.ceil(len(mean_df.columns) / 2)
-                ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.4),  ncol=ncol, prop={'size': 10})
+                ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.35),  ncol=ncol, prop={'size': 10})
                 plt.tight_layout()
                 line_out = os.path.join(ANALYSIS_FOLDER, 'latency_encode_decode_network_linechart.svg')
                 fig.savefig(line_out)
+                # Write plotted data to CSV
+                try:
+                    out_csv = os.path.join(ANALYSIS_FOLDER, 'latency_encode_decode_network_linechart_data.csv')
+                    # Create a dataframe with Participants (index) and latency for each architecture
+                    csv_df = mean_df.copy()
+                    csv_df.index.name = 'Participants'
+                    csv_df.to_csv(out_csv, sep=';')
+                    print('Saved latency data to:', out_csv)
+                except Exception as e:
+                    print(f'WARNING: Failed to write latency data CSV: {e}')
                 plt.close(fig)
                 print('Wrote latency encode+decode+network linechart to', line_out)
         except Exception as e:
@@ -2505,7 +2525,7 @@ def write_root_latency_summary(scenarios, ROOT_FOLDER):
                     if not xs or not ys:
                         continue
                     label = f"{arch} - {lt}"
-                    ax.plot(xs, ys, label=label, color=cmap.get(arch), linestyle=linestyle_map.get(lt, '-'), marker=marker)
+                    ax.plot(xs, ys, label=label.replace('_', ' '), color=cmap.get(arch), linestyle=linestyle_map.get(lt, '-'), marker=marker)
                     max_val = max(max_val, max(ys))
 
             ax.set_xlabel(GRAPH_NUM_CLIENT_LABEL)
@@ -2652,7 +2672,7 @@ def write_root_measured_bandwidth_summary(scenarios, ROOT_FOLDER):
                 ys_min = sub['Client_Out_Min'].tolist()
                 ys_max = sub['Client_Out_Max'].tolist()
                 if any(pd.notna(ys_mean)):
-                    ax.plot(xs, ys_mean, marker=markers[i % len(markers)], linestyle='-', label=f'{arch} Out', color=cmap.get(arch))
+                    ax.plot(xs, ys_mean, marker=markers[i % len(markers)], linestyle='-', label=f"{arch.replace('_', ' ')} Out", color=cmap.get(arch))
                     # show discrete min/max as errorbars (non-continuous)
                     try:
                         xm = np.array(xs, dtype=float)
@@ -2677,7 +2697,7 @@ def write_root_measured_bandwidth_summary(scenarios, ROOT_FOLDER):
                 ys_min_in = sub['Client_In_Min'].tolist()
                 ys_max_in = sub['Client_In_Max'].tolist()
                 if any(pd.notna(ys_mean_in)):
-                    ax.plot(xs, ys_mean_in, marker=markers[i % len(markers)], linestyle='--', label=f'{arch} In', color=cmap.get(arch))
+                    ax.plot(xs, ys_mean_in, marker=markers[i % len(markers)], linestyle='--', label=f"{arch.replace('_', ' ')} In", color=cmap.get(arch))
                     try:
                         xm = np.array(xs, dtype=float)
                         ym = np.array(ys_mean_in, dtype=float)

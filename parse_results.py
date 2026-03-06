@@ -54,7 +54,7 @@ _unmatched_print_count = 0
 
 GRAPH_NUM_CLIENT_LABEL = 'Number of Clients'
 FIGSIZE = (6,4)
-MARKERS = ['s', 'o', '^', 'D', 'v', 'P', 'X', '*']
+MARKERS = ['^', 'o', 's', 'D', 'v', 'P', 'X', '*']
 
 def read_csv_guess(path, na_values=["", "NA", "null"], dtype=None):
     """Try to read CSV using common separators. Returns DataFrame or None on failure."""
@@ -938,7 +938,7 @@ def plot_psnr(mean_df, std_df, analysis_folder, scenario):
     except Exception as e:
         print(f'WARNING: Failed to set x-axis ticks for PSNR plot: {e}')
     # Force y-limits to 0..50 and add horizontal 8-bit max line before legend so it's shown
-    plt.ylim(20, 50)
+    plt.ylim(25, 45)
     #plt.axhline(48.131, color='gray', linestyle=':', linewidth=2.0, label='Max PSNR (8-bit)', zorder=5)
     ncol = len(mean_df.columns)#+1
     plt.legend(loc="lower center", bbox_to_anchor=(0.5, -0.35),  ncol=ncol, prop={'size': 10})
@@ -2185,7 +2185,7 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                 except Exception:
                     max_val = None
                 if max_val is not None and max_val > 0:
-                    ax.set_ylim(0, max(max_val * 1.05, 1.0))
+                    ax.set_ylim(None, None)
                 else:
                     ax.set_ylim(0, 1)
                 ncol = len(mean_df.columns) if len(mean_df.columns) <= 3 else math.ceil(len(mean_df.columns) / 2)

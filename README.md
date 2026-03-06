@@ -102,8 +102,3 @@ This creates a timestamped folder under `./results/<timestamp>` containing per-r
 ```
 
 Outputs are written under `./results/<timestamp>/analysis/` (CSV summaries + SVG plots).
-
-## Used in
-- Article: “Design and Evaluation Methodology of Hybrid Video Conferencing Architecture” submitted to *ACM Transactions on Multimedia (TOMM)* special issue *“Methodologies for Multimedia (Meet4MM)”*
-
-

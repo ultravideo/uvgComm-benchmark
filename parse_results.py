@@ -37,6 +37,30 @@ ARCH_COLOR_MAP = {
     'sfu': '#ff7f0e',      # SFU
     'hybrid': '#2ca02c'    # Hybrid
 }
+
+
+def _arch_plot_priority(arch_name):
+    """Return a stable plot priority so Hybrid is always drawn last (on top).
+
+    Lower numbers are drawn first.
+    """
+    name = str(arch_name).strip().lower() if arch_name is not None else ''
+    # Always draw hybrid last.
+    if 'hybrid' in name:
+        return 3
+    # Prefer a consistent ordering for common architectures.
+    if 'p2p' in name or 'mesh' in name:
+        return 0
+    if 'sfu' in name:
+        return 1
+    # Unknown architectures come before hybrid.
+    return 2
+
+
+def _sorted_arch_keys(keys):
+    """Sort architecture keys for plotting so Hybrid is last."""
+    ks = [k for k in keys if k is not None]
+    return sorted(ks, key=lambda k: (_arch_plot_priority(k), str(k).strip().lower()))
 # Use non-interactive backend for matplotlib
 matplotlib.use("Agg")
 
@@ -55,6 +79,26 @@ _unmatched_print_count = 0
 GRAPH_NUM_CLIENT_LABEL = 'Number of Clients'
 FIGSIZE = (6,4)
 MARKERS = ['^', 'o', 's', 'D', 'v', 'P', 'X', '*']
+
+
+def _arch_marker(arch_name, fallback_index=0):
+    """Return a matplotlib marker for a given architecture.
+
+    Per user request:
+      - P2P mesh: cube-like -> square marker 's'
+      - SFU: triangle '^'
+      - Hybrid: circle 'o'
+
+    Unknown architectures fall back to MARKERS[fallback_index].
+    """
+    name = str(arch_name).strip().lower() if arch_name is not None else ''
+    if 'hybrid' in name:
+        return '^'
+    if 'sfu' in name:
+        return 'o'
+    if 'p2p' in name or 'mesh' in name:
+        return 's'
+    return MARKERS[int(fallback_index) % len(MARKERS)]
 
 def read_csv_guess(path, na_values=["", "NA", "null"], dtype=None):
     """Try to read CSV using common separators. Returns DataFrame or None on failure."""
@@ -772,8 +816,8 @@ def plot_cpu(results_by_arch, analysis_folder, scenario):
     # results_by_arch: dict[arch] -> list of (n_clients, cpu_avg)
     plt.figure(figsize=FIGSIZE)
     cmap = get_color_map(results_by_arch.keys())
-    markers=MARKERS
-    for i, (arch, rows) in enumerate(sorted(results_by_arch.items())):
+    for i, arch in enumerate(_sorted_arch_keys(results_by_arch.keys())):
+        rows = results_by_arch.get(arch, [])
         rows_sorted = sorted(rows, key=lambda x: x[0])
         xs = [r[0] for r in rows_sorted]
         ys = [r[1] for r in rows_sorted]
@@ -783,7 +827,7 @@ def plot_cpu(results_by_arch, analysis_folder, scenario):
         # plot only where y is finite
         mask = ~np.isnan(ys_arr)
         if np.any(mask):
-            m = markers[i % len(markers)]
+            m = _arch_marker(arch, i)
             ls = '-' #if i % 2 == 0 else '--'
             # use default color cycle (will be set externally if desired)
             plt.plot(xs_arr[mask], ys_arr[mask], marker=m, linestyle=ls, label=arch.replace('_', ' '), color=cmap[arch])
@@ -921,9 +965,8 @@ def parse_measured_bandwidth(client_folders, start_ts=None, end_ts=None):
 def plot_psnr(mean_df, std_df, analysis_folder, scenario):
     plt.figure(figsize=FIGSIZE)
     cmap = get_color_map(mean_df.columns.unique())
-    markers=MARKERS
-    for i, col in enumerate(sorted(mean_df.columns)):
-        plt.plot(mean_df.index, mean_df[col], marker=markers[i % len(markers)], label=col.replace('_', ' '), color=cmap.get(col))
+    for i, col in enumerate(_sorted_arch_keys(mean_df.columns)):
+        plt.plot(mean_df.index, mean_df[col], marker=_arch_marker(col, i), label=col.replace('_', ' '), color=cmap.get(col))
         if col in std_df.columns:
             std = std_df[col].fillna(0)
             plt.fill_between(mean_df.index, mean_df[col] - std, mean_df[col] + std, alpha=0.15)
@@ -965,12 +1008,11 @@ def plot_psnr_speaker_vs_listeners(psnr_speaker_stats, psnr_listeners_stats, ana
         mean_speaker, std_speaker = build_psnr_dfs(psnr_speaker_stats)
         mean_listeners, std_listeners = build_psnr_dfs(psnr_listeners_stats)
         plt.figure(figsize=FIGSIZE)
-        markers=MARKERS
-        all_archs = sorted(set(list(mean_speaker.columns) + list(mean_listeners.columns)))
+        all_archs = _sorted_arch_keys(set(list(mean_speaker.columns) + list(mean_listeners.columns)))
         cmap = get_color_map(all_archs)
         for i, arch in enumerate(all_archs):
             color = cmap.get(arch)
-            mk = markers[i % len(markers)]
+            mk = _arch_marker(arch, i)
             # first: solid line, filled marker
             if arch in mean_speaker.columns:
                 plt.plot(mean_speaker.index, mean_speaker[arch], marker=mk, markersize=8, linewidth=2.0, markeredgewidth=1.4, linestyle='-', label=f"{arch.replace('_', ' ')} (speaker)", color=color)
@@ -1012,9 +1054,9 @@ def plot_measured_bandwidth_speaker_vs_listeners(measured_speaker_stats, measure
         if not idx:
             return
         fig, ax = plt.subplots(figsize=FIGSIZE)
-        markers=MARKERS
-        cmap = get_color_map(sorted(set(list(measured_speaker_stats.keys()) + list(measured_listeners_stats.keys()))))
-        for i, arch in enumerate(sorted(set(list(measured_speaker_stats.keys()) + list(measured_listeners_stats.keys())))):
+        archs = _sorted_arch_keys(set(list(measured_speaker_stats.keys()) + list(measured_listeners_stats.keys())))
+        cmap = get_color_map(archs)
+        for i, arch in enumerate(archs):
             speaker_means = []
             listeners_means = []
             for n in idx:
@@ -1024,7 +1066,7 @@ def plot_measured_bandwidth_speaker_vs_listeners(measured_speaker_stats, measure
                 listeners_means.append(float(np.mean(rvals))/1e6 if rvals else np.nan)
             x = idx
             color = cmap.get(arch)
-            mk = markers[i % len(markers)]
+            mk = _arch_marker(arch, i)
             # speaker: solid, filled marker
             ax.plot(x, speaker_means, marker=mk, markersize=7, linewidth=2.0, markeredgewidth=1.2, linestyle='-', label=f"{arch.replace('_', ' ')} (speaker)", color=color)
             # listeners: dashed, open marker
@@ -1055,12 +1097,11 @@ def plot_latency_speaker_vs_listeners(latency_speaker_stats, latency_listeners_s
         mean_speaker, std_speaker = build_psnr_dfs(latency_speaker_stats)
         mean_listeners, std_listeners = build_psnr_dfs(latency_listeners_stats)
         plt.figure(figsize=FIGSIZE)
-        markers=MARKERS
-        all_archs = sorted(set(list(mean_speaker.columns) + list(mean_listeners.columns)))
+        all_archs = _sorted_arch_keys(set(list(mean_speaker.columns) + list(mean_listeners.columns)))
         cmap = get_color_map(all_archs)
         for i, arch in enumerate(all_archs):
             color = cmap.get(arch)
-            mk = markers[i % len(markers)]
+            mk = _arch_marker(arch, i)
             # speaker: solid line, filled marker
             if arch in mean_speaker.columns:
                 plt.plot(mean_speaker.index, mean_speaker[arch], marker=mk, markersize=8, linewidth=2.0, markeredgewidth=1.4, linestyle='-', label=f"{arch.replace('_', ' ')} (speaker)", color=color)
@@ -1769,16 +1810,16 @@ def _plot_measured_bandwidth_generic(df, participants_col, arch_col, ycols, labe
     """
     fig, ax = plt.subplots(figsize=FIGSIZE)
     cmap = get_color_map(df[arch_col].unique())
-    markers=MARKERS
-    groups = df.groupby(arch_col)
+    groups = list(df.groupby(arch_col))
     max_val = 0.0
 
     # linestyles for multiple series per-arch
     linestyles = ['-', '--', ':', '-.']
 
+    groups = sorted(groups, key=lambda kv: (_arch_plot_priority(kv[0]), str(kv[0]).strip().lower()))
     for i, (arch_name, g) in enumerate(groups):
         color = cmap.get(arch_name)
-        marker = markers[i % len(markers)]
+        marker = _arch_marker(arch_name, i)
         try:
             gagg_mean = g.groupby(participants_col)[ycols].mean()
             gagg_std = g.groupby(participants_col)[ycols].std().fillna(0.0)
@@ -1978,7 +2019,7 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
             # comparable per participant count.
             # Build mapping participants -> arch -> segments
             data_map = {}
-            archs = sorted({r['arch'] for r in agg_rows})
+            archs = _sorted_arch_keys({r['arch'] for r in agg_rows})
             parts = sorted({int(r['participants']) for r in agg_rows})
             for p in parts:
                 data_map[p] = {}
@@ -2065,7 +2106,7 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                 participants_idx = valid_parts
                 mean_df = pd.DataFrame(index=participants_idx)
                 std_df = pd.DataFrame(index=participants_idx)
-                arch_keys = sorted({r['arch'] for r in agg_rows})
+                arch_keys = _sorted_arch_keys({r['arch'] for r in agg_rows})
                 for arch in arch_keys:
                     vals_map = {int(r['participants']): float(r['mean_total']) for r in agg_rows if r['arch'] == arch and r.get('mean_total') is not None}
                     means = []
@@ -2083,11 +2124,10 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
 
                 # Plot with shading for std (mirrors plot_psnr style)
                 fig, ax = plt.subplots(figsize=FIGSIZE)
-                markers=MARKERS
                 cmap = get_color_map(mean_df.columns)
-                for i, col in enumerate(mean_df.columns):
+                for i, col in enumerate(_sorted_arch_keys(mean_df.columns)):
                     y = mean_df[col]
-                    ax.plot(mean_df.index, y, marker=markers[i % len(markers)], label=col.replace('_', ' '), color=cmap.get(col))
+                    ax.plot(mean_df.index, y, marker=_arch_marker(col, i), label=col.replace('_', ' '), color=cmap.get(col))
                     if col in std_df.columns:
                         std = std_df[col].fillna(0)
                         try:
@@ -2139,7 +2179,7 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                 participants_idx = valid_parts
                 mean_df = pd.DataFrame(index=participants_idx)
                 std_df = pd.DataFrame(index=participants_idx)
-                arch_keys = sorted({r['arch'] for r in agg_rows})
+                arch_keys = _sorted_arch_keys({r['arch'] for r in agg_rows})
                 for arch in arch_keys:
                     #vals_map = {int(r['participants']): float(r['mean_encode'] + r['mean_decode'] + r['mean_network']) for r in agg_rows if r['arch'] == arch and r.get('mean_encode') is not None and r.get('mean_decode') is not None and r.get('mean_network') is not None}
                     vals_map = {int(r['participants']): float(r['mean_network']) for r in agg_rows if r['arch'] == arch and r.get('mean_network') is not None}
@@ -2158,11 +2198,10 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
 
                 # Plot with shading for std (mirrors plot_psnr style)
                 fig, ax = plt.subplots(figsize=FIGSIZE)
-                markers=MARKERS
                 cmap = get_color_map(mean_df.columns)
-                for i, col in enumerate(mean_df.columns):
+                for i, col in enumerate(_sorted_arch_keys(mean_df.columns)):
                     y = mean_df[col]
-                    ax.plot(mean_df.index, y, marker=markers[i % len(markers)], label=col.replace('_', ' '), color=cmap.get(col))
+                    ax.plot(mean_df.index, y, marker=_arch_marker(col, i), label=col.replace('_', ' '), color=cmap.get(col))
                     if col in std_df.columns:
                         std = std_df[col].fillna(0)
                         try:
@@ -2343,8 +2382,8 @@ def write_root_cpu_summary(results_by_arch, ROOT_FOLDER):
     try:
         fig, ax = plt.subplots(figsize=FIGSIZE)
         cmap = get_color_map(sorted(mean_map.keys()))
-        markers=MARKERS
-        for i, (arch, pts) in enumerate(sorted(mean_map.items())):
+        for i, arch in enumerate(_sorted_arch_keys(mean_map.keys())):
+            pts = mean_map.get(arch, [])
             if not pts:
                 continue
             xs = [p for p, _ in pts]
@@ -2355,7 +2394,7 @@ def write_root_cpu_summary(results_by_arch, ROOT_FOLDER):
                 row = next((r for r in cpu_by_parts_rows if r['Architecture'] == arch and r['Participants'] == x), None)
                 stds.append(row['Std_CPU'] if row is not None else np.nan)
             color = cmap.get(arch)
-            mk = markers[i % len(markers)]
+            mk = _arch_marker(arch, i)
             ax.errorbar(xs, ys, yerr=stds, marker=mk, linestyle='-', label=arch, color=color, capsize=3)
         ax.set_xlabel(GRAPH_NUM_CLIENT_LABEL)
         ax.set_ylabel('CPU usage (%)')
@@ -2505,7 +2544,7 @@ def write_root_latency_summary(scenarios, ROOT_FOLDER):
                 continue
 
             fig, ax = plt.subplots(figsize=(10, 6))
-            archs = sorted(sub['Architecture'].dropna().unique())
+            archs = _sorted_arch_keys(sub['Architecture'].dropna().unique())
             cmap = get_color_map(archs)
             max_val = 0.0
             try:
@@ -2514,7 +2553,7 @@ def write_root_latency_summary(scenarios, ROOT_FOLDER):
                 xticks = []
 
             for i, arch in enumerate(archs):
-                marker = markers[i % len(markers)]
+                marker = _arch_marker(arch, i)
                 for lt in latency_types:
                     sel = sub[(sub['LatencyType'] == lt) & (sub['Architecture'] == arch)]
                     if sel.empty:
@@ -2660,9 +2699,8 @@ def write_root_measured_bandwidth_summary(scenarios, ROOT_FOLDER):
         # Plot mean lines with min/max filled ranges for client Out/In per architecture
         try:
             fig, ax = plt.subplots(figsize=FIGSIZE)
-            archs = sorted([a for a in out_df['Architecture'].dropna().unique()])
+            archs = _sorted_arch_keys([a for a in out_df['Architecture'].dropna().unique()])
             cmap = get_color_map(archs)
-            markers=MARKERS
             for i, arch in enumerate(archs):
                 sub = out_df[out_df['Architecture'] == arch].sort_values('Participants')
                 xs = sub['Participants'].tolist()
@@ -2672,7 +2710,7 @@ def write_root_measured_bandwidth_summary(scenarios, ROOT_FOLDER):
                 ys_min = sub['Client_Out_Min'].tolist()
                 ys_max = sub['Client_Out_Max'].tolist()
                 if any(pd.notna(ys_mean)):
-                    ax.plot(xs, ys_mean, marker=markers[i % len(markers)], linestyle='-', label=f"{arch.replace('_', ' ')} Out", color=cmap.get(arch))
+                    ax.plot(xs, ys_mean, marker=_arch_marker(arch, i), linestyle='-', label=f"{arch.replace('_', ' ')} Out", color=cmap.get(arch))
                     # show discrete min/max as errorbars (non-continuous)
                     try:
                         xm = np.array(xs, dtype=float)
@@ -2697,7 +2735,7 @@ def write_root_measured_bandwidth_summary(scenarios, ROOT_FOLDER):
                 ys_min_in = sub['Client_In_Min'].tolist()
                 ys_max_in = sub['Client_In_Max'].tolist()
                 if any(pd.notna(ys_mean_in)):
-                    ax.plot(xs, ys_mean_in, marker=markers[i % len(markers)], linestyle='--', label=f"{arch.replace('_', ' ')} In", color=cmap.get(arch))
+                    ax.plot(xs, ys_mean_in, marker=_arch_marker(arch, i), linestyle='--', label=f"{arch.replace('_', ' ')} In", color=cmap.get(arch))
                     try:
                         xm = np.array(xs, dtype=float)
                         ym = np.array(ys_mean_in, dtype=float)

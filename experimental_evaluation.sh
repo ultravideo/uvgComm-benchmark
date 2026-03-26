@@ -77,6 +77,16 @@ COOLDOWN_TIME=${COOLDOWN_TIME:-15}
 # `-l` accepts one or more of: none,local,global (comma-separated). Default: none
 LATENCY_MODES=${LATENCY_MODES:-none}
 
+# Dataset-driven latency settings (for dataset-* modes)
+# LATENCY_SEED: reproducible node selection seed
+LATENCY_SEED=${LATENCY_SEED:-1}
+
+# Dataset cache directory (downloaded NetLatency-Data repo is stored here)
+DATASET_CACHE_DIR=${DATASET_CACHE_DIR:-./datasets/NetLatency-Data}
+
+# Processed dataset cache directory (human-readable mean RTT matrix text file only)
+PROCESSED_DATASET_DIR=${PROCESSED_DATASET_DIR:-./datasets/netlatency_processed}
+
 # Send bandwidth mode (affects per-client `upBandwidth` in generated configs)
 # Allowed values:
 #  - all1000 : every client gets 1000 Mbps (default)
@@ -102,7 +112,7 @@ Options:
     -w VIEW        View mode to use (gallery|speaker) or comma-separated list. Defaults to ${VIEW_MODE}
     -v VISIBLE     Number of visible participants in gallery view (default: ${VISIBLE_PARTICIPANTS}).
     -e SECONDS     Evaluation period in seconds (default: ${EXPERIMENT_TIME}).
-    -l MODES       Simulated latency mode(s): none|local|global (comma-separated list). Defaults to ${LATENCY_MODES}
+    -l MODES       Simulated latency mode(s): none|local|global|dataset-PlanetLab|dataset-Seattle (comma-separated list). Defaults to ${LATENCY_MODES}
     -b MODE        Send bandwidth mode (all1000|all10|all1|inc1|inc5|inc10) or comma-separated list. Defaults to ${SEND_BW_MODE}
     -h             Show this help
 EOF
@@ -207,9 +217,11 @@ validate_params() {
     fi
 
     # validate latency mode(s)
-    local lat_re='^(none|local|global)(,(none|local|global))*$'
+    # - legacy: none,local,global
+    # - dataset-driven: dataset-PlanetLab, dataset-Seattle
+    local lat_re='^(none|local|global|dataset-PlanetLab|dataset-Seattle)(,(none|local|global|dataset-PlanetLab|dataset-Seattle))*$'
     if ! [[ "$LATENCY_MODES" =~ $lat_re ]]; then
-        echo "ERROR: Unknown latency mode '$LATENCY_MODES' (allowed: none,local,global or comma-separated list)" >&2; exit 1
+        echo "ERROR: Unknown latency mode '$LATENCY_MODES' (allowed: none,local,global,dataset-PlanetLab,dataset-Seattle or comma-separated list)" >&2; exit 1
     fi
 
     # validate view mode(s)
@@ -298,7 +310,142 @@ prepare_tests() {
     # a reasonable upper bound; the file will be written in configs/.
     generate_usernames "$MAX_CLIENTS"
 
+    # Prepare dataset-driven latency artifacts (only if dataset-* latency modes requested)
+    prepare_latency_datasets
+
     echo "Preparation complete. Input files ready: $INPUT_FILE_720, $INPUT_FILE_FULLHD and $INPUT_FILE_4K"
+}
+
+latency_is_dataset_mode() {
+    # Return 0 (true) if provided latency mode token is dataset-*.
+    local m="$1"
+    [[ "$m" == dataset-* ]]
+}
+
+dataset_name_from_latency_mode() {
+    # Map latency mode token -> dataset name.
+    # Supported: dataset-PlanetLab, dataset-Seattle
+    local m="$1"
+    case "$m" in
+        dataset-PlanetLab) echo "PlanetLab" ;;
+        dataset-Seattle) echo "Seattle" ;;
+        *) echo "" ;;
+    esac
+}
+
+ensure_netlatency_dataset() {
+    # Ensure NetLatency-Data dataset is present under DATASET_CACHE_DIR.
+    # Downloads and extracts the GitHub master.zip using 7z (already required by this repo).
+    mkdir -p "$(dirname "$DATASET_CACHE_DIR")" 2>/dev/null || true
+    mkdir -p "$DATASET_CACHE_DIR" 2>/dev/null || true
+
+    # If cache already looks valid, do nothing.
+    if [ -d "${DATASET_CACHE_DIR}/PlanetLab" ] && [ -d "${DATASET_CACHE_DIR}/Seattle" ]; then
+        return 0
+    fi
+
+    echo "NetLatency-Data not found in ${DATASET_CACHE_DIR}; downloading dataset..."
+    local zip_path="$(dirname "$DATASET_CACHE_DIR")/NetLatency-Data-master.zip"
+    local extract_root="$(dirname "$DATASET_CACHE_DIR")"
+    local extracted_dir="${extract_root}/NetLatency-Data-master"
+    local url="https://github.com/uofa-rzhu3/NetLatency-Data/archive/refs/heads/master.zip"
+
+    wget -O "$zip_path" "$url"
+
+    # Extract into extract_root (creates NetLatency-Data-master)
+    7z x -y -o"$extract_root" "$zip_path" >/dev/null
+
+    if [ ! -d "$extracted_dir" ]; then
+        echo "ERROR: Dataset extraction failed; expected folder not found: $extracted_dir" >&2
+        exit 1
+    fi
+
+    # Populate cache directory
+    rm -rf "$DATASET_CACHE_DIR" 2>/dev/null || true
+    mv "$extracted_dir" "$DATASET_CACHE_DIR"
+
+    if [ ! -d "${DATASET_CACHE_DIR}/PlanetLab" ] || [ ! -d "${DATASET_CACHE_DIR}/Seattle" ]; then
+        echo "ERROR: Dataset cache missing expected subfolders under ${DATASET_CACHE_DIR}" >&2
+        exit 1
+    fi
+}
+
+prepare_latency_datasets() {
+    # Prepare averaged RTT matrices + reproducible node selection for any dataset-* modes.
+    # Cached under PROCESSED_DATASET_DIR so it is generated once and reused across runs.
+    local need_dataset=0
+    IFS=',' read -r -a _lat_modes <<< "${LATENCY_MODES}"
+    for _m in "${_lat_modes[@]}"; do
+        if latency_is_dataset_mode "${_m}"; then
+            need_dataset=1
+            break
+        fi
+    done
+    if [ "$need_dataset" -eq 0 ]; then
+        return 0
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "ERROR: python3 not found but dataset-* latency mode was requested." >&2
+        exit 1
+    fi
+
+    ensure_netlatency_dataset
+
+    # Prepare each dataset requested (once).
+    for _m in "${_lat_modes[@]}"; do
+        if ! latency_is_dataset_mode "${_m}"; then
+            continue
+        fi
+        local ds
+        ds=$(dataset_name_from_latency_mode "${_m}")
+        if [ -z "$ds" ]; then
+            echo "ERROR: Unknown dataset latency mode '${_m}'" >&2
+            exit 1
+        fi
+
+        local out_dir="${PROCESSED_DATASET_DIR}/${ds}"
+        mkdir -p "$out_dir"
+
+        local cached_txt="${out_dir}/avg_${ds}_rtt_ms.txt"
+        if [ -f "${cached_txt}" ]; then
+            echo "Using cached mean RTT matrix: ${cached_txt}"
+            case "$ds" in
+                PlanetLab) DATASET_PREPARED_PLANETLAB="$cached_txt" ;;
+                Seattle) DATASET_PREPARED_SEATTLE="$cached_txt" ;;
+            esac
+            continue
+        fi
+
+        # Optional unit overrides
+        local unit_arg=""
+        if [ "$ds" = "PlanetLab" ] && [ -n "${DATASET_UNITS_PLANETLAB-}" ]; then
+            unit_arg="--units ${DATASET_UNITS_PLANETLAB}"
+        fi
+        if [ "$ds" = "Seattle" ] && [ -n "${DATASET_UNITS_SEATTLE-}" ]; then
+            unit_arg="--units ${DATASET_UNITS_SEATTLE}"
+        fi
+
+        echo "Preparing mean RTT matrix for ${ds}"
+        local mean_matrix_file
+        mean_matrix_file=$(python3 "./dataset_latency.py" prepare-mean \
+            --dataset "${ds}" \
+            --dataset-root "${DATASET_CACHE_DIR}" \
+            --out-dir "${out_dir}" \
+            --zero-missing \
+            ${unit_arg} \
+        )
+
+        if [ ! -f "${mean_matrix_file}" ]; then
+            echo "ERROR: Dataset mean-matrix prepare did not produce expected file: ${mean_matrix_file}" >&2
+            exit 1
+        fi
+
+        case "$ds" in
+            PlanetLab) DATASET_PREPARED_PLANETLAB="$mean_matrix_file" ;;
+            Seattle) DATASET_PREPARED_SEATTLE="$mean_matrix_file" ;;
+        esac
+    done
 }
 
 write_metadata() {
@@ -331,6 +478,19 @@ write_metadata() {
         echo "Download_BW: ${download_bw} Mbps"
         echo "Upload_BW_Mode: ${upload_mode}"
         echo "Simulated_latencies: $latency"
+        if latency_is_dataset_mode "$latency"; then
+            ds=$(dataset_name_from_latency_mode "$latency")
+            echo "Latency_Dataset: ${ds}"
+            echo "Latency_Seed: ${LATENCY_SEED}"
+            echo "Latency_Aggregation: avg_all_slices"
+            echo "Latency_Model: oneway=rtt/2"
+            if [ -n "${DATASET_PREPARED_FILE-}" ]; then
+                echo "Latency_Mean_Matrix_File: ${DATASET_PREPARED_FILE}"
+            fi
+            if [ -n "${DATASET_SELECTED_NODES-}" ]; then
+                echo "Latency_Selected_Nodes: ${DATASET_SELECTED_NODES}"
+            fi
+        fi
         echo "View_Mode: $view_mode"
         echo "Visible_Participants: ${VISIBLE_PARTICIPANTS}"
         echo "Start_Timestamp: $start"
@@ -566,8 +726,9 @@ create_clients() {
     local num_clients="$1"
     local input_file="$2"
     local output_folder="$3"
-    local LATENCY_MODE="${4:-}"
-    local LATENCY_FILE="${5:-}"
+    local ARCHITECTURE="$4"
+    local LATENCY_MODE="${5:-}"
+    local LATENCY_FILE="${6:-}"
 
     for i in $(seq 1 "$num_clients"); do
         CONTAINER_NAME="${CLIENT_PREFIX}${i}"
@@ -589,29 +750,140 @@ create_clients() {
             --stats=${CONTAINER_STATS_FOLDER} \
             --siplog=${CONTAINER_STATS_FOLDER}/siplog.txt
 
-            # apply in-container latency if requested (LATENCY_MODE must be local/global)
-            if [ -n "${LATENCY_MODE}" ] && [ "${LATENCY_MODE}" != "none" ]; then
-            local lat_ms
-            if [ -z "$LATENCY_FILE" ]; then
-                LATENCY_FILE="${RUN_FOLDER}/latencies_${LATENCY_MODE}_n${num_clients}.txt"
-            fi
-            if [ -f "$LATENCY_FILE" ]; then
-                lat_ms=$(sed -n "$((i+1))p" "$LATENCY_FILE" 2>/dev/null || echo "")
+        # apply in-container latency if requested
+        if [ -n "${LATENCY_MODE}" ] && [ "${LATENCY_MODE}" != "none" ]; then
+            if latency_is_dataset_mode "${LATENCY_MODE}"; then
+                if [ -z "$LATENCY_FILE" ] || [ ! -f "$LATENCY_FILE" ]; then
+                    echo "ERROR: dataset latency mode requires LATENCY_FILE to be the cached mean RTT matrix text file" >&2
+                    exit 1
+                fi
+                apply_tc_dataset "$CONTAINER_NAME" "$LATENCY_FILE" "$num_clients" "$ARCHITECTURE" "client${i}" "$client_output" "${CONTAINER_STATS_FOLDER}"
             else
-                lat_ms=""
-            fi
-            if [ -n "$lat_ms" ] && [ "$lat_ms" -gt 0 ] 2>/dev/null; then
-                # detect primary interface inside container
-                net_if=$(docker exec "$CONTAINER_NAME" sh -c 'ls /sys/class/net | grep -v lo | head -n1' 2>/dev/null || echo "")
-                if [ -n "$net_if" ]; then
-                    # Increase tx queue length to reduce packet drops when netem adds delay
-                    docker exec "$CONTAINER_NAME" ip link set dev "$net_if" txqueuelen 1000 2>/dev/null || true
-                    # Use a larger qdisc limit so many simultaneous streams don't overflow the netem queue
-                    docker exec "$CONTAINER_NAME" tc qdisc replace dev "$net_if" root netem delay "${lat_ms}ms" limit 10000 2>/dev/null || true
+                # Legacy modes: local/global -> one constant delay per container
+                local lat_ms
+                if [ -z "$LATENCY_FILE" ]; then
+                    LATENCY_FILE="${RUN_FOLDER}/latencies_${LATENCY_MODE}_n${num_clients}.txt"
+                fi
+                if [ -f "$LATENCY_FILE" ]; then
+                    lat_ms=$(sed -n "$((i+1))p" "$LATENCY_FILE" 2>/dev/null || echo "")
+                else
+                    lat_ms=""
+                fi
+                if [ -n "$lat_ms" ] && [ "$lat_ms" -gt 0 ] 2>/dev/null; then
+                    # detect primary interface inside container
+                    net_if=$(docker exec "$CONTAINER_NAME" sh -c 'ls /sys/class/net | grep -v lo | head -n1' 2>/dev/null || echo "")
+                    if [ -n "$net_if" ]; then
+                        docker exec "$CONTAINER_NAME" ip link set dev "$net_if" txqueuelen 1000 2>/dev/null || true
+                        docker exec "$CONTAINER_NAME" tc qdisc replace dev "$net_if" root netem delay "${lat_ms}ms" limit 10000 2>/dev/null || true
+                    fi
                 fi
             fi
         fi
     done
+}
+
+apply_tc_dataset() {
+    # Generate per-destination delay table from prepared dataset and apply it.
+    # Writes separate artifacts in the container stats folder:
+    #  - tc_apply.sh : the exact script executed inside the container
+    #  - tc_log.txt  : stdout/stderr from applying tc rules
+    #  - tc_dump.txt : tc qdisc/class/filter state after applying (stdout only)
+    # Usage: apply_tc_dataset <container> <mean_matrix_file> <clients> <arch> <role> <stats_host_dir> <stats_container_dir>
+    local container="$1"
+    local mean_matrix_file="$2"
+    local clients="$3"
+    local arch="$4"
+    local role="$5"
+    local stats_host_dir="$6"
+    local stats_container_dir="$7"
+
+    # Wait briefly for the container to accept exec calls
+    local attempts=0
+    while [ "$attempts" -lt 15 ]; do
+        if docker exec "$container" sh -c 'true' >/dev/null 2>&1; then
+            break
+        fi
+        attempts=$((attempts + 1))
+        sleep 0.2
+    done
+
+    if [ ! -f "$mean_matrix_file" ]; then
+        echo "ERROR: Mean RTT matrix file not found: $mean_matrix_file" >&2
+        exit 1
+    fi
+
+    if [ -z "$stats_host_dir" ] || [ ! -d "$stats_host_dir" ]; then
+        echo "ERROR: stats_host_dir missing or not a directory: $stats_host_dir" >&2
+        exit 1
+    fi
+    if [ -z "$stats_container_dir" ]; then
+        echo "ERROR: stats_container_dir missing" >&2
+        exit 1
+    fi
+
+    local tc_apply_host="${stats_host_dir}/tc_apply.sh"
+    local tc_log_container="${stats_container_dir}/tc_log.txt"
+    local tc_dump_container="${stats_container_dir}/tc_dump.txt"
+
+    local tmp_table
+    tmp_table=$(mktemp)
+
+    if ! python3 "./dataset_latency.py" table-for-role \
+        --mean-matrix "$mean_matrix_file" \
+        --clients "$clients" \
+        --arch "$arch" \
+        --role "$role" \
+        --net-prefix "172.28.0." \
+        --seed "${LATENCY_SEED}" \
+        > "$tmp_table"; then
+        rm -f "$tmp_table"
+        echo "ERROR: Failed to generate dst_ip;delay_ms table (role=${role})" >&2
+        exit 1
+    fi
+
+    {
+        echo "#!/bin/sh"
+        echo "set -eu"
+        echo "NET_IF=\$(ip route show default 2>/dev/null | awk '{print \$5; exit}')"
+        echo "if [ -z \"\$NET_IF\" ]; then NET_IF=\$(ls /sys/class/net | grep -v lo | head -n1); fi"
+        echo "if [ -z \"\$NET_IF\" ]; then echo 'ERROR: Failed to detect network interface' >&2; exit 1; fi"
+        echo "tc qdisc del dev \"\$NET_IF\" root 2>/dev/null || true"
+        echo "tc qdisc replace dev \"\$NET_IF\" root handle 1: htb default 1 r2q 10"
+        echo "tc class replace dev \"\$NET_IF\" parent 1: classid 1:1 htb rate 1000mbit ceil 1000mbit"
+        echo "ip link set dev \"\$NET_IF\" txqueuelen 1000 2>/dev/null || true"
+    } > "$tc_apply_host"
+
+    awk -F';' '
+        BEGIN { minor=10 }
+        NR==1 && $1=="dst_ip" { next }
+        {
+            gsub("\r","",$1); gsub("\r","",$2);
+            gsub(/[[:space:]]/,"",$1); gsub(/[[:space:]]/,"",$2);
+            if ($1=="" || $2=="") next;
+            if ($2 !~ /^[0-9]+$/) { print "echo \"ERROR: Non-integer delay_ms " $2 " for dst " $1 "\" >&2; exit 1"; exit 0 }
+            classid = "1:" minor;
+            handle = minor ":";
+            print "tc class replace dev \"$NET_IF\" parent 1:1 classid " classid " htb rate 1000mbit ceil 1000mbit";
+            print "tc qdisc replace dev \"$NET_IF\" parent " classid " handle " handle " netem delay " $2 "ms limit 10000";
+            print "tc filter replace dev \"$NET_IF\" protocol ip parent 1: prio 1 u32 match ip dst " $1 "/32 flowid " classid;
+            minor++;
+        }
+    ' "$tmp_table" >> "$tc_apply_host"
+
+    rm -f "$tmp_table"
+    chmod +x "$tc_apply_host" 2>/dev/null || true
+
+    # Apply rules and capture stdout/stderr to tc_log.txt inside the mounted stats folder.
+    if ! docker exec "$container" sh -c "sh '${stats_container_dir}/tc_apply.sh' > '${tc_log_container}' 2>&1" >/dev/null 2>&1; then
+        echo "ERROR: Failed to apply dataset tc rules (container=${container}, role=${role}). See ${stats_host_dir}/tc_log.txt" >&2
+        exit 1
+    fi
+
+    # Dump resulting state to tc_dump.txt (stdout only). Any stderr is appended to tc_log.txt.
+    docker exec "$container" sh -c "NET_IF=\$(ip route show default 2>/dev/null | awk '{print \$5; exit}'); \
+        if [ -z \"\$NET_IF\" ]; then NET_IF=\$(ls /sys/class/net | grep -v lo | head -n1); fi; \
+        { tc qdisc show dev \"\$NET_IF\"; tc class show dev \"\$NET_IF\"; tc filter show dev \"\$NET_IF\" parent 1:; } \
+        > '${tc_dump_container}' 2>> '${tc_log_container}'" >/dev/null 2>&1 || true
 }
 
 create_host_script() {
@@ -732,6 +1004,7 @@ create_host() {
         $( [ -n "${SFU_CPUS}" ] && printf '--cpus="%s" \\' "${SFU_CPUS}" || true ) \
         -v "${CONFIG_FOLDER}/uvgComm_host.ini:${CONTAINER_CONFIG_FILE}" \
         -v "${script_file}:${CONTAINER_HOST_SCRIPT_FILE}" \
+        -v "$1/${HOST_NAME}:${CONTAINER_STATS_FOLDER}" \
         -v "${CORE_DIR_HOST}:/cores" \
         --ulimit core=-1 \
         --ulimit nofile=${SFU_NOFILE}:${SFU_NOFILE} \
@@ -747,23 +1020,28 @@ create_host() {
 
     # apply in-container host/SFU latency if requested
     if [ -n "${latency_mode_param}" ] && [ "${latency_mode_param}" != "none" ]; then
-        local LATENCY_FILE="${latency_file}"
-        if [ -z "$LATENCY_FILE" ]; then
-            LATENCY_FILE="${RUN_FOLDER}/latencies_${latency_mode_param}_n${clients}.txt"
-        fi
-        if [ -f "$LATENCY_FILE" ]; then
-            host_lat=$(sed -n '1p' "$LATENCY_FILE" 2>/dev/null || echo "")
+        if latency_is_dataset_mode "${latency_mode_param}"; then
+            if [ -z "${latency_file}" ] || [ ! -f "${latency_file}" ]; then
+                echo "ERROR: dataset latency mode requires latency_file to be the cached mean RTT matrix text file" >&2
+                exit 1
+            fi
+            apply_tc_dataset "$HOST_NAME" "$latency_file" "$clients" "$architecture" "host" "$1/${HOST_NAME}" "${CONTAINER_STATS_FOLDER}"
         else
-            host_lat=""
-        fi
-        if [ -n "$host_lat" ] && [ "$host_lat" -gt 0 ] 2>/dev/null; then
-            # detect primary interface inside host container
-            host_if=$(docker exec "$HOST_NAME" sh -c 'ls /sys/class/net | grep -v lo | head -n1' 2>/dev/null || echo "")
-            if [ -n "$host_if" ]; then
-                # Increase tx queue length on the host side of the container
-                docker exec "$HOST_NAME" ip link set dev "$host_if" txqueuelen 1000 2>/dev/null || true
-                # Use larger qdisc limit to avoid buffer overflows with many participant streams
-                docker exec "$HOST_NAME" tc qdisc replace dev "$host_if" root netem delay "${host_lat}ms" limit 10000 2>/dev/null || true
+            local LATENCY_FILE="${latency_file}"
+            if [ -z "$LATENCY_FILE" ]; then
+                LATENCY_FILE="${RUN_FOLDER}/latencies_${latency_mode_param}_n${clients}.txt"
+            fi
+            if [ -f "$LATENCY_FILE" ]; then
+                host_lat=$(sed -n '1p' "$LATENCY_FILE" 2>/dev/null || echo "")
+            else
+                host_lat=""
+            fi
+            if [ -n "$host_lat" ] && [ "$host_lat" -gt 0 ] 2>/dev/null; then
+                host_if=$(docker exec "$HOST_NAME" sh -c 'ls /sys/class/net | grep -v lo | head -n1' 2>/dev/null || echo "")
+                if [ -n "$host_if" ]; then
+                    docker exec "$HOST_NAME" ip link set dev "$host_if" txqueuelen 1000 2>/dev/null || true
+                    docker exec "$HOST_NAME" tc qdisc replace dev "$host_if" root netem delay "${host_lat}ms" limit 10000 2>/dev/null || true
+                fi
             fi
         fi
     fi
@@ -1069,6 +1347,10 @@ run_scenario() {
 
     for run_index in $(seq 1 "$RUN_COUNT"); do
 
+        # Per-run dataset metadata (set only for dataset-* latency modes)
+        DATASET_PREPARED_FILE=""
+        DATASET_SELECTED_NODES=""
+
         local run_output_folder="${base_output_folder}/run_${run_index}"
         mkdir -p "${run_output_folder}"
 
@@ -1096,15 +1378,53 @@ run_scenario() {
         echo "Latency mode: $LATENCY_MODE_PARAM, View: $VIEW_MODE"
         echo "---------------------------------------------------------"
 
+        # Create host first so it is ready when clients call in sequence.
+        # For dataset-* latency modes: use the cached mean RTT matrix text file and stream tc rules from it.
+        if latency_is_dataset_mode "${LATENCY_MODE_PARAM}"; then
+            local ds
+            ds=$(dataset_name_from_latency_mode "${LATENCY_MODE_PARAM}")
+            local mean_matrix_file=""
+            case "$ds" in
+                PlanetLab) mean_matrix_file="${DATASET_PREPARED_PLANETLAB-}" ;;
+                Seattle) mean_matrix_file="${DATASET_PREPARED_SEATTLE-}" ;;
+            esac
+            if [ -z "$mean_matrix_file" ] || [ ! -f "$mean_matrix_file" ]; then
+                echo "ERROR: Dataset latency requested (${LATENCY_MODE_PARAM}) but mean RTT matrix file not found. Ensure prepare_tests ran and succeeded." >&2
+                exit 1
+            fi
+            LATENCY_FILE="$mean_matrix_file"
+            DATASET_PREPARED_FILE="$mean_matrix_file"
+            DATASET_SELECTED_NODES=$(python3 "./dataset_latency.py" nodes --mean-matrix "$mean_matrix_file" --clients "$CLIENTS" --seed "${LATENCY_SEED}" 2>/dev/null || echo "")
+
+            # Also record selection at the root of the timestamped result folder (RUN_FOLDER)
+            # so it is easy to audit selections across all scenarios/runs.
+            local root_nodes_csv="${RUN_FOLDER}/latency_nodes.csv"
+            if [ ! -f "${root_nodes_csv}" ]; then
+                echo "scenario_tag;run_index;arch;clients;resolution;ul_mode;view;dataset;seed;mean_matrix_file;host_node;client_nodes;selected_nodes" > "${root_nodes_csv}"
+            fi
+            local host_node_idx=""
+            local client_node_idxs=""
+            host_node_idx=$(printf "%s" "${DATASET_SELECTED_NODES}" | sed -n 's/.*host=\([0-9][0-9]*\).*/\1/p')
+            client_node_idxs=$(printf "%s" "${DATASET_SELECTED_NODES}" | sed -n 's/.*clients=\(.*\)$/\1/p')
+            echo "${scen_tag};${run_index};${ARCHITECTURE};${CLIENTS};${RESOLUTION};${UPLOAD_MODE};${VIEW_MODE};${ds};${LATENCY_SEED};${mean_matrix_file};${host_node_idx};${client_node_idxs};${DATASET_SELECTED_NODES}" >> "${root_nodes_csv}"
+
+            # Write chosen node indices into the run folder for transparency.
+            {
+                echo "dataset=${ds}"
+                echo "seed=${LATENCY_SEED}"
+                echo "mean_matrix_file=${mean_matrix_file}"
+                echo "selected_nodes=${DATASET_SELECTED_NODES}"
+            } > "${run_output_folder}/latency_nodes.txt"
+        fi
+
          write_metadata "$scen_tag" "$ARCHITECTURE" "$CLIENTS" "$RESOLUTION" \
              "$DOWNLOAD_BW" "$UPLOAD_MODE" "$LATENCY_MODE_PARAM" "$VIEW_MODE" \
              "$run_output_folder" "$experiment_start_ms" "$experiment_end_ms" "$run_index"
 
-        # Create host first so it is ready when clients call in sequence.
         create_host "$run_output_folder" "$ARCHITECTURE" "$CLIENTS" "$RESOLUTION" "$DOWNLOAD_BW" "$warmup_time_ms" "$experiment_time_ms" "$cooldown_time_ms" "$LATENCY_MODE_PARAM" "$LATENCY_FILE"
 
         generate_client_configs "${UPLOAD_MODE}" "${VIEW_MODE}" "${CLIENTS}" || true
-        create_clients "$CLIENTS" "$INPUT_FILE" "$run_output_folder" "$LATENCY_MODE_PARAM" "$LATENCY_FILE"
+        create_clients "$CLIENTS" "$INPUT_FILE" "$run_output_folder" "$ARCHITECTURE" "$LATENCY_MODE_PARAM" "$LATENCY_FILE"
 
         # Start bandwidth monitor (polling interval 1s) - writes per-container CSVs
         start_bandwidth_monitor "$run_output_folder" 1
@@ -1240,7 +1560,12 @@ for LATENCY_MODE in "${LATENCY_RUNS[@]}"; do
 
                         latency_file=""
                         if [ -n "${LATENCY_MODE}" ] && [ "${LATENCY_MODE}" != "none" ]; then
-                            latency_file=$(generate_latencies "$RUN_FOLDER" "$clients" "$LATENCY_MODE" 2>/dev/null || echo "")
+                            if latency_is_dataset_mode "${LATENCY_MODE}"; then
+                                # dataset-* modes generate per-run tables inside run_scenario
+                                latency_file=""
+                            else
+                                latency_file=$(generate_latencies "$RUN_FOLDER" "$clients" "$LATENCY_MODE" 2>/dev/null || echo "")
+                            fi
                         fi
 
                         # Choose input file per-resolution: prefer matching extracted inputs

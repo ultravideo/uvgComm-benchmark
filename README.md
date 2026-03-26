@@ -74,7 +74,7 @@ python3 -m pip install --user pandas numpy matplotlib
 - `-w VIEW`: `gallery`, `speaker`, or both separated by comma.
 - `-v VISIBLE`: visible participants in gallery view, default is 9.
 - `-e SECONDS`: evaluation duration, default 60 (seconds).
-- `-l MODES`: simulated latency mode(s): `none`, `local`, `global`, or a comma-separated list.
+- `-l MODES`: simulated latency mode(s): `none`, `local`, `global`, `dataset-PlanetLab`, `dataset-Seattle`, or a comma-separated list.
 - `-b MODE`: send bandwidth mode(s): `all1000`, `all10`, `all1`, `inc1`, `inc5`, `inc10`, or a comma-separated list.
 - `-h`: show help.
 

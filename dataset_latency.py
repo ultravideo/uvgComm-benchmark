@@ -468,6 +468,137 @@ def cmd_table_for_role(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sfu_penalty(args: argparse.Namespace) -> int:
+    """Emit a CSV table comparing direct P2P delay vs via-SFU delay.
+
+    For each ordered client pair (clientA -> clientB), compute:
+      direct_ms = rtt(clientA, clientB)/2
+      via_sfu_ms = rtt(clientA, host)/2 + rtt(host, clientB)/2
+      penalty_ms = via_sfu_ms - direct_ms
+    """
+    n, avg_flat = _read_mean_matrix_file(args.mean_matrix)
+    clients = int(args.clients)
+    if clients <= 1:
+        raise ValueError("--clients must be >= 2")
+    if clients >= n:
+        raise ValueError(f"Requested clients={clients} too large for n={n} (need clients <= n-1)")
+
+    seed = int(args.seed)
+    host_node = int(_pick_sfu_central_node(avg_flat, n))
+    client_nodes = _seeded_sample_nodes(n, exclude=host_node, k=clients, seed=seed)
+
+    role_to_node: Dict[str, int] = {"host": host_node}
+    for i in range(1, clients + 1):
+        role_to_node[f"client{i}"] = int(client_nodes[i - 1])
+
+    host_ip = _ip_for("host", args.net_prefix)
+    out = csv.writer(sys.stdout, delimiter=';', lineterminator='\n')
+    out.writerow(
+        [
+            "src_role",
+            "dst_role",
+            "src_ip",
+            "dst_ip",
+            "host_ip",
+            "direct_ms",
+            "via_sfu_ms",
+            "penalty_ms",
+        ]
+    )
+
+    for a in range(1, clients + 1):
+        src_role = f"client{a}"
+        src_node = role_to_node[src_role]
+        src_ip = _ip_for(src_role, args.net_prefix)
+
+        # client->host leg for this source
+        rtt_src_host = _rtt_ms_from_flat(avg_flat, n, src_node, host_node)
+        d_src_host = max(0, int(round(rtt_src_host / 2.0)))
+
+        for b in range(1, clients + 1):
+            if a == b:
+                continue
+            dst_role = f"client{b}"
+            dst_node = role_to_node[dst_role]
+            dst_ip = _ip_for(dst_role, args.net_prefix)
+
+            rtt_direct = _rtt_ms_from_flat(avg_flat, n, src_node, dst_node)
+            direct_ms = max(0, int(round(rtt_direct / 2.0)))
+
+            rtt_host_dst = _rtt_ms_from_flat(avg_flat, n, host_node, dst_node)
+            d_host_dst = max(0, int(round(rtt_host_dst / 2.0)))
+
+            via_ms = d_src_host + d_host_dst
+            penalty = via_ms - direct_ms
+            out.writerow([src_role, dst_role, src_ip, dst_ip, host_ip, direct_ms, via_ms, penalty])
+
+    return 0
+
+
+def cmd_derive_seed(args: argparse.Namespace) -> int:
+    """Derive a deterministic per-run seed from a base seed and run index.
+
+    This is used by the bash runner so that all scenarios with the same
+    run_index select the same nodes.
+    """
+    base_seed = int(args.base_seed)
+    run_index = int(args.run_index)
+    if run_index <= 0:
+        raise ValueError("--run-index must be >= 1")
+
+    import hashlib
+
+    h = hashlib.sha256(f"{base_seed}:{run_index}".encode("utf-8")).digest()
+    seed = int.from_bytes(h[:8], "big") % 2147483647
+    if seed == 0:
+        seed = 1
+    print(seed)
+    return 0
+
+
+def cmd_sfu_penalty_summary(args: argparse.Namespace) -> int:
+    """Summarize a sfu_penalty.csv produced by cmd_sfu_penalty.
+
+    Output format (semicolon-separated, no header):
+      pairs;direct_faster;via_sfu_faster;ties;penalty_min;penalty_p50;penalty_p95;penalty_max
+    """
+    path = str(args.penalty_csv)
+    penalties: List[int] = []
+    with open(path, newline="") as f:
+        r = csv.DictReader(f, delimiter=';')
+        for row in r:
+            if not row:
+                continue
+            p = row.get("penalty_ms")
+            if p is None or p == "":
+                continue
+            penalties.append(int(p))
+
+    pairs = len(penalties)
+    direct_faster = sum(1 for p in penalties if p > 0)
+    via_faster = sum(1 for p in penalties if p < 0)
+    ties = sum(1 for p in penalties if p == 0)
+
+    if not penalties:
+        print("0;0;0;0;0;0;0;0")
+        return 0
+
+    ps = sorted(penalties)
+
+    def pct(pctile: float) -> int:
+        k = int(round((len(ps) - 1) * (pctile / 100.0)))
+        return int(ps[k])
+
+    pmin = int(ps[0])
+    p50 = float(statistics.median(ps))
+    p95 = int(pct(95))
+    pmax = int(ps[-1])
+
+    # Keep p50 as-is (may be .5) for small even-sized lists.
+    print(f"{pairs};{direct_faster};{via_faster};{ties};{pmin};{p50};{p95};{pmax}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Dataset-driven latency utilities (NetLatency-Data)")
     sp = p.add_subparsers(dest="cmd", required=True)
@@ -512,6 +643,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_role.add_argument("--net-prefix", default="172.28.0.")
     p_role.add_argument("--seed", type=int, default=1)
     p_role.set_defaults(func=cmd_table_for_role)
+
+    p_pen = sp.add_parser("sfu-penalty", help="Compare direct client->client delay vs via-SFU (expected penalty)")
+    p_pen.add_argument("--mean-matrix", required=True)
+    p_pen.add_argument("--clients", type=int, required=True)
+    p_pen.add_argument("--net-prefix", default="172.28.0.")
+    p_pen.add_argument("--seed", type=int, default=1)
+    p_pen.set_defaults(func=cmd_sfu_penalty)
+
+    p_seed = sp.add_parser("derive-seed", help="Derive deterministic per-run seed from base seed and run index")
+    p_seed.add_argument("--base-seed", required=True, type=int)
+    p_seed.add_argument("--run-index", required=True, type=int)
+    p_seed.set_defaults(func=cmd_derive_seed)
+
+    p_pen_sum = sp.add_parser("sfu-penalty-summary", help="Summarize sfu_penalty.csv into a single metrics line")
+    p_pen_sum.add_argument("--penalty-csv", required=True)
+    p_pen_sum.set_defaults(func=cmd_sfu_penalty_summary)
 
     return p
 

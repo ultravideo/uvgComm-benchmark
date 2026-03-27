@@ -75,7 +75,7 @@ python3 -m pip install --user pandas numpy matplotlib
 - `-v VISIBLE`: visible participants in gallery view, default is 9.
 - `-e SECONDS`: evaluation duration, default 60 (seconds).
 - `-l MODES`: simulated latency mode(s): `none`, `local`, `global`, `dataset-PlanetLab`, `dataset-Seattle`, or a comma-separated list.
-- `-b MODE`: send bandwidth mode(s): `all1000`, `all10`, `all1`, `inc1`, `inc5`, `inc10`, or a comma-separated list.
+- `-b MODE`: send bandwidth mode(s): `all1000` or `matchdl` (match upload to scenario download), or a comma-separated list.
 - `-h`: show help.
 
 ## Example for running the evaluation
@@ -90,7 +90,7 @@ python3 -m pip install --user pandas numpy matplotlib
 	-v 9 \
 	-e 60 \
 	-l "none,global" \
-	-b "all1000,all1"
+	-b "all1000,matchdl"
 ```
 
 This creates a timestamped folder under `./results/<timestamp>` containing per-run logs and CSV traces. You will get a handly time estimate before starting the full test and allowing you to adjust based on the time you have available.

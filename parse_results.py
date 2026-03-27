@@ -81,6 +81,190 @@ FIGSIZE = (6,4)
 MARKERS = ['^', 'o', 's', 'D', 'v', 'P', 'X', '*']
 
 
+# --- Confidence interval helpers (across runs) ---
+# We avoid SciPy by using a small t critical value lookup for 95% two-sided CIs.
+# For df > 30 we fall back to normal approximation (1.96), which is close.
+_T_CRIT_975 = {
+    1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571,
+    6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228,
+    11: 2.201, 12: 2.179, 13: 2.160, 14: 2.145, 15: 2.131,
+    16: 2.120, 17: 2.110, 18: 2.101, 19: 2.093, 20: 2.086,
+    21: 2.080, 22: 2.074, 23: 2.069, 24: 2.064, 25: 2.060,
+    26: 2.056, 27: 2.052, 28: 2.048, 29: 2.045, 30: 2.042,
+}
+
+
+def _t_crit_975(df):
+    """Return t critical value for 95% CI (two-sided), alpha=0.05."""
+    try:
+        dfi = int(df)
+    except Exception:
+        return 1.96
+    if dfi <= 0:
+        return None
+    if dfi in _T_CRIT_975:
+        return _T_CRIT_975[dfi]
+    return 1.96
+
+
+def _clean_numeric_list(values):
+    """Return a list of finite floats, dropping None/NaN/inf."""
+    if values is None:
+        return []
+    out = []
+    for v in values:
+        try:
+            if v is None:
+                continue
+            fv = float(v)
+            if not np.isfinite(fv):
+                continue
+            out.append(fv)
+        except Exception:
+            continue
+    return out
+
+
+def mean_std_ci95(values):
+    """Compute mean/std and 95% CI across a list of per-run samples.
+
+    Returns dict with keys:
+      n, mean, std, ci95_low, ci95_high, ci95_halfwidth
+
+    CI uses Student's t with df=n-1. For n<2, CI fields are None.
+    std is sample std (ddof=1) when n>=2; otherwise None.
+    """
+    vals = _clean_numeric_list(values)
+    n = len(vals)
+    if n == 0:
+        return {
+            'n': 0, 'mean': None, 'std': None,
+            'ci95_low': None, 'ci95_high': None, 'ci95_halfwidth': None
+        }
+    meanv = float(np.mean(vals))
+    if n < 2:
+        return {
+            'n': n, 'mean': meanv, 'std': None,
+            'ci95_low': None, 'ci95_high': None, 'ci95_halfwidth': None
+        }
+    try:
+        stdv = float(np.std(vals, ddof=1))
+    except Exception:
+        stdv = None
+    tcrit = _t_crit_975(n - 1)
+    if stdv is None or tcrit is None:
+        return {
+            'n': n, 'mean': meanv, 'std': stdv,
+            'ci95_low': None, 'ci95_high': None, 'ci95_halfwidth': None
+        }
+    half = float(tcrit * stdv / math.sqrt(float(n)))
+    return {
+        'n': n,
+        'mean': meanv,
+        'std': stdv,
+        'ci95_low': meanv - half,
+        'ci95_high': meanv + half,
+        'ci95_halfwidth': half,
+    }
+
+
+def _stats_map_from_arch_rows(rows_by_arch):
+    """Convert dict[arch] -> list[(participants, value)] into dict[arch][participants] -> list[value]."""
+    out = defaultdict(lambda: defaultdict(list))
+    for arch, rows in (rows_by_arch or {}).items():
+        for participants, val in (rows or []):
+            try:
+                p = int(participants)
+            except Exception:
+                p = participants
+            if val is None:
+                continue
+            out[arch][p].append(val)
+    return out
+
+
+def write_ci95_by_participants(stats_map, analysis_folder, out_csv_name, out_svg_name, ylabel):
+    """Write a per-point 95% CI summary CSV and a CI half-width plot.
+
+    stats_map: dict[arch][participants] -> list(per-run values)
+    """
+    rows = []
+    for arch, by_p in (stats_map or {}).items():
+        for participants, vals in (by_p or {}).items():
+            s = mean_std_ci95(vals)
+            rows.append({
+                'Architecture': arch,
+                'Participants': int(participants) if participants is not None else None,
+                'N': s.get('n'),
+                'Mean': s.get('mean'),
+                'Std': s.get('std'),
+                'CI95_Low': s.get('ci95_low'),
+                'CI95_High': s.get('ci95_high'),
+                'CI95_HalfWidth': s.get('ci95_halfwidth'),
+            })
+
+    out_df = pd.DataFrame(rows)
+    if out_df.empty:
+        return
+    try:
+        out_df = out_df.sort_values(by=['Architecture', 'Participants'], kind='mergesort')
+    except Exception:
+        pass
+
+    out_path = os.path.join(analysis_folder, out_csv_name)
+    try:
+        out_df.to_csv(out_path, index=False, sep=';')
+        print('Wrote CI95 summary to', out_path)
+    except Exception as e:
+        print(f'WARNING: Failed to write CI95 CSV {out_path}: {e}')
+
+    # Plot CI half-width per architecture vs participants.
+    try:
+        fig, ax = plt.subplots(figsize=FIGSIZE)
+        archs = _sorted_arch_keys(out_df['Architecture'].dropna().unique())
+        cmap = get_color_map(archs)
+        max_val = 0.0
+        for i, arch in enumerate(archs):
+            g = out_df[out_df['Architecture'] == arch].copy()
+            # Ensure numeric participants and CI values
+            g['Participants'] = pd.to_numeric(g['Participants'], errors='coerce')
+            g['CI95_HalfWidth'] = pd.to_numeric(g['CI95_HalfWidth'], errors='coerce')
+            g = g.dropna(subset=['Participants', 'CI95_HalfWidth'])
+            if g.empty:
+                continue
+            g = g.sort_values('Participants', kind='mergesort')
+            xs = g['Participants'].astype(int).tolist()
+            ys = g['CI95_HalfWidth'].astype(float).tolist()
+            if ys:
+                try:
+                    max_val = max(max_val, float(np.nanmax(ys)))
+                except Exception:
+                    pass
+            ax.plot(xs, ys, marker=_arch_marker(arch, i), label=str(arch).replace('_', ' '), color=cmap.get(arch))
+
+        ax.set_xlabel(GRAPH_NUM_CLIENT_LABEL)
+        ax.set_ylabel(ylabel)
+        ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
+        try:
+            xt = sorted(set(int(x) for x in out_df['Participants'].dropna().unique()))
+            ax.set_xticks(xt)
+        except Exception:
+            pass
+        if max_val and max_val > 0:
+            ax.set_ylim(0, max_val * 1.05)
+        else:
+            ax.set_ylim(0, 1)
+        ncol = len(archs) if len(archs) <= 3 else math.ceil(len(archs) / 2)
+        ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.35),  ncol=ncol, prop={'size': 10})
+        plt.tight_layout()
+        svg_path = os.path.join(analysis_folder, out_svg_name)
+        fig.savefig(svg_path)
+        plt.close(fig)
+        print('Wrote CI95 half-width plot to', svg_path)
+    except Exception as e:
+        print(f'WARNING: Failed to create CI95 half-width plot {out_svg_name}: {e}')
+
+
 def _arch_marker(arch_name, fallback_index=0):
     """Return a matplotlib marker for a given architecture.
 
@@ -1956,6 +2140,45 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
     lat_out.to_csv(lat_csv, index=False, sep=';')
     print('Wrote latency summary to', lat_csv)
 
+    # CI95 across runs for latency metrics (per arch/participants).
+    # Note: for dataset-driven runs, `avg_latency_ms` (participant-side) may be empty
+    # while `avg_network_latency_ms` is populated.
+    try:
+        # Total/participant latency (if present)
+        lat_stats = defaultdict(lambda: defaultdict(list))
+        # Dataset/network latency (if present)
+        net_stats = defaultdict(lambda: defaultdict(list))
+        for _, r in lat_df.iterrows():
+            arch = r.get('arch')
+            parts = r.get('participants')
+            val_total = r.get('avg_latency_ms')
+            val_net = r.get('avg_network_latency_ms')
+            if arch is None or parts is None:
+                continue
+            try:
+                parts_i = int(parts)
+            except Exception:
+                parts_i = parts
+            if val_total is not None:
+                lat_stats[arch][parts_i].append(val_total)
+            if val_net is not None:
+                net_stats[arch][parts_i].append(val_net)
+
+        # Participant/total latency CI (may be empty)
+        write_ci95_by_participants(lat_stats,
+                                  ANALYSIS_FOLDER,
+                                  out_csv_name='latency_ci95_by_participants.csv',
+                                  out_svg_name='latency_ci95_halfwidth.svg',
+                                  ylabel='Latency 95% CI half-width (ms)')
+        # Network latency CI (useful for dataset-based latency experiments)
+        write_ci95_by_participants(net_stats,
+                                  ANALYSIS_FOLDER,
+                                  out_csv_name='network_latency_ci95_by_participants.csv',
+                                  out_svg_name='network_latency_ci95_halfwidth.svg',
+                                  ylabel='Network latency 95% CI half-width (ms)')
+    except Exception as e:
+        print(f'WARNING: Failed to compute/write latency CI95 summary: {e}')
+
     try:
         expected_runs = {}
         for arch, entries in arch_map.items():
@@ -2426,8 +2649,9 @@ def write_root_latency_summary(scenarios, ROOT_FOLDER):
 
     - `scenarios` is a list of scenario folder names under ROOT_FOLDER
     - Reads each `ROOT_FOLDER/analysis/<scenario>/latency_summary.csv` if present
-    - Detects latency type from the scenario name (lat-none, lat-local, lat-global)
-    - Groups by (LatencyType, Architecture, Participants) and averages `Avg. Latency(ms)`
+        - Detects latency type from the scenario name (lat-none, lat-local, lat-global, lat-dataset)
+        - Groups by (LatencyType, Architecture, Participants) and averages a per-scenario latency column
+            (prefers `Avg. Latency(ms)`, falls back to `Avg. Network Latency(ms)` when needed)
     - Writes `ROOT_FOLDER/analysis/latency_root_summary.csv` and
       `ROOT_FOLDER/analysis/latency_root_linechart.svg`.
     """
@@ -2449,19 +2673,27 @@ def write_root_latency_summary(scenarios, ROOT_FOLDER):
         if df.empty:
             continue
         sname = scenario.lower()
-        # Only accept the predetermined latency types to keep code minimal.
+        # Only accept known latency types.
         if 'lat-none' in sname:
             ltype = 'none'
         elif 'lat-local' in sname:
             ltype = 'local'
         elif 'lat-global' in sname:
             ltype = 'global'
+        elif 'lat-dataset' in sname:
+            ltype = 'dataset'
         else:
             # skip scenarios that are not one of the three known latency types
             continue
 
         # assume `process_latency_rows` produced these canonical columns
-        if not {'Architecture', 'Participants', 'Avg. Latency(ms)'}.issubset(set(df.columns)):
+        # NOTE: dataset-based experiments may not populate Avg. Latency(ms), but do populate Avg. Network Latency(ms).
+        cols = set(df.columns)
+        if not {'Architecture', 'Participants'}.issubset(cols):
+            continue
+        has_total_latency = 'Avg. Latency(ms)' in cols
+        has_network_latency = 'Avg. Network Latency(ms)' in cols
+        if not (has_total_latency or has_network_latency):
             continue
 
         # Try to extract resolution and upload-limit (upload bitrate configuration) from scenario name
@@ -2470,7 +2702,7 @@ def write_root_latency_summary(scenarios, ROOT_FOLDER):
         for token in scenario.split('_'):
             if res is None and 'x' in token and token.split('x', 1)[0].isdigit():
                 res = token
-            # tokens like 'ul-all1', 'ul-all10', 'ul-500kbps' etc.
+            # tokens like 'ul-all1000', 'ul-matchdl', 'ul-500kbps' etc.
             if upload is None and token.lower().startswith('ul'):
                 upload = token
 
@@ -2502,7 +2734,11 @@ def write_root_latency_summary(scenarios, ROOT_FOLDER):
             except Exception as e:
                 print(f'WARNING: Failed to convert participants to int: {e}')
                 parts = None
-            latv = r['Avg. Latency(ms)']
+            latv = None
+            if has_total_latency:
+                latv = r.get('Avg. Latency(ms)')
+            if (latv is None or pd.isna(latv)) and has_network_latency:
+                latv = r.get('Avg. Network Latency(ms)')
             try:
                 latv = float(latv) if pd.notna(latv) else None
             except Exception as e:
@@ -2533,8 +2769,8 @@ def write_root_latency_summary(scenarios, ROOT_FOLDER):
     # For each unique (Upload, Resolution) pair produce a separate latency linechart
     uploads = sorted(agg['Upload'].dropna().unique())
     resolutions = sorted(agg['Resolution'].dropna().unique())
-    linestyle_map = {'none': '-', 'local': '--', 'global': ':'}
-    latency_types = ['global', 'local', 'none']
+    linestyle_map = {'none': '-', 'local': '--', 'global': ':', 'dataset': '-.'}
+    latency_types = ['global', 'local', 'none', 'dataset']
     markers=MARKERS
 
     for up in uploads:
@@ -2926,6 +3162,25 @@ def process_scenario(ROOT_FOLDER, scenario):
 
     # Prepare PSNR mean/std and write diagnostics
     psnr_mean, psnr_std = build_psnr_dfs(psnr_stats)
+
+    # CI95 across runs for PSNR and CPU (per arch/participants)
+    try:
+        write_ci95_by_participants(psnr_stats,
+                                  ANALYSIS_FOLDER,
+                                  out_csv_name='psnr_ci95_by_participants.csv',
+                                  out_svg_name='psnr_ci95_halfwidth.svg',
+                                  ylabel='PSNR 95% CI half-width (dB)')
+    except Exception as e:
+        print(f'WARNING: Failed to compute/write PSNR CI95 summary: {e}')
+    try:
+        cpu_stats = _stats_map_from_arch_rows(cpu_results)
+        write_ci95_by_participants(cpu_stats,
+                                  ANALYSIS_FOLDER,
+                                  out_csv_name='cpu_ci95_by_participants.csv',
+                                  out_svg_name='cpu_ci95_halfwidth.svg',
+                                  ylabel='CPU 95% CI half-width (%)')
+    except Exception as e:
+        print(f'WARNING: Failed to compute/write CPU CI95 summary: {e}')
     # Create and save first-vs-others PSNR and measured-bandwidth plots using
     # aggregators populated during accumulation.
     try:

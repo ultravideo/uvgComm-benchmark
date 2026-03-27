@@ -81,6 +81,10 @@ LATENCY_MODES=${LATENCY_MODES:-none}
 # LATENCY_SEED: reproducible node selection seed
 LATENCY_SEED=${LATENCY_SEED:-1}
 
+# Base seed used to derive a deterministic per-run seed in dataset-* modes.
+# This ensures all scenarios with the same run_index pick the same nodes.
+LATENCY_SEED_BASE=${LATENCY_SEED}
+
 # Dataset cache directory (downloaded NetLatency-Data repo is stored here)
 DATASET_CACHE_DIR=${DATASET_CACHE_DIR:-./datasets/NetLatency-Data}
 
@@ -90,11 +94,7 @@ PROCESSED_DATASET_DIR=${PROCESSED_DATASET_DIR:-./datasets/netlatency_processed}
 # Send bandwidth mode (affects per-client `upBandwidth` in generated configs)
 # Allowed values:
 #  - all1000 : every client gets 1000 Mbps (default)
-#  - all10   : every client gets 10 Mbps
-#  - all1    : every client gets 1 Mbps
-#  - inc1    : each client gets i * 1 Mbps
-#  - inc5    : each client gets i * 5 Mbps
-#  - inc10   : each client gets i * 10 Mbps
+#  - matchdl : every client gets upload Mbps equal to the scenario download Mbps
 SEND_BW_MODE=${SEND_BW_MODE:-all1000}
 
 
@@ -113,7 +113,7 @@ Options:
     -v VISIBLE     Number of visible participants in gallery view (default: ${VISIBLE_PARTICIPANTS}).
     -e SECONDS     Evaluation period in seconds (default: ${EXPERIMENT_TIME}).
     -l MODES       Simulated latency mode(s): none|local|global|dataset-PlanetLab|dataset-Seattle (comma-separated list). Defaults to ${LATENCY_MODES}
-    -b MODE        Send bandwidth mode (all1000|all10|all1|inc1|inc5|inc10) or comma-separated list. Defaults to ${SEND_BW_MODE}
+    -b MODE        Send bandwidth mode (all1000|matchdl) or comma-separated list. Defaults to ${SEND_BW_MODE}
     -h             Show this help
 EOF
 }
@@ -133,6 +133,16 @@ format_duration_hms() {
     local minutes=$(( (total_seconds % 3600) / 60 ))
     local seconds=$(( total_seconds % 60 ))
     printf "%d days %d hours %d minutes %d seconds" "$days" "$hours" "$minutes" "$seconds"
+}
+
+dataset_seed_for_run_index() {
+    # Deterministic pseudo-random seed derived from a base seed and 1-based run_index.
+    # Purpose: all scenarios with the same run_index use the same selected nodes.
+    # Derivation: seed = sha256(f"{base_seed}:{run_index}") reduced to a 31-bit positive integer.
+    # This avoids arbitrary-looking constants while remaining stable and reproducible.
+    local base_seed="$1"
+    local run_index="$2"
+    python3 "./dataset_latency.py" derive-seed --base-seed "$base_seed" --run-index "$run_index"
 }
 
 # Small extra time added to the countdown to avoid cleaning up a run while the
@@ -231,9 +241,9 @@ validate_params() {
     fi
 
     # validate send bandwidth mode(s) (comma-separated values allowed)
-    local bw_re='^(all1000|all10|all1|inc1|inc5|inc10)(,(all1000|all10|all1|inc1|inc5|inc10))*$'
+    local bw_re='^(all1000|matchdl)(,(all1000|matchdl))*$'
     if ! [[ "$SEND_BW_MODE" =~ $bw_re ]]; then
-        echo "ERROR: Unknown send bandwidth mode '$SEND_BW_MODE' (allowed: all1000,all1,inc1,inc5,inc10 or comma-separated list)" >&2; exit 1
+        echo "ERROR: Unknown send bandwidth mode '$SEND_BW_MODE' (allowed: all1000,matchdl or comma-separated list)" >&2; exit 1
     fi
 
     if ! [[ "$CLIENTS_LIST" =~ $clients_re ]]; then
@@ -481,6 +491,7 @@ write_metadata() {
         if latency_is_dataset_mode "$latency"; then
             ds=$(dataset_name_from_latency_mode "$latency")
             echo "Latency_Dataset: ${ds}"
+            echo "Latency_Seed_Base: ${LATENCY_SEED_BASE}"
             echo "Latency_Seed: ${LATENCY_SEED}"
             echo "Latency_Aggregation: avg_all_slices"
             echo "Latency_Model: oneway=rtt/2"
@@ -594,13 +605,14 @@ prepare_archive() {
 generate_client_configs() {
     # Generate per-client configs from template configs/uvgComm_client.ini.
     # Idempotent: overwrite files so per-scenario settings apply.
-    # Usage: generate_client_configs [send_bw_mode] [view_mode] [num_clients]
+    # Usage: generate_client_configs [send_bw_mode] [view_mode] [num_clients] [download_bw_mbps]
     # If send_bw_mode is not provided, fall back to global SEND_BW_MODE.
     # If view_mode is not provided, fall back to global VIEW_MODE.
     # If num_clients is not provided, fall back to global MAX_CLIENTS.
     local send_bw_mode="${1:-${SEND_BW_MODE}}"
     local view_mode="${2:-${VIEW_MODE}}"
     local num_clients="${3:-${MAX_CLIENTS}}"
+    local download_bw_mbps="${4:-}"
     local template="${CONFIG_FOLDER}/uvgComm_client.ini"
     mkdir -p "${CONFIG_FOLDER}"
 
@@ -686,20 +698,14 @@ generate_client_configs() {
             all1000)
                 upload_bps=$((1000 * 1000000))
                 ;;
-            all10)
-                upload_bps=$((10 * 1000000))
-                ;;
-            all1)
-                upload_bps=$((1 * 1000000))
-                ;;
-            inc1)
-                upload_bps=$(( i * 1000000 ))
-                ;;
-            inc5)
-                upload_bps=$(( i * 5000000 ))
-                ;;
-            inc10)
-                upload_bps=$(( i * 10000000 ))
+            matchdl)
+                # Match the scenario's download bandwidth (Mbps) for every client.
+                # download_bw_mbps may be a float string like "6.0".
+                if [ -n "${download_bw_mbps}" ]; then
+                    upload_bps=$(awk "BEGIN {printf \"%d\", (${download_bw_mbps}) * 1000000}")
+                else
+                    upload_bps=$((1000 * 1000000))
+                fi
                 ;;
             *)
                 # Fallback to the default all1000 behavior instead of an unexpected incremental value
@@ -1347,6 +1353,10 @@ run_scenario() {
 
     for run_index in $(seq 1 "$RUN_COUNT"); do
 
+        # Default to the base seed at the start of each run. Dataset modes may
+        # override this to an effective per-run-index seed below.
+        LATENCY_SEED="${LATENCY_SEED_BASE}"
+
         # Per-run dataset metadata (set only for dataset-* latency modes)
         DATASET_PREPARED_FILE=""
         DATASET_SELECTED_NODES=""
@@ -1392,6 +1402,11 @@ run_scenario() {
                 echo "ERROR: Dataset latency requested (${LATENCY_MODE_PARAM}) but mean RTT matrix file not found. Ensure prepare_tests ran and succeeded." >&2
                 exit 1
             fi
+
+            # IMPORTANT: Use a deterministic per-run-index seed so that
+            # all scenarios with the same run_index select the same nodes.
+            LATENCY_SEED="$(dataset_seed_for_run_index "${LATENCY_SEED_BASE}" "${run_index}")"
+
             LATENCY_FILE="$mean_matrix_file"
             DATASET_PREPARED_FILE="$mean_matrix_file"
             DATASET_SELECTED_NODES=$(python3 "./dataset_latency.py" nodes --mean-matrix "$mean_matrix_file" --clients "$CLIENTS" --seed "${LATENCY_SEED}" 2>/dev/null || echo "")
@@ -1400,21 +1415,44 @@ run_scenario() {
             # so it is easy to audit selections across all scenarios/runs.
             local root_nodes_csv="${RUN_FOLDER}/latency_nodes.csv"
             if [ ! -f "${root_nodes_csv}" ]; then
-                echo "scenario_tag;run_index;arch;clients;resolution;ul_mode;view;dataset;seed;mean_matrix_file;host_node;client_nodes;selected_nodes" > "${root_nodes_csv}"
+                echo "scenario_tag;run_index;arch;clients;resolution;ul_mode;view;dataset;seed_base;seed_effective;mean_matrix_file;host_node;client_nodes;selected_nodes" > "${root_nodes_csv}"
             fi
             local host_node_idx=""
             local client_node_idxs=""
             host_node_idx=$(printf "%s" "${DATASET_SELECTED_NODES}" | sed -n 's/.*host=\([0-9][0-9]*\).*/\1/p')
             client_node_idxs=$(printf "%s" "${DATASET_SELECTED_NODES}" | sed -n 's/.*clients=\(.*\)$/\1/p')
-            echo "${scen_tag};${run_index};${ARCHITECTURE};${CLIENTS};${RESOLUTION};${UPLOAD_MODE};${VIEW_MODE};${ds};${LATENCY_SEED};${mean_matrix_file};${host_node_idx};${client_node_idxs};${DATASET_SELECTED_NODES}" >> "${root_nodes_csv}"
+            echo "${scen_tag};${run_index};${ARCHITECTURE};${CLIENTS};${RESOLUTION};${UPLOAD_MODE};${VIEW_MODE};${ds};${LATENCY_SEED_BASE};${LATENCY_SEED};${mean_matrix_file};${host_node_idx};${client_node_idxs};${DATASET_SELECTED_NODES}" >> "${root_nodes_csv}"
 
             # Write chosen node indices into the run folder for transparency.
             {
                 echo "dataset=${ds}"
+                echo "seed_base=${LATENCY_SEED_BASE}"
                 echo "seed=${LATENCY_SEED}"
                 echo "mean_matrix_file=${mean_matrix_file}"
                 echo "selected_nodes=${DATASET_SELECTED_NODES}"
             } > "${run_output_folder}/latency_nodes.txt"
+
+            # Log expected SFU penalty (direct client->client vs via-SFU) for this scenario.
+            # This is independent of the architecture being run; it's a property of the selected nodes.
+            python3 "./dataset_latency.py" sfu-penalty \
+                --mean-matrix "$mean_matrix_file" \
+                --clients "$CLIENTS" \
+                --seed "${LATENCY_SEED}" \
+                --net-prefix "172.28.0." \
+                > "${run_output_folder}/sfu_penalty.csv" 2>/dev/null || true
+
+            # Root-level summary (one row per scenario/run).
+            local root_penalty_csv="${RUN_FOLDER}/sfu_penalty_summary.csv"
+            if [ ! -f "${root_penalty_csv}" ]; then
+                echo "scenario_tag;run_index;arch;clients;resolution;ul_mode;view;dataset;seed_base;seed_effective;pairs;direct_faster;via_sfu_faster;ties;penalty_min;penalty_p50;penalty_p95;penalty_max" > "${root_penalty_csv}"
+            fi
+            if [ -s "${run_output_folder}/sfu_penalty.csv" ]; then
+                local metrics
+                metrics=$(python3 "./dataset_latency.py" sfu-penalty-summary --penalty-csv "${run_output_folder}/sfu_penalty.csv" 2>/dev/null || echo "")
+                if [ -n "${metrics}" ]; then
+                    echo "${scen_tag};${run_index};${ARCHITECTURE};${CLIENTS};${RESOLUTION};${UPLOAD_MODE};${VIEW_MODE};${ds};${LATENCY_SEED_BASE};${LATENCY_SEED};${metrics}" >> "${root_penalty_csv}"
+                fi
+            fi
         fi
 
          write_metadata "$scen_tag" "$ARCHITECTURE" "$CLIENTS" "$RESOLUTION" \
@@ -1423,7 +1461,7 @@ run_scenario() {
 
         create_host "$run_output_folder" "$ARCHITECTURE" "$CLIENTS" "$RESOLUTION" "$DOWNLOAD_BW" "$warmup_time_ms" "$experiment_time_ms" "$cooldown_time_ms" "$LATENCY_MODE_PARAM" "$LATENCY_FILE"
 
-        generate_client_configs "${UPLOAD_MODE}" "${VIEW_MODE}" "${CLIENTS}" || true
+        generate_client_configs "${UPLOAD_MODE}" "${VIEW_MODE}" "${CLIENTS}" "${DOWNLOAD_BW}" || true
         create_clients "$CLIENTS" "$INPUT_FILE" "$run_output_folder" "$ARCHITECTURE" "$LATENCY_MODE_PARAM" "$LATENCY_FILE"
 
         # Start bandwidth monitor (polling interval 1s) - writes per-container CSVs

@@ -20,6 +20,7 @@ The script writes CSV summaries and SVG/PNG plots under <timestamp_folder>/analy
 import math
 import os
 import glob
+import re
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
@@ -166,21 +167,6 @@ def mean_std_ci95(values):
         'ci95_high': meanv + half,
         'ci95_halfwidth': half,
     }
-
-
-def _stats_map_from_arch_rows(rows_by_arch):
-    """Convert dict[arch] -> list[(participants, value)] into dict[arch][participants] -> list[value]."""
-    out = defaultdict(lambda: defaultdict(list))
-    for arch, rows in (rows_by_arch or {}).items():
-        for participants, val in (rows or []):
-            try:
-                p = int(participants)
-            except Exception:
-                p = participants
-            if val is None:
-                continue
-            out[arch][p].append(val)
-    return out
 
 
 def write_ci95_by_participants(stats_map, analysis_folder, out_csv_name, out_svg_name, ylabel):
@@ -1619,6 +1605,7 @@ def setup_analysis_folders(ROOT_FOLDER, scenario):
     ensure_dir(base_analysis)
     scenario_analysis = os.path.join(base_analysis, scenario)
     ensure_dir(scenario_analysis)
+
     return scenario_analysis
 
 
@@ -1864,7 +1851,25 @@ def accumulate_run_results(metrics, arch, participants, run_path,
         print(f'WARNING: Failed to aggregate speaker-vs-listeners latency: {e}')
 
     # latency/encode/decode
-    latency_rows.append({'arch': arch, 'participants': parts_eff,
+    run_num = None
+    try:
+        md = metrics.get('metadata') or {}
+        # Prefer explicit Run value from metadata if present
+        if md.get('Run') not in (None, ''):
+            run_num = int(md.get('Run'))
+    except Exception:
+        run_num = None
+    if run_num is None:
+        try:
+            # Fallback: parse from run folder name like run_1, run-2, etc.
+            base = os.path.basename(str(run_path)) if run_path is not None else ''
+            m = re.search(r'\brun[_-]?(\d+)\b', base, flags=re.IGNORECASE)
+            if m:
+                run_num = int(m.group(1))
+        except Exception:
+            run_num = None
+
+    latency_rows.append({'arch': arch, 'participants': parts_eff, 'run': run_num,
                          'avg_latency_ms': metrics.get('avg_latency_ms'),
                          'avg_network_latency_ms': metrics.get('avg_network_latency_ms'),
                          'avg_encode_ms': metrics.get('avg_encode_ms'),
@@ -2132,10 +2137,18 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
 
     lat_out = lat_df.rename(columns={
         'arch': 'Architecture', 'participants': 'Participants',
+        'run': 'Run',
         'avg_latency_ms': 'Avg. Latency(ms)', 'avg_network_latency_ms': 'Avg. Network Latency(ms)',
         'avg_encode_ms': 'Avg. Encoding Time (ms)',
         'avg_decode_ms': 'Avg. Decoding Time (ms)'
     })
+    # Keep output deterministic and easier to inspect.
+    try:
+        sort_cols = [c for c in ['Architecture', 'Participants', 'Run'] if c in lat_out.columns]
+        if sort_cols:
+            lat_out = lat_out.sort_values(by=sort_cols, kind='mergesort')
+    except Exception:
+        pass
     lat_csv = os.path.join(ANALYSIS_FOLDER, f'latency_summary.csv')
     lat_out.to_csv(lat_csv, index=False, sep=';')
     print('Wrote latency summary to', lat_csv)
@@ -3163,24 +3176,6 @@ def process_scenario(ROOT_FOLDER, scenario):
     # Prepare PSNR mean/std and write diagnostics
     psnr_mean, psnr_std = build_psnr_dfs(psnr_stats)
 
-    # CI95 across runs for PSNR and CPU (per arch/participants)
-    try:
-        write_ci95_by_participants(psnr_stats,
-                                  ANALYSIS_FOLDER,
-                                  out_csv_name='psnr_ci95_by_participants.csv',
-                                  out_svg_name='psnr_ci95_halfwidth.svg',
-                                  ylabel='PSNR 95% CI half-width (dB)')
-    except Exception as e:
-        print(f'WARNING: Failed to compute/write PSNR CI95 summary: {e}')
-    try:
-        cpu_stats = _stats_map_from_arch_rows(cpu_results)
-        write_ci95_by_participants(cpu_stats,
-                                  ANALYSIS_FOLDER,
-                                  out_csv_name='cpu_ci95_by_participants.csv',
-                                  out_svg_name='cpu_ci95_halfwidth.svg',
-                                  ylabel='CPU 95% CI half-width (%)')
-    except Exception as e:
-        print(f'WARNING: Failed to compute/write CPU CI95 summary: {e}')
     # Create and save first-vs-others PSNR and measured-bandwidth plots using
     # aggregators populated during accumulation.
     try:

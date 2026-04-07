@@ -1473,13 +1473,43 @@ def _client_crash_reason(run_path, client_num):
     return None
 
 
+_DUPLICATE_POC_PHRASE = 'Duplicate POC in a sequence'
+
+
+def _count_duplicate_poc_in_log(log_path):
+    """Count occurrences of the HEVC decoder warning about duplicate POC.
+
+    We intentionally match by substring (not full regex) to keep this fast and
+    robust across different ffmpeg log formats.
+
+    Returns an int count, or None if the log could not be read.
+    """
+    if not log_path or (not os.path.isfile(log_path)):
+        return 0
+    try:
+        count = 0
+        with open(log_path, 'r', errors='ignore') as f:
+            for line in f:
+                if _DUPLICATE_POC_PHRASE in line:
+                    count += 1
+        return int(count)
+    except Exception as e:
+        print(f'WARNING: Failed to scan docker.log for duplicate POC: {log_path}: {e}')
+        return None
+
+
 def write_diagnostics(presence_records, missing_records, analysis_folder):
     """Write per-run diagnostics CSVs with one row per run+client.
 
     Writes one CSV per architecture under `analysis_folder` and omits the
     Architecture column from those outputs.
 
-    Status is one of: OK, missing frames, broken
+        Status is one of: OK, missing frames, broken
+
+        Notes on the "Receivers missing our frames" column:
+            - Each diagnostics row represents a *sender* client (the local trace owner).
+            - The column lists receiver client ids that did not receive frames from
+                this sender (based on missing-frame detection).
     """
     pres_df = pd.DataFrame(presence_records)
     miss_df = pd.DataFrame(missing_records)
@@ -1550,8 +1580,9 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
             local_yesno = 'yes' if localc else 'no'
             rows.append({'RunPath': runp, 'Architecture': arch, 'Participants': parts, 'Run': run_number,
                          'Client': client, 'Local results': local_yesno, 'Participant results': partc,
-                         'Analyzed Frames': analyzed, 'Frames Lost': frames_lost, 'Missing Participants': partners_str,
+                         'Analyzed Frames': analyzed, 'Frames Lost': frames_lost, 'Receivers with missing': partners_str,
                          'Max Encode (ms)': p.get('max_encode_ms'), 'Max Decode (ms)': p.get('max_decode_ms'),
+                         'Duplicate POC refs': p.get('duplicate_poc_count'),
                          'Status': status})
     else:
         # No presence records: still write a row per missing record (or one OK row)
@@ -1567,22 +1598,25 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
                 rows.append({'RunPath': runp, 'Architecture': arch, 'Participants': parts, 'Run': run_number,
                              'Client': client, 'Local results': 'no', 'Participant results': 0,
                              'Analyzed Frames': int(val.get('analyzed_frames', 0)),
-                             'Frames Lost': frames_lost, 'Missing Participants': partners_str,
+                             'Frames Lost': frames_lost, 'Receivers with missing': partners_str,
                              'Max Encode (ms)': None, 'Max Decode (ms)': None,
+                             'Duplicate POC refs': None,
                              'Status': ('missing frames' if frames_lost > 0 else 'OK')})
         else:
             rows.append({'RunPath': None, 'Architecture': None, 'Participants': None, 'Run': None,
                          'Client': None, 'Local results': 0, 'Participant results': 0,
-                         'Analyzed Frames': 0, 'Frames Lost': 0, 'Missing Participants': '', 
-                         'Max Encode (ms)': None, 'Max Decode (ms)': None, 'Status': 'OK'})
+                         'Analyzed Frames': 0, 'Frames Lost': 0, 'Receivers with missing': '', 
+                         'Max Encode (ms)': None, 'Max Decode (ms)': None,
+                         'Duplicate POC refs': None,
+                         'Status': 'OK'})
 
     # Notify user that sorting is starting, then sort rows using a module-level helper.
     print(f"Sorting diagnostics {len(rows)} rows...")
     rows = sorted(rows, key=_diagnostics_sort_key)
 
     cols = ['RunPath', 'Architecture', 'Participants', 'Run', 'Client',
-            'Local results', 'Participant results', 'Analyzed Frames', 'Frames Lost', 'Missing Participants',
-            'Max Encode (ms)', 'Max Decode (ms)', 'Status']
+            'Local results', 'Participant results', 'Analyzed Frames', 'Frames Lost', 'Receivers with missing',
+            'Max Encode (ms)', 'Max Decode (ms)', 'Duplicate POC refs', 'Status']
     diag_df = pd.DataFrame(rows, columns=cols)
 
     # Split into one CSV per architecture and drop the Architecture column.
@@ -1618,6 +1652,15 @@ def collect_presence_records_for_run(run_path, arch, participants):
     """
     # gather all client folders first (unfiltered)
     client_folders_all = sorted([p for p in glob.glob(os.path.join(run_path, 'uvgcomm-client*')) if os.path.isdir(p)])
+
+    # Pre-scan docker.log once per client folder so filtered/unfiltered record
+    # building doesn't re-read the same log file.
+    dup_poc_by_folder = {}
+    for cf in client_folders_all:
+        try:
+            dup_poc_by_folder[cf] = _count_duplicate_poc_in_log(os.path.join(cf, 'docker.log'))
+        except Exception:
+            dup_poc_by_folder[cf] = None
 
     # determine visible limit (may be None)
     visible_limit = None
@@ -1690,6 +1733,7 @@ def collect_presence_records_for_run(run_path, arch, participants):
                          'local_present': local_present, 'part_present': part_present,
                          'local_valid': local_valid, 'part_valid': part_valid,
                          'local_count': local_count, 'part_count': part_count,
+                         'duplicate_poc_count': dup_poc_by_folder.get(cf),
                          'code': code, 'run_path': run_path})
         return recs
 

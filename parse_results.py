@@ -2283,10 +2283,10 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                 fig, ax = plt.subplots(figsize=FIGSIZE)
                 ax.text(0.5, 0.5, 'No latency available to plot', ha='center', va='center')
                 ax.axis('off')
-                line_out = os.path.join(ANALYSIS_FOLDER, 'latency_encode_decode_network_linechart.svg')
+                line_out = os.path.join(ANALYSIS_FOLDER, 'latency_network_linechart.svg')
                 fig.savefig(line_out)
                 plt.close(fig)
-                print('Wrote placeholder latency linechart to', line_out)
+                print('Wrote placeholder network latency linechart to', line_out)
             else:
                 # Build mean/std DataFrames similar to PSNR plotting helper
                 participants_idx = valid_parts
@@ -2294,7 +2294,6 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                 std_df = pd.DataFrame(index=participants_idx)
                 arch_keys = _sorted_arch_keys({r['arch'] for r in agg_rows})
                 for arch in arch_keys:
-                    #vals_map = {int(r['participants']): float(r['mean_encode'] + r['mean_decode'] + r['mean_network']) for r in agg_rows if r['arch'] == arch and r.get('mean_encode') is not None and r.get('mean_decode') is not None and r.get('mean_network') is not None}
                     vals_map = {int(r['participants']): float(r['mean_network']) for r in agg_rows if r['arch'] == arch and r.get('mean_network') is not None}
                     means = []
                     stds = []
@@ -2342,22 +2341,108 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                 ncol = len(mean_df.columns) if len(mean_df.columns) <= 3 else math.ceil(len(mean_df.columns) / 2)
                 ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.35),  ncol=ncol, prop={'size': 10})
                 plt.tight_layout()
-                line_out = os.path.join(ANALYSIS_FOLDER, 'latency_encode_decode_network_linechart.svg')
+                line_out = os.path.join(ANALYSIS_FOLDER, 'latency_network_linechart.svg')
                 fig.savefig(line_out)
                 # Write plotted data to CSV
                 try:
-                    out_csv = os.path.join(ANALYSIS_FOLDER, 'latency_encode_decode_network_linechart_data.csv')
+                    out_csv = os.path.join(ANALYSIS_FOLDER, 'latency_network_linechart_data.csv')
                     # Create a dataframe with Participants (index) and latency for each architecture
                     csv_df = mean_df.copy()
                     csv_df.index.name = 'Participants'
                     csv_df.to_csv(out_csv, sep=';')
-                    print('Saved latency data to:', out_csv)
+                    print('Saved network latency data to:', out_csv)
                 except Exception as e:
-                    print(f'WARNING: Failed to write latency data CSV: {e}')
+                    print(f'WARNING: Failed to write network latency data CSV: {e}')
                 plt.close(fig)
-                print('Wrote latency encode+decode+network linechart to', line_out)
+                print('Wrote network latency linechart to', line_out)
+
+            # Total latency linechart: encoding + decoding + network
+            try:
+                valid_parts_total = sorted({
+                    int(r['participants']) for r in agg_rows
+                    if r.get('mean_encode') is not None and r.get('mean_decode') is not None and r.get('mean_network') is not None
+                })
+                if not valid_parts_total:
+                    fig, ax = plt.subplots(figsize=FIGSIZE)
+                    ax.text(0.5, 0.5, 'No complete latency breakdown available to plot total latency', ha='center', va='center')
+                    ax.axis('off')
+                    total_out = os.path.join(ANALYSIS_FOLDER, 'latency_total_linechart.svg')
+                    fig.savefig(total_out)
+                    plt.close(fig)
+                    print('Wrote placeholder total latency linechart to', total_out)
+                else:
+                    participants_idx = valid_parts_total
+                    mean_total_df = pd.DataFrame(index=participants_idx)
+                    std_total_df = pd.DataFrame(index=participants_idx)
+                    arch_keys = _sorted_arch_keys({r['arch'] for r in agg_rows})
+                    for arch in arch_keys:
+                        vals_map = {
+                            int(r['participants']): float(r['mean_encode'] + r['mean_decode'] + r['mean_network'])
+                            for r in agg_rows
+                            if r['arch'] == arch and r.get('mean_encode') is not None and r.get('mean_decode') is not None and r.get('mean_network') is not None
+                        }
+                        means = []
+                        stds = []
+                        for n in participants_idx:
+                            v = vals_map.get(n)
+                            if v is None:
+                                means.append(np.nan)
+                                stds.append(np.nan)
+                            else:
+                                means.append(v)
+                                stds.append(0.0)
+                        mean_total_df[arch] = means
+                        std_total_df[arch] = stds
+
+                    fig, ax = plt.subplots(figsize=FIGSIZE)
+                    cmap = get_color_map(mean_total_df.columns)
+                    for i, col in enumerate(_sorted_arch_keys(mean_total_df.columns)):
+                        y = mean_total_df[col]
+                        ax.plot(mean_total_df.index, y, marker=_arch_marker(col, i), label=col.replace('_', ' '), color=cmap.get(col))
+                        if col in std_total_df.columns:
+                            std = std_total_df[col].fillna(0)
+                            try:
+                                ax.fill_between(mean_total_df.index, (y - std), (y + std), alpha=0.15, color=cmap.get(col))
+                            except Exception:
+                                pass
+                    ax.set_xlabel(GRAPH_NUM_CLIENT_LABEL)
+                    ax.set_ylabel('Total latency (ms)')
+                    ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
+                    try:
+                        xt = [int(x) for x in mean_total_df.index]
+                        ax.set_xticks(xt)
+                    except Exception:
+                        pass
+                    # enforce y-axis starting at zero; compute automatic upper bound from mean+std
+                    try:
+                        combined = (mean_total_df.fillna(0) + std_total_df.fillna(0)).values
+                        max_val = float(np.nanmax(combined)) if combined.size else None
+                    except Exception:
+                        max_val = None
+                    if max_val is not None and max_val > 0:
+                        ax.set_ylim(None, None)
+                    else:
+                        ax.set_ylim(0, 1)
+                    ncol = len(mean_total_df.columns) if len(mean_total_df.columns) <= 3 else math.ceil(len(mean_total_df.columns) / 2)
+                    ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.35),  ncol=ncol, prop={'size': 10})
+                    plt.tight_layout()
+                    total_out = os.path.join(ANALYSIS_FOLDER, 'latency_total_linechart.svg')
+                    fig.savefig(total_out)
+                    # Write plotted data to CSV
+                    try:
+                        out_csv = os.path.join(ANALYSIS_FOLDER, 'latency_total_linechart_data.csv')
+                        csv_df = mean_total_df.copy()
+                        csv_df.index.name = 'Participants'
+                        csv_df.to_csv(out_csv, sep=';')
+                        print('Saved total latency data to:', out_csv)
+                    except Exception as e:
+                        print(f'WARNING: Failed to write total latency data CSV: {e}')
+                    plt.close(fig)
+                    print('Wrote total latency linechart to', total_out)
+            except Exception as e:
+                print('Failed to create total latency line plot:', e)
         except Exception as e:
-            print('Failed to create latency encode+decode+network line plot:', e)
+            print('Failed to create network latency line plot:', e)
     except Exception as e:
         print('Failed to create latency breakdown plot:', e)
 

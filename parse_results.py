@@ -2894,8 +2894,7 @@ def process_scenario(ROOT_FOLDER, scenario):
 
     Returns a tuple `(averaged_cpu, discarded_runs, failed_runs)`.  *discarded_runs* are
     runs dropped from aggregation (broken clients, analysis failure, etc.).  *failed_runs*
-    are those with missing-frame errors; they are still accumulated but reported
-    separately for visibility.
+    are runs dropped due to missing frames (kept separate for visibility).
     """
     scenario_folder = os.path.join(ROOT_FOLDER, scenario)
     ANALYSIS_FOLDER = setup_analysis_folders(ROOT_FOLDER, scenario)
@@ -2922,8 +2921,7 @@ def process_scenario(ROOT_FOLDER, scenario):
     presence_records_unfiltered = []
     # collect runs that are discarded due to broken clients or other analysis failures
     discarded_runs = []
-    # runs that failed because of missing frames; we still include their metrics in the
-    # aggregated results but mark them separately so callers can inspect them.
+    # runs dropped due to missing frames (kept separate for visibility)
     failed_runs = []
 
     # Build list of runs and collect presence records first (cheap). Parallelize collection
@@ -3020,17 +3018,15 @@ def process_scenario(ROOT_FOLDER, scenario):
                             continue
 
                     if run_failed:
-                        # runs where the only failure reason is missing frames are classified as
-                        # "failed_runs" but are still accumulated into the final metrics.
+                        # Per current policy: discard any run where even a single frame is lost.
                         if len(reasons) == 1 and reasons[0] == 'missing_frames':
                             failed_runs.append({'arch': arch, 'participants': participants, 'run_path': run_path, 'reason': 'missing_frames'})
-                            print(f"Marking run as failed (missing frames) but including in results: {arch} participants={participants} run={run_path}")
-                            # do not `continue` here; we want to accumulate these metrics below
+                            print(f"Discarding run due to missing frames: {arch} participants={participants} run={run_path}")
                         else:
                             discarded_runs.append({'arch': arch, 'participants': participants, 'run_path': run_path, 'reason': ','.join(sorted(set(reasons))) or 'failed'})
                             print(f"Discarding run due to failure: {arch} participants={participants} run={run_path} reason={','.join(sorted(set(reasons))) }")
-                            # do NOT accumulate this run's metrics into aggregate results; diagnostics already preserved
-                            continue
+                        # do NOT accumulate this run's metrics into aggregate results; diagnostics already preserved
+                        continue
 
                     # Otherwise, include the run in aggregated results
                     accumulate_run_results(metrics, arch, participants, run_path,

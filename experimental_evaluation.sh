@@ -249,6 +249,12 @@ validate_params() {
         echo "ERROR: Unknown send bandwidth mode '$SEND_BW_MODE' (allowed: all1000,matchdl or comma-separated list)" >&2; exit 1
     fi
 
+    # validate capture mode
+    local cap_re='^(none|pcap_host)$'
+    if ! [[ "$CAPTURE_MODE" =~ $cap_re ]]; then
+        echo "ERROR: Unknown capture mode '$CAPTURE_MODE' (allowed: none,pcap_host)" >&2; exit 1
+    fi
+
     if ! [[ "$CLIENTS_LIST" =~ $clients_re ]]; then
         echo "ERROR: Invalid CLIENTS list '$CLIENTS_LIST' (must be comma-separated positive integers)" >&2; exit 1
     fi
@@ -296,6 +302,14 @@ prepare_tests() {
         fi
         if ! command -v tshark >/dev/null 2>&1; then
             echo "ERROR: tshark not found. Install wireshark/tshark or set CAPTURE_MODE=none." >&2
+            exit 1
+        fi
+
+        # tcpdump needs elevated privileges (root) or capabilities (CAP_NET_RAW / CAP_NET_ADMIN)
+        if ! tcpdump -D >/dev/null 2>&1; then
+            echo "ERROR: tcpdump is installed but not usable by the current user (permission denied)." >&2
+            echo "       Re-run this script with sudo, or grant capabilities to tcpdump, e.g.:" >&2
+            echo "       sudo setcap cap_net_raw,cap_net_admin=eip \"$(command -v tcpdump)\"" >&2
             exit 1
         fi
     fi
@@ -535,6 +549,8 @@ write_run_parameters() {
 
     {
         echo "cmd: ${ORIGINAL_CMDLINE-}"
+        # Persist the same docker image summary that is printed at script start.
+        echo "docker_image: $(docker images --format '{{.Repository}}:{{.Tag}} {{.ID}} {{.CreatedAt}}' 2>/dev/null | grep -E \"^${DOCKER_IMAGE}:\" | head -n1 || echo \"${DOCKER_IMAGE}: not found\")"
         echo "opts: RUN_COUNT=${RUN_COUNT} CLIENTS_LIST=${CLIENTS_LIST} ARCHS=${ARCHS} RESOLUTIONS=${RESOLUTIONS} VIEW_MODE=${VIEW_MODE} VISIBLE_PARTICIPANTS=${VISIBLE_PARTICIPANTS} EXPERIMENT_TIME=${EXPERIMENT_TIME} LATENCY_MODES=${LATENCY_MODES} SEND_BW_MODE=${SEND_BW_MODE}"
         echo "inputs: 720=${INPUT_FILE_720} 1080=${INPUT_FILE_FULLHD} 4k=${INPUT_FILE_4K}"
         echo "estimated_total: ${total_hms:-unknown}"
@@ -1190,6 +1206,14 @@ start_bandwidth_monitor() {
         tcpdump -i "${chosen_iface}" udp -w "${output_location}/capture_all.pcap" -U &> "${output_location}/tcpdump.log" &
         BW_CAPTURE_PID=$!
         echo "Started host pcap capture (pid=${BW_CAPTURE_PID}) on ${chosen_iface} -> ${output_location}/capture_all.pcap" >> "$BW_MONITOR_LOG"
+
+        # Fail fast if tcpdump immediately exits (common cause: missing permissions)
+        sleep 0.2
+        if ! kill -0 "${BW_CAPTURE_PID}" >/dev/null 2>&1; then
+            echo "ERROR: tcpdump failed to start for host pcap capture. See ${output_location}/tcpdump.log" >> "$BW_MONITOR_LOG"
+            echo "ERROR: tcpdump failed to start for host pcap capture. See ${output_location}/tcpdump.log" >&2
+            exit 1
+        fi
     fi
 
     (
@@ -1578,9 +1602,6 @@ cleanup() {
 
 # ----------------- start of the script -----------------------
 
-cleanup # make sure the containers don't exist
-trap cleanup EXIT # remove containers if this script crashes
-
 # Capture the original CLI invocation (best-effort, shell-escaped)
 ORIGINAL_CMDLINE="$0"
 for _arg in "$@"; do
@@ -1596,6 +1617,8 @@ ARCHS=$(echo "$ARCHS" | tr ' ' ',')
 RESOLUTIONS=$(echo "$RESOLUTIONS" | tr ' ' ',')
 CLIENTS_LIST=$(echo "$CLIENTS_LIST" | tr ' ' ',')
 SEND_BW_MODE=$(echo "$SEND_BW_MODE" | tr ' ' ',')
+# Normalize capture mode to canonical lowercase token (single value)
+CAPTURE_MODE=$(echo "$CAPTURE_MODE" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
 
 # Run strict validation now (will exit on error). validate_params will also
 # populate ARCHS_ARRAY, RESOLUTIONS_ARRAY and CLIENTS_ARRAY on success.
@@ -1638,6 +1661,9 @@ if [ -t 0 ]; then
 else
     echo "No TTY detected; proceeding without interactive confirmation."
 fi
+
+cleanup # make sure the containers don't exist
+trap cleanup EXIT # remove containers if this script crashes
 
 prepare_tests # prepares test files and creates network
 

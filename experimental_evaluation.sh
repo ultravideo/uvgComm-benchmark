@@ -66,11 +66,11 @@ VIEW_MODE=${VIEW_MODE:-gallery}
 WAIT_AFTER_INVITE=15
 WAIT_AFTER_SETTINGS=10
 
-# Experiment length in seconds (default 60). Can be overridden with -e on CLI
-EXPERIMENT_TIME=${EXPERIMENT_TIME:-60}
+# Experiment length in seconds. Can be overridden with -e on CLI
+EXPERIMENT_TIME=${EXPERIMENT_TIME:-30}
 
 # Global warmup/cooldown times (seconds). Can be overridden via env vars.
-WARMUP_TIME=${WARMUP_TIME:-10}
+WARMUP_TIME=${WARMUP_TIME:-30}
 COOLDOWN_TIME=${COOLDOWN_TIME:-15}
 
 # Latency simulation settings
@@ -1203,7 +1203,7 @@ start_bandwidth_monitor() {
         fi
 
         # Start tcpdump only if we have a chosen interface (tcpdump accepts 'any')
-        tcpdump -i "${chosen_iface}" udp -w "${output_location}/capture_all.pcap" -U &> "${output_location}/tcpdump.log" &
+        tcpdump -i "${chosen_iface}" -Q in udp -w "${output_location}/capture_all.pcap" -U &> "${output_location}/tcpdump.log" &
         BW_CAPTURE_PID=$!
         echo "Started host pcap capture (pid=${BW_CAPTURE_PID}) on ${chosen_iface} -> ${output_location}/capture_all.pcap" >> "$BW_MONITOR_LOG"
 

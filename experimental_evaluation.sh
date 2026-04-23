@@ -1188,6 +1188,10 @@ start_bandwidth_monitor() {
     if [ "${CAPTURE_MODE}" = "pcap_host" ]; then
         # Try to detect bridge interface used by the docker network
         host_iface=$(docker network inspect "$NETWORK_NAME" --format '{{.Options.com.docker.network.bridge.name}}' 2>/dev/null || true)
+        # docker prints '<no value>' when the option isn't set; treat that as empty
+        if [ "$host_iface" = "<no value>" ]; then
+            host_iface=""
+        fi
         if [ -z "$host_iface" ]; then
             host_iface=$(ip -o link | awk -F': ' '/br-/{print $2; exit}' 2>/dev/null || true)
         fi
@@ -1203,15 +1207,26 @@ start_bandwidth_monitor() {
         fi
 
         # Start tcpdump only if we have a chosen interface (tcpdump accepts 'any')
-        tcpdump -i "${chosen_iface}" -Q in udp -w "${output_location}/capture_all.pcap" -U &> "${output_location}/tcpdump.log" &
-        BW_CAPTURE_PID=$!
-        echo "Started host pcap capture (pid=${BW_CAPTURE_PID}) on ${chosen_iface} -> ${output_location}/capture_all.pcap" >> "$BW_MONITOR_LOG"
+        # Start two captures: inbound and outbound, so sent vs received can be analyzed separately.
+        tcpdump -i "${chosen_iface}" -Q in udp -w "${output_location}/capture_in.pcap" -U &> "${output_location}/tcpdump_in.log" &
+        BW_CAPTURE_PID_IN=$!
+        tcpdump -i "${chosen_iface}" -Q out udp -w "${output_location}/capture_out.pcap" -U &> "${output_location}/tcpdump_out.log" &
+        BW_CAPTURE_PID_OUT=$!
+        echo "Started host pcap captures (in_pid=${BW_CAPTURE_PID_IN}, out_pid=${BW_CAPTURE_PID_OUT}) on ${chosen_iface} -> ${output_location}/capture_in.pcap, ${output_location}/capture_out.pcap" >> "$BW_MONITOR_LOG"
 
         # Fail fast if tcpdump immediately exits (common cause: missing permissions)
         sleep 0.2
-        if ! kill -0 "${BW_CAPTURE_PID}" >/dev/null 2>&1; then
-            echo "ERROR: tcpdump failed to start for host pcap capture. See ${output_location}/tcpdump.log" >> "$BW_MONITOR_LOG"
-            echo "ERROR: tcpdump failed to start for host pcap capture. See ${output_location}/tcpdump.log" >&2
+        in_ok=0
+        out_ok=0
+        if [ -n "${BW_CAPTURE_PID_IN-}" ] && kill -0 "${BW_CAPTURE_PID_IN}" >/dev/null 2>&1; then
+            in_ok=1
+        fi
+        if [ -n "${BW_CAPTURE_PID_OUT-}" ] && kill -0 "${BW_CAPTURE_PID_OUT}" >/dev/null 2>&1; then
+            out_ok=1
+        fi
+        if [ "$in_ok" -eq 0 ] && [ "$out_ok" -eq 0 ]; then
+            echo "ERROR: tcpdump failed to start for host pcap captures. See ${output_location}/tcpdump_in.log and ${output_location}/tcpdump_out.log" >> "$BW_MONITOR_LOG"
+            echo "ERROR: tcpdump failed to start for host pcap captures. See ${output_location}/tcpdump_in.log and ${output_location}/tcpdump_out.log" >&2
             exit 1
         fi
     fi
@@ -1392,13 +1407,19 @@ stop_bandwidth_monitor() {
         echo "Bandwidth monitor stopped"
     fi
     # Stop host pcap capture if started
-    if [ -n "${BW_CAPTURE_PID-}" ]; then
-        # try graceful stop first
-        kill -INT "${BW_CAPTURE_PID}" 2>/dev/null || true
-        wait "${BW_CAPTURE_PID}" 2>/dev/null || true
-        unset BW_CAPTURE_PID
-        echo "Host pcap capture stopped"
+    if [ -n "${BW_CAPTURE_PID_IN-}" ]; then
+        # try graceful stop for inbound capture first
+        kill -INT "${BW_CAPTURE_PID_IN}" 2>/dev/null || true
+        wait "${BW_CAPTURE_PID_IN}" 2>/dev/null || true
+        unset BW_CAPTURE_PID_IN
     fi
+    if [ -n "${BW_CAPTURE_PID_OUT-}" ]; then
+        # try graceful stop for outbound capture
+        kill -INT "${BW_CAPTURE_PID_OUT}" 2>/dev/null || true
+        wait "${BW_CAPTURE_PID_OUT}" 2>/dev/null || true
+        unset BW_CAPTURE_PID_OUT
+    fi
+    echo "Host pcap captures stopped"
 }
 
 run_scenario() {
@@ -1545,30 +1566,32 @@ run_scenario() {
         stop_bandwidth_monitor
         # If host pcap capture was enabled, run a simple post-run traffic breakdown
         if [ "${CAPTURE_MODE}" = "pcap_host" ]; then
-            pcap_file="${run_output_folder}/capture_all.pcap"
-            if [ -f "${pcap_file}" ]; then
-                echo "Postprocessing pcap: ${pcap_file}"
-                # Extract udp rows: ip.src ip.dst udp.srcport udp.dstport frame.len
-                tshark -r "${pcap_file}" -Y "udp" -T fields -e ip.src -e ip.dst -e udp.srcport -e udp.dstport -e frame.len 2>/dev/null |
-                awk -F'\t' 'BEGIN{OFS=";"; print "src;dst;sport;dport;packets;bytes;avg_pkt_size"} NF>=5{key=$1";"$2";"$3";"$4; pkts[key]++; bytes[key]+=$5} END{for(k in bytes) printf "%s;%d;%d;%.2f\n", k, pkts[k], bytes[k], (bytes[k]/pkts[k])}' > "${run_output_folder}/traffic_per_flow.csv"
+            for dir_suffix in in out; do
+                pcap_file="${run_output_folder}/capture_${dir_suffix}.pcap"
+                if [ -f "${pcap_file}" ]; then
+                    echo "Postprocessing pcap (${dir_suffix}): ${pcap_file}"
+                    # Extract udp rows: ip.src ip.dst udp.srcport udp.dstport frame.len
+                    tshark -r "${pcap_file}" -Y "udp" -T fields -e ip.src -e ip.dst -e udp.srcport -e udp.dstport -e frame.len 2>/dev/null |
+                    awk -F'\t' 'BEGIN{OFS=";"; print "src;dst;sport;dport;packets;bytes;avg_pkt_size"} NF>=5{key=$1";"$2";"$3";"$4; pkts[key]++; bytes[key]+=$5} END{for(k in bytes) printf "%s;%d;%d;%.2f\n", k, pkts[k], bytes[k], (bytes[k]/pkts[k])}' > "${run_output_folder}/traffic_per_flow_${dir_suffix}.csv"
 
-                # Aggregate by destination port (total bytes, packets)
-                awk -F ';' 'NR>1{dport=$4; pkts[dport]+=$5; bytes[dport]+=$6} END{print "dport;packets;bytes"; for(p in bytes) print p";"pkts[p]";"bytes[p]}' "${run_output_folder}/traffic_per_flow.csv" > "${run_output_folder}/traffic_per_port.csv" || true
+                    # Aggregate by destination port (total bytes, packets)
+                    awk -F ';' 'NR>1{dport=$4; pkts[dport]+=$5; bytes[dport]+=$6} END{print "dport;packets;bytes"; for(p in bytes) print p";"pkts[p]";"bytes[p]}' "${run_output_folder}/traffic_per_flow_${dir_suffix}.csv" > "${run_output_folder}/traffic_per_port_${dir_suffix}.csv" || true
 
-                # Aggregate by protocol (uses Wireshark protocol column) - total bytes and packets
-                tshark -r "${pcap_file}" -Y "udp" -T fields -e _ws.col.Protocol -e frame.len 2>/dev/null |
-                awk -F '\t' 'BEGIN{OFS=";"; print "protocol;packets;bytes;avg_pkt_size"} NF>=2{proto=$1; len=$2; pkts[proto]++; bytes[proto]+=len} END{for(p in bytes) printf "%s;%d;%d;%.2f\n", p, pkts[p], bytes[p], (bytes[p]/pkts[p])}' > "${run_output_folder}/traffic_per_protocol.csv" || true
+                    # Aggregate by protocol (uses Wireshark protocol column) - total bytes and packets
+                    tshark -r "${pcap_file}" -Y "udp" -T fields -e _ws.col.Protocol -e frame.len 2>/dev/null |
+                    awk -F '\t' 'BEGIN{OFS=";"; print "protocol;packets;bytes;avg_pkt_size"} NF>=2{proto=$1; len=$2; pkts[proto]++; bytes[proto]+=len} END{for(p in bytes) printf "%s;%d;%d;%.2f\n", p, pkts[p], bytes[p], (bytes[p]/pkts[p])}' > "${run_output_folder}/traffic_per_protocol_${dir_suffix}.csv" || true
 
-                # Print top protocols by bytes for quick inspection
-                echo "Top protocols (by bytes):"
-                ( head -n 1 "${run_output_folder}/traffic_per_protocol.csv" && tail -n +2 "${run_output_folder}/traffic_per_protocol.csv" | sort -t';' -k3 -nr | head -n 10 ) || true
+                    # Print top protocols by bytes for quick inspection
+                    echo "Top protocols (by bytes) [${dir_suffix}]:"
+                    ( head -n 1 "${run_output_folder}/traffic_per_protocol_${dir_suffix}.csv" && tail -n +2 "${run_output_folder}/traffic_per_protocol_${dir_suffix}.csv" | sort -t';' -k3 -nr | head -n 10 ) || true
 
-                # Print top 10 flows by bytes to STDOUT for quick inspection
-                echo "Top flows (by bytes):"
-                ( head -n 1 "${run_output_folder}/traffic_per_flow.csv" && tail -n +2 "${run_output_folder}/traffic_per_flow.csv" | sort -t';' -k6 -nr | head -n 10 )
-            else
-                echo "Warning: expected pcap ${pcap_file} not found"
-            fi
+                    # Print top 10 flows by bytes to STDOUT for quick inspection
+                    echo "Top flows (by bytes) [${dir_suffix}]:"
+                    ( head -n 1 "${run_output_folder}/traffic_per_flow_${dir_suffix}.csv" && tail -n +2 "${run_output_folder}/traffic_per_flow_${dir_suffix}.csv" | sort -t';' -k6 -nr | head -n 10 )
+                else
+                    echo "Warning: expected pcap ${pcap_file} not found"
+                fi
+            done
         fi
         record_container_logs "$run_output_folder"
         cleanup

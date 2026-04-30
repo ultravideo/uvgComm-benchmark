@@ -2043,6 +2043,105 @@ def _plot_measured_bandwidth_generic(df, participants_col, arch_col, ycols, labe
     print('Wrote measured bandwidth plot to', out_path)
 
 
+def _plot_measured_bandwidth_minmax(df, participants_col, arch_col, ycols, labels, ANALYSIS_FOLDER, out_filename, title, ylabel):
+    """Plot per-arch per-participant mean with min/max ranges to expose outliers.
+
+    For each arch and participant count, plot the mean as a solid line and
+    the min/max as dashed lines and a faint filled area between min and max.
+    """
+    fig, ax = plt.subplots(figsize=FIGSIZE)
+    cmap = get_color_map(df[arch_col].unique())
+
+    groups = list(df.groupby(arch_col))
+    groups = sorted(groups, key=lambda kv: (_arch_plot_priority(kv[0]), str(kv[0]).strip().lower()))
+
+    linestyles = ['-', '--', ':', '-.']
+    max_val = 0.0
+
+    for i, (arch_name, g) in enumerate(groups):
+        color = cmap.get(arch_name)
+        marker = _arch_marker(arch_name, i)
+        try:
+            # compute per-participant mean/min/max for each ycol
+            means = {}
+            mins = {}
+            maxs = {}
+            for ycol in ycols:
+                grp = g.groupby(participants_col)[ycol]
+                means[ycol] = grp.mean()
+                mins[ycol] = grp.min()
+                maxs[ycol] = grp.max()
+        except Exception as e:
+            print(f'WARNING: Failed to aggregate bandwidth data for min/max: {e}')
+            continue
+
+        x = sorted(set(int(x) for x in g[participants_col].dropna().unique()))
+        for j, ycol in enumerate(ycols):
+            mean_series = means.get(ycol)
+            min_series = mins.get(ycol)
+            max_series = maxs.get(ycol)
+            if mean_series is None:
+                continue
+            # align x with series index
+            xs = list(mean_series.index)
+            y_mean = [float(mean_series.loc[p]) if p in mean_series.index else None for p in xs]
+            y_min = [float(min_series.loc[p]) if (min_series is not None and p in min_series.index) else None for p in xs]
+            y_max = [float(max_series.loc[p]) if (max_series is not None and p in max_series.index) else None for p in xs]
+
+            mk = marker if j == 0 else 'x'
+            ls_mean = linestyles[0]
+            try:
+                ax.plot(xs, y_mean, marker=mk, linestyle=ls_mean, label=f"{arch_name.replace('_', ' ')} {labels[j]}", color=color)
+                # plot min/max dashed lines
+                ax.plot(xs, y_min, linestyle='--', color=color, alpha=0.7, label=f"{arch_name.replace('_', ' ')} {labels[j]} min")
+                ax.plot(xs, y_max, linestyle=':', color=color, alpha=0.7, label=f"{arch_name.replace('_', ' ')} {labels[j]} max")
+                # fill between min and max when available
+                try:
+                    # convert None to nan for fill_between
+                    y_min_np = [np.nan if v is None else v for v in y_min]
+                    y_max_np = [np.nan if v is None else v for v in y_max]
+                    ax.fill_between(xs, y_min_np, y_max_np, color=color, alpha=0.12)
+                except Exception:
+                    pass
+                # update max_val for y-limits
+                try:
+                    valid_vals = [v for v in (y_max or []) if v is not None]
+                    if valid_vals:
+                        mv = max(valid_vals)
+                        if mv > max_val:
+                            max_val = mv
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f'WARNING: Failed to plot min/max bandwidth series: {e}')
+
+    ax.set_xlabel(GRAPH_NUM_CLIENT_LABEL)
+    ax.set_ylabel(ylabel)
+    ax.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
+    try:
+        xt = sorted(set(int(x) for x in df[participants_col].dropna().unique()))
+        ax.set_xticks(xt)
+    except Exception as e:
+        print(f'WARNING: Failed to set x-axis ticks for bandwidth minmax plot: {e}')
+    if max_val is not None and max_val > 0:
+        ax.set_ylim(0, max(max_val * 1.05, 0.1))
+    else:
+        ax.set_ylim(0, 1)
+    # Legend may contain duplicates; make it compact
+    ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.45),  ncol=3)
+    plt.tight_layout()
+    out_path = os.path.join(ANALYSIS_FOLDER, out_filename)
+    try:
+        fig.savefig(out_path)
+    except Exception as e:
+        print(f'WARNING: Failed to save bandwidth min/max plot to {out_path}: {e}')
+    try:
+        plt.close(fig)
+    except Exception as e:
+        print(f'WARNING: Failed to close figure: {e}')
+    print('Wrote measured bandwidth min/max plot to', out_path)
+
+
 def process_measured_bandwidth_rows(measured_rows, ANALYSIS_FOLDER):
     """Write measured per-client bandwidth CSV and produce a plot similar to
     bandwidth_mbps_per_client.svg but using the docker-measured bandwidth.csv
@@ -2093,6 +2192,19 @@ def process_measured_bandwidth_rows(measured_rows, ANALYSIS_FOLDER):
     except Exception as e:
         print('Failed to create measured client bandwidth plot:', e)
 
+    # Also produce a min/max (per-point) variant to help spot outliers
+    try:
+        _plot_measured_bandwidth_minmax(client_df,
+                                         'Participants', 'Architecture',
+                                         ['Measured_Client_Outgoing_Mbps_per_client', 'Measured_Client_Incoming_Mbps_per_client'],
+                                         ['Client Out', 'Client In'],
+                                         ANALYSIS_FOLDER,
+                                         'measured_bandwidth_clients_mbps_per_client_minmax.svg',
+                                         'Measured Outgoing and Incoming Bandwidth (clients) - min/max',
+                                         'Bandwidth (Mb/s)')
+    except Exception as e:
+        print('Failed to create measured client bandwidth min/max plot:', e)
+
     # Host plot (host total Mbps) - separate graph because host scale can dominate
     try:
         _plot_measured_bandwidth_generic(host_df,
@@ -2105,6 +2217,19 @@ def process_measured_bandwidth_rows(measured_rows, ANALYSIS_FOLDER):
                                          'Bandwidth (Mb/s)')
     except Exception as e:
         print('Failed to create measured host bandwidth plot:', e)
+
+    # Also produce a min/max (per-point) variant for host to catch outliers
+    try:
+        _plot_measured_bandwidth_minmax(host_df,
+                                         'Participants', 'Architecture',
+                                         ['Measured_Host_Outgoing_Mbps', 'Measured_Host_Incoming_Mbps'],
+                                         ['Host Out', 'Host In'],
+                                         ANALYSIS_FOLDER,
+                                         'measured_bandwidth_host_mbps_minmax.svg',
+                                         'Measured Host Outgoing and Incoming Bandwidth - min/max',
+                                         'Bandwidth (Mb/s)')
+    except Exception as e:
+        print('Failed to create measured host bandwidth min/max plot:', e)
 
 
 def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):

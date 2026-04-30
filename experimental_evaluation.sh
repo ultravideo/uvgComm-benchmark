@@ -1564,35 +1564,6 @@ run_scenario() {
 
         # Stop bandwidth monitor and collect logs
         stop_bandwidth_monitor
-        # If host pcap capture was enabled, run a simple post-run traffic breakdown
-        if [ "${CAPTURE_MODE}" = "pcap_host" ]; then
-            for dir_suffix in in out; do
-                pcap_file="${run_output_folder}/capture_${dir_suffix}.pcap"
-                if [ -f "${pcap_file}" ]; then
-                    echo "Postprocessing pcap (${dir_suffix}): ${pcap_file}"
-                    # Extract udp rows: ip.src ip.dst udp.srcport udp.dstport frame.len
-                    tshark -r "${pcap_file}" -Y "udp" -T fields -e ip.src -e ip.dst -e udp.srcport -e udp.dstport -e frame.len 2>/dev/null |
-                    awk -F'\t' 'BEGIN{OFS=";"; print "src;dst;sport;dport;packets;bytes;avg_pkt_size"} NF>=5{key=$1";"$2";"$3";"$4; pkts[key]++; bytes[key]+=$5} END{for(k in bytes) printf "%s;%d;%d;%.2f\n", k, pkts[k], bytes[k], (bytes[k]/pkts[k])}' > "${run_output_folder}/traffic_per_flow_${dir_suffix}.csv"
-
-                    # Aggregate by destination port (total bytes, packets)
-                    awk -F ';' 'NR>1{dport=$4; pkts[dport]+=$5; bytes[dport]+=$6} END{print "dport;packets;bytes"; for(p in bytes) print p";"pkts[p]";"bytes[p]}' "${run_output_folder}/traffic_per_flow_${dir_suffix}.csv" > "${run_output_folder}/traffic_per_port_${dir_suffix}.csv" || true
-
-                    # Aggregate by protocol (uses Wireshark protocol column) - total bytes and packets
-                    tshark -r "${pcap_file}" -Y "udp" -T fields -e _ws.col.Protocol -e frame.len 2>/dev/null |
-                    awk -F '\t' 'BEGIN{OFS=";"; print "protocol;packets;bytes;avg_pkt_size"} NF>=2{proto=$1; len=$2; pkts[proto]++; bytes[proto]+=len} END{for(p in bytes) printf "%s;%d;%d;%.2f\n", p, pkts[p], bytes[p], (bytes[p]/pkts[p])}' > "${run_output_folder}/traffic_per_protocol_${dir_suffix}.csv" || true
-
-                    # Print top protocols by bytes for quick inspection
-                    echo "Top protocols (by bytes) [${dir_suffix}]:"
-                    ( head -n 1 "${run_output_folder}/traffic_per_protocol_${dir_suffix}.csv" && tail -n +2 "${run_output_folder}/traffic_per_protocol_${dir_suffix}.csv" | sort -t';' -k3 -nr | head -n 10 ) || true
-
-                    # Print top 10 flows by bytes to STDOUT for quick inspection
-                    echo "Top flows (by bytes) [${dir_suffix}]:"
-                    ( head -n 1 "${run_output_folder}/traffic_per_flow_${dir_suffix}.csv" && tail -n +2 "${run_output_folder}/traffic_per_flow_${dir_suffix}.csv" | sort -t';' -k6 -nr | head -n 10 )
-                else
-                    echo "Warning: expected pcap ${pcap_file} not found"
-                fi
-            done
-        fi
         record_container_logs "$run_output_folder"
         cleanup
 

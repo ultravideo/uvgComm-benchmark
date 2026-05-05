@@ -1527,7 +1527,8 @@ def write_diagnostics(presence_records, missing_records, analysis_folder):
             analyzed = mk.get('analyzed_frames', 0)
             partners = sorted(missing_partners.get(key, []))
             partners_str = ','.join(str(int(p)) for p in partners) if partners else ''
-            if localc == 0 and partc == 0:
+
+            if localc == 0:
                 # If both traces are missing, try to detect if the client container
                 # crashed (segfault / non-zero exit) and prefer a more informative
                 # status string for diagnostics.
@@ -3219,8 +3220,10 @@ def process_scenario(ROOT_FOLDER, scenario):
                                 code = p.get('code')
                                 local_valid = p.get('local_valid')
                                 part_valid = p.get('part_valid')
-                                # code 'M' means both traces missing; also treat both invalid as broken
-                                if code == 'M' or (local_valid is False and part_valid is False):
+                                # Treat missing local traces as broken. code 'M' means
+                                # both traces missing; also consider a client broken if
+                                # the local trace is absent or invalid.
+                                if code == 'M' or (p.get('local_valid') is False) or (p.get('local_present') is False):
                                     run_failed = True
                                     reasons.append('broken_client')
                                     break

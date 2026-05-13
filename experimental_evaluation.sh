@@ -154,6 +154,19 @@ timer_margin_ms() {
     echo $((3000 + clients * 1000))
 }
 
+# Scale cooldown time (seconds) based on number of clients.
+# Small client counts get slightly shorter cooldowns, large counts get slightly
+# longer cooldowns. Scaling is linear between min and max factors and uses
+# MAX_CLIENTS (computed in parse_args) as the reference maximum.
+scale_cooldown_seconds() {
+    local clients="$1"
+    # Use simple linear formula: cooldown_seconds = 5 + clients
+    if ! [[ "$clients" =~ ^[0-9]+$ ]]; then
+        clients=0
+    fi
+    echo $((5 + clients))
+}
+
 parse_args() {
     while getopts ":r:c:a:s:w:v:e:l:b:m:h" opt; do
         case ${opt} in
@@ -1467,7 +1480,11 @@ run_scenario() {
         local setup_time_ms=$(( CLIENTS * WAIT_AFTER_INVITE * 1000 + WAIT_AFTER_SETTINGS * 1000 ))
         local warmup_time_ms=$(( WARMUP_TIME * 1000 ))
         local experiment_time_ms=$(( EXPERIMENT_TIME * 1000 ))
-        local cooldown_time_ms=$(( COOLDOWN_TIME * 1000 ))
+        # Compute a scaled cooldown based on number of clients so larger
+        # client-count scenarios get slightly more time to finish/record.
+        local scaled_cooldown_s
+        scaled_cooldown_s=$(scale_cooldown_seconds "$CLIENTS")
+        local cooldown_time_ms=$(( scaled_cooldown_s * 1000 ))
         local margin_ms=$(timer_margin_ms "$CLIENTS")
 
         local experiment_start_ms=$((current_time_ms + setup_time_ms + warmup_time_ms))
@@ -1633,7 +1650,9 @@ num_views=${#VIEW_MODES_ARRAY[@]}
 num_bw_modes=${#SEND_BW_ARRAY[@]}
 
 for clients in ${CLIENTS_LIST//,/ } ; do
-    per_run_ms=$(( clients * WAIT_AFTER_INVITE * 1000 + WAIT_AFTER_SETTINGS * 1000 + WARMUP_TIME * 1000 + EXPERIMENT_TIME * 1000 + COOLDOWN_TIME * 1000 + $(timer_margin_ms "$clients") ))
+    # Use scaled cooldown when estimating total runtime
+    scaled_cooldown=$(scale_cooldown_seconds "$clients")
+    per_run_ms=$(( clients * WAIT_AFTER_INVITE * 1000 + WAIT_AFTER_SETTINGS * 1000 + WARMUP_TIME * 1000 + EXPERIMENT_TIME * 1000 + scaled_cooldown * 1000 + $(timer_margin_ms "$clients") ))
     total_ms=$(( total_ms + per_run_ms * RUN_COUNT * num_resolutions * num_arch * num_latency_modes * num_views * num_bw_modes ))
 done
 

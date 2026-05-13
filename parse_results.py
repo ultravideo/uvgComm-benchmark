@@ -240,7 +240,7 @@ def write_ci95_by_participants(stats_map, analysis_folder, out_csv_name, out_svg
             ax.set_ylim(0, max_val * 1.05)
         else:
             ax.set_ylim(0, 1)
-        ncol = len(archs) if len(archs) <= 3 else math.ceil(len(archs) / 2)
+        ncol = max(1, len(archs) if len(archs) <= 3 else math.ceil(len(archs) / 2))
         ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.35),  ncol=ncol, prop={'size': 10})
         plt.tight_layout()
         svg_path = os.path.join(analysis_folder, out_svg_name)
@@ -977,7 +977,7 @@ def plot_cpu(results_by_arch, analysis_folder, scenario):
     #plt.title(f'CPU usage - {scenario}')
     # nicer grid: horizontal lines only
     plt.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
-    ncol = len(results_by_arch) if len(results_by_arch) <= 3 else math.ceil(len(results_by_arch) / 2)
+    ncol = max(1, len(results_by_arch) if len(results_by_arch) <= 3 else math.ceil(len(results_by_arch) / 2))
     plt.legend(loc="lower center", bbox_to_anchor=(0.5, -0.3),  ncol=ncol, prop={'size': 10})
     # enforce y-axis 0-100 and ticks every 10%
     plt.ylim(0, None)
@@ -1124,7 +1124,7 @@ def plot_psnr(mean_df, std_df, analysis_folder, scenario):
     # Force y-limits to 0..50 and add horizontal 8-bit max line before legend so it's shown
     plt.ylim(25, 45)
     #plt.axhline(48.131, color='gray', linestyle=':', linewidth=2.0, label='Max PSNR (8-bit)', zorder=5)
-    ncol = len(mean_df.columns)#+1
+    ncol = max(1, len(mean_df.columns))
     plt.legend(loc="lower center", bbox_to_anchor=(0.5, -0.35),  ncol=ncol, prop={'size': 10})
     plt.tight_layout()
     out = os.path.join(analysis_folder, 'psnr.svg')
@@ -1170,7 +1170,7 @@ def plot_psnr_speaker_vs_listeners(psnr_speaker_stats, psnr_listeners_stats, ana
         plt.grid(axis='y', linestyle='--', linewidth=0.6, alpha=0.7)
         plt.ylim(30, 50)
         plt.axhline(48.131, color='gray', linestyle=':', linewidth=2.0, label='Max PSNR (8-bit)', zorder=5)
-        ncol = len(all_archs) if len(all_archs) <= 3 else math.ceil(len(all_archs) / 2)
+        ncol = max(1, len(all_archs) if len(all_archs) <= 3 else math.ceil(len(all_archs) / 2))
         plt.legend(loc="lower center", bbox_to_anchor=(0.5, -0.3),  ncol=ncol, prop={'size': 9})
         # force x-axis to whole numbers (participants)
         try:
@@ -1220,7 +1220,7 @@ def plot_measured_bandwidth_speaker_vs_listeners(measured_speaker_stats, measure
             ax.set_xticks(idx)
         except Exception as e:
             print(f'WARNING: Failed to set x-axis ticks for measured bandwidth plot: {e}')
-        ncol = len(cmap) if len(cmap) <= 3 else math.ceil(len(cmap) / 2)
+        ncol = max(1, len(cmap) if len(cmap) <= 3 else math.ceil(len(cmap) / 2))
         ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.3),  ncol=ncol)
         plt.tight_layout()
         out = os.path.join(analysis_folder, 'measured_bandwidth_speaker_vs_listeners.svg')
@@ -1277,7 +1277,7 @@ def plot_latency_speaker_vs_listeners(latency_speaker_stats, latency_listeners_s
             plt.ylim(0, max(max_val * 1.05, 1.0))
         else:
             plt.ylim(0, 1)
-        ncol = len(all_archs) if len(all_archs) <= 3 else math.ceil(len(all_archs) / 2)
+        ncol = max(1, len(all_archs) if len(all_archs) <= 3 else math.ceil(len(all_archs) / 2))
         plt.legend(loc="lower center", bbox_to_anchor=(0.5, -0.25),  ncol=ncol, prop={'size': 9})
         # force integer x-ticks
         try:
@@ -2029,7 +2029,7 @@ def _plot_measured_bandwidth_generic(df, participants_col, arch_col, ycols, labe
         ax.set_ylim(0, max(max_val * 1.05, 0.1))
     else:
         ax.set_ylim(0, 1)
-    ncol = len(groups) if len(groups) <= 3 else math.ceil(len(groups) / 2)
+    ncol = max(1, len(groups) if len(groups) <= 3 else math.ceil(len(groups) / 2))
     ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.4),  ncol=ncol)
     plt.tight_layout()
     out_path = os.path.join(ANALYSIS_FOLDER, out_filename)
@@ -2464,7 +2464,7 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                     ax.set_ylim(None, None)
                 else:
                     ax.set_ylim(0, 1)
-                ncol = len(mean_df.columns) if len(mean_df.columns) <= 3 else math.ceil(len(mean_df.columns) / 2)
+                ncol = max(1, len(mean_df.columns) if len(mean_df.columns) <= 3 else math.ceil(len(mean_df.columns) / 2))
                 ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.35),  ncol=ncol, prop={'size': 10})
                 plt.tight_layout()
                 line_out = os.path.join(ANALYSIS_FOLDER, 'latency_network_linechart.svg')
@@ -2549,7 +2549,7 @@ def process_latency_rows(latency_rows, arch_map, ANALYSIS_FOLDER):
                         ax.set_ylim(None, None)
                     else:
                         ax.set_ylim(0, 1)
-                    ncol = len(mean_total_df.columns) if len(mean_total_df.columns) <= 3 else math.ceil(len(mean_total_df.columns) / 2)
+                    ncol = max(1, len(mean_total_df.columns) if len(mean_total_df.columns) <= 3 else math.ceil(len(mean_total_df.columns) / 2))
                     ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.35),  ncol=ncol, prop={'size': 10})
                     plt.tight_layout()
                     total_out = os.path.join(ANALYSIS_FOLDER, 'latency_total_linechart.svg')
@@ -2732,7 +2732,7 @@ def write_root_cpu_summary(results_by_arch, ROOT_FOLDER):
             ax.set_xticks(all_x)
         except Exception as e:
             print(f'WARNING: Failed to set x-axis ticks for CPU plot: {e}')
-        ncol = len(mean_map) if len(mean_map) <= 3 else math.ceil(len(mean_map) / 2)
+        ncol = max(1, len(mean_map) if len(mean_map) <= 3 else math.ceil(len(mean_map) / 2))
         ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.3),  ncol=ncol)
         plt.tight_layout()
         outp2 = os.path.join(analysis_root, 'cpu_summary_by_participants.svg')
@@ -2903,7 +2903,7 @@ def write_root_latency_summary(scenarios, ROOT_FOLDER):
                 ax.set_ylim(0, max_val * 1.05)
             if xticks:
                 ax.set_xticks(xticks)
-            ncol = len(archs) if len(archs) <= 3 else math.ceil(len(archs) / 2)
+            ncol = max(1, len(archs) if len(archs) <= 3 else math.ceil(len(archs) / 2))
             ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.3),  ncol=ncol)
             plt.tight_layout()
             safe_up = str(up).replace('/', '-').replace(' ', '_')
@@ -3088,7 +3088,7 @@ def write_root_measured_bandwidth_summary(scenarios, ROOT_FOLDER):
                 ax.set_xticks(xt)
             except Exception:
                 pass
-            ncol = len(archs) if len(archs) <= 3 else math.ceil(len(archs) / 2)
+            ncol = max(1, len(archs) if len(archs) <= 3 else math.ceil(len(archs) / 2))
             ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.3),  ncol=ncol)
             plt.tight_layout()
             outp = os.path.join(analysis_root, f'measured_bandwidth_root_{res}_view-{view}.svg')

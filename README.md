@@ -1,6 +1,6 @@
 # uvgcomm-benchmark
 
-Minimal benchmarking harness for running reproducible uvgComm Docker-based experiments and parsing the produced metrics into summary CSVs and plots.
+Benchmarking harness for running reproducible uvgComm Docker-based experiments and parsing the produced metrics into summary CSVs and plots. Includes many configuration options. UvgComm docker image needs to be created separately.
 
 ## Supported platform
 
@@ -17,6 +17,8 @@ If you built the image with a different name/tag, tag it to `uvgcomm-docker:late
 ```bash
 docker tag <your-image>:<tag> uvgcomm-docker:latest
 ```
+
+uvgComm has instructions for how to create a docker image out of it.
 
 ## Dependencies
 
@@ -67,6 +69,8 @@ python3 -m pip install --user pandas numpy matplotlib
 
 ## Command-line options (`experimental_evaluation.sh`)
 
+Experiments support different client counts, upload bandwidth limits, qualities. A helpful run time estimate is printed before the actual run is commenced.
+
 - `-r RUNS`: repeat each scenario this many times.
 - `-c CLIENTS`: comma-separated list of participant counts evaluated.
 - `-a ARCHS`: comma-separated list of architectures evaluated: `P2P_Mesh,SFU,Hybrid`.
@@ -89,7 +93,7 @@ python3 -m pip install --user pandas numpy matplotlib
 	-w "gallery,speaker" \
 	-v 9 \
 	-e 60 \
-	-l "none,global" \
+	-l "none,dataset-PlanetLab" \
 	-b "all1000,matchdl"
 ```
 
@@ -101,4 +105,12 @@ This creates a timestamped folder under `./results/<timestamp>` containing per-r
 ./parse_results.py ./results/20260101_123456
 ```
 
-Outputs are written under `./results/<timestamp>/analysis/` (CSV summaries + SVG plots).
+Outputs are written under `./results/<timestamp>/analysis/` (CSV summaries + SVG plots). Client bandwidths are measured in two ways: 1) From internal results and 2) from container rx/tx buffer values. These should roughly match most of the time. All runs with even a small issue are completely excluded from the results.
+
+## Inspecting the streams
+
+In addition to the results, there is an option to capture all packets of a stream with `-m pcap_host` parameter. This will create a `.pcap file` that can be analyzed with tools such as `Wireshark`. Probably not recommended for actual evaluation, but a helpful option for examining what is happening.
+
+## Used in
+
+This framework was used in paper submitted to ACM TOMM titled `Design and Evaluation Methodology of Hybrid Video Conferencing Architecture`.

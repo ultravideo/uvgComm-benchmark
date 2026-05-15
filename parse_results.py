@@ -71,6 +71,8 @@ FIGURE_FONT_SIZE = 10
 plt.rcParams["legend.fontsize"] = LEGEND_FONT_SIZE
 plt.rcParams['xtick.labelsize'] = FIGURE_FONT_SIZE
 plt.rcParams['ytick.labelsize'] = FIGURE_FONT_SIZE
+plt.rcParams['axes.spines.top'] = False
+plt.rcParams['axes.spines.right'] = False
 
 
 # limit unmatched-frame debug prints per detect_missing_frames run
@@ -269,6 +271,28 @@ def _arch_marker(arch_name, fallback_index=0):
     if 'p2p' in name or 'mesh' in name:
         return 's'
     return MARKERS[int(fallback_index) % len(MARKERS)]
+
+
+def _bandwidth_yaxis_upper(value):
+    """Return a clean upper bound and tick step for bandwidth charts."""
+    if value is None or not np.isfinite(value) or value <= 0:
+        return 1.0, 1.0
+    if value <= 1:
+        step = 0.1
+    elif value <= 2:
+        step = 0.2
+    elif value <= 5:
+        step = 0.5
+    elif value <= 10:
+        step = 1.0
+    elif value <= 20:
+        step = 2.0
+    elif value <= 50:
+        step = 5.0
+    else:
+        step = 10.0
+    upper = math.ceil(value / step) * step
+    return upper, step
 
 def read_csv_guess(path, na_values=["", "NA", "null"], dtype=None):
     """Try to read CSV using common separators. Returns DataFrame or None on failure."""
@@ -2026,7 +2050,9 @@ def _plot_measured_bandwidth_generic(df, participants_col, arch_col, ycols, labe
     except Exception as e:
         print(f'WARNING: Failed to set x-axis ticks for bandwidth plot: {e}')
     if max_val is not None and max_val > 0:
-        ax.set_ylim(0, max(max_val * 1.05, 0.1))
+        upper, step = _bandwidth_yaxis_upper(max_val)
+        ax.set_ylim(0, upper)
+        ax.set_yticks(np.arange(0, upper + (step * 0.5), step))
     else:
         ax.set_ylim(0, 1)
     ncol = max(1, len(groups) if len(groups) <= 3 else math.ceil(len(groups) / 2))
@@ -2125,7 +2151,9 @@ def _plot_measured_bandwidth_minmax(df, participants_col, arch_col, ycols, label
     except Exception as e:
         print(f'WARNING: Failed to set x-axis ticks for bandwidth minmax plot: {e}')
     if max_val is not None and max_val > 0:
-        ax.set_ylim(0, max(max_val * 1.05, 0.1))
+        upper, step = _bandwidth_yaxis_upper(max_val)
+        ax.set_ylim(0, upper)
+        ax.set_yticks(np.arange(0, upper + (step * 0.5), step))
     else:
         ax.set_ylim(0, 1)
     # Legend may contain duplicates; make it compact
